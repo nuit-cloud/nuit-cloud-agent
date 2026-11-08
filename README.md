@@ -3,7 +3,7 @@
 The program a **Nuit Cloud Server** runs so the nuit·cloud platform can commission and look after it.
 
 - It **only calls out** to the platform over HTTPS; it listens on nothing. No SSH, no `sudo` list, no root password held by the platform.
-- It does **only what the platform signs**, and only tasks in its own closed catalog: `ping`, `survey`, `profile-check`, `profile-apply`. A task is run only if its Ed25519 signature verifies against a key the agent was given at enrollment, it is for this machine, it has not expired, and it has not been run before.
+- It does **only what the platform signs**, and only tasks in its own closed catalog: `ping`, `survey`, `profile-check`, `profile-apply`, `update-agent`, `runtime-smoke`, `address-scan`, `ssh-confirm`, `firewall-confirm`, `runtime-repair`, `set-hostname`, `connectivity-check`. A task is run only if its Ed25519 signature verifies against a key the agent was given at enrollment, it is for this machine, it has not expired, and it has not been run before.
 - One static binary (no runtime on the machine), for linux/amd64 and linux/arm64.
 
 The design and the reasons are in the platform repository: `docs/adr/0001-machines-are-commissioned-by-a-pull-agent.md`.
@@ -55,6 +55,10 @@ make build     # static binaries in dist/ (VERSION=1.2.3 to set the version)
 ```
 
 `internal/taskverify/testdata/vectors.json` holds tasks signed by the platform's own TypeScript signing code with a public test key, so the agent is tested against exactly what the platform produces. Regenerate it from the platform repository if the signing format ever changes.
+
+## connectivity-check (read-only)
+
+Params `{targets: [{id, kind: tcp|https|dns, host, port?, path?, sni?}]}` (1 to 32; `path` and `sni` for https only). Result `{results: [{id, ok, ms, detail}]}` in target order. `detail` is `connected`, `HTTP <status>` or `resolved <ipv4>` on success, otherwise one class word: `refused`, `timeout`, `unreachable`, `dns-failed`, `tls-verify-failed`, `tls-handshake-failed`, `reset`, `other`. Hosts are re-validated by the agent (DNS name or non-loopback, non-link-local, non-multicast IPv4); no redirects are followed, no credentials sent; 8 in parallel, 5 s each, 60 s overall.
 
 ## Status
 

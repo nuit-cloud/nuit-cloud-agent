@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/mgjoyce/nuit-cloud-agent/internal/client"
+	"github.com/mgjoyce/nuit-cloud-agent/internal/connectivity"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/controlplane"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/fwconfirm"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/hostname"
@@ -65,6 +66,8 @@ type Runner struct {
 	Repair func(ctx context.Context, action string) (string, int, error)
 	// SetHostname changes the machine's hostname (hostname.Setter; injectable so tests touch no real machine).
 	SetHostname func(ctx context.Context, name, address string) (hostname.Result, error)
+	// Connectivity checks which endpoints this machine can reach; injectable so tests dial nothing.
+	Connectivity func(ctx context.Context, targets []connectivity.Target, version string) []connectivity.Result
 	// Restart is set when a task has changed the agent itself (an update), so the loop restarts it after reporting.
 	Restart *atomic.Bool
 	Now     func() time.Time
@@ -75,7 +78,7 @@ func (r Runner) RestartRequested() bool { return r.Restart != nil && r.Restart.L
 
 // Names is the catalog: what this agent can do.
 func (r Runner) Names() []string {
-	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke", "address-scan", "ssh-confirm", "firewall-confirm", "runtime-repair", "set-hostname"}
+	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke", "address-scan", "ssh-confirm", "firewall-confirm", "runtime-repair", "set-hostname", "connectivity-check"}
 }
 
 // Run performs one task, bounded by its timeout, and says how it went. It never panics the agent: a task that blows up is a
@@ -110,6 +113,8 @@ func (r Runner) Run(ctx context.Context, task *taskverify.Task) (report client.R
 		return r.repair(ctx, task)
 	case "set-hostname":
 		return r.setHostname(ctx, task)
+	case "connectivity-check":
+		return r.connectivity(ctx, task)
 	case "address-scan":
 		return r.scan(ctx, task)
 	case "ssh-confirm":
@@ -410,6 +415,28 @@ func (r Runner) setHostname(ctx context.Context, task *taskverify.Task) client.R
 	zero := 0
 	return client.Report{Status: "done", ExitCode: &zero, Output: fmt.Sprintf("hostname %s: %s (was %s, by %s)", res.Hostname, res.Outcome, res.Previous, res.Method),
 		Result: map[string]any{"previous": res.Previous, "hostname": res.Hostname, "outcome": res.Outcome, "method": res.Method, "address": res.Address, "hostsLine": res.HostsLine}}
+}
+
+// connectivity answers which of the named endpoints this machine can reach. It is read-only; the params are validated again here.
+func (r Runner) connectivity(ctx context.Context, task *taskverify.Task) client.Report {
+	one := 1
+	targets, err := connectivity.Validate(task.Params)
+	if err != nil {
+		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+	}
+	run := r.Connectivity
+	if run == nil {
+		run = connectivity.Run
+	}
+	results := run(ctx, targets, r.Version)
+	reached := 0
+	for _, x := range results {
+		if x.OK {
+			reached++
+		}
+	}
+	zero := 0
+	return client.Report{Status: "done", ExitCode: &zero, Output: fmt.Sprintf("%d of %d reachable", reached, len(results)), Result: map[string]any{"results": results}}
 }
 
 // smoke runs the runtime's smoke test. It passes only if the script says so (SMOKE OK) and exits 0.
