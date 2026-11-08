@@ -3,6 +3,7 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,6 +25,7 @@ import (
 	"github.com/mgjoyce/nuit-cloud-agent/internal/lanscan"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/profiles"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/runtimeinstall"
+	"github.com/mgjoyce/nuit-cloud-agent/internal/servicelog"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/sshconfirm"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/survey"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/taskverify"
@@ -68,6 +70,8 @@ type Runner struct {
 	SetHostname func(ctx context.Context, name, address string) (hostname.Result, error)
 	// Connectivity checks which endpoints this machine can reach; injectable so tests dial nothing.
 	Connectivity func(ctx context.Context, targets []connectivity.Target, version string) []connectivity.Result
+	// JournalExec runs journalctl for service-log (no shell); injectable so tests read no real journal.
+	JournalExec servicelog.Exec
 	// Restart is set when a task has changed the agent itself (an update), so the loop restarts it after reporting.
 	Restart *atomic.Bool
 	Now     func() time.Time
@@ -78,7 +82,7 @@ func (r Runner) RestartRequested() bool { return r.Restart != nil && r.Restart.L
 
 // Names is the catalog: what this agent can do.
 func (r Runner) Names() []string {
-	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke", "address-scan", "ssh-confirm", "firewall-confirm", "runtime-repair", "set-hostname", "connectivity-check"}
+	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke", "address-scan", "ssh-confirm", "firewall-confirm", "runtime-repair", "set-hostname", "connectivity-check", "service-log"}
 }
 
 // Run performs one task, bounded by its timeout, and says how it went. It never panics the agent: a task that blows up is a
@@ -115,6 +119,8 @@ func (r Runner) Run(ctx context.Context, task *taskverify.Task) (report client.R
 		return r.setHostname(ctx, task)
 	case "connectivity-check":
 		return r.connectivity(ctx, task)
+	case "service-log":
+		return r.serviceLog(ctx, task)
 	case "address-scan":
 		return r.scan(ctx, task)
 	case "ssh-confirm":
@@ -437,6 +443,35 @@ func (r Runner) connectivity(ctx context.Context, task *taskverify.Task) client.
 	}
 	zero := 0
 	return client.Report{Status: "done", ExitCode: &zero, Output: fmt.Sprintf("%d of %d reachable", reached, len(results)), Result: map[string]any{"results": results}}
+}
+
+// serviceLog returns journal lines of one of the Control Plane Server's own services. It is read-only; params are validated again here.
+func (r Runner) serviceLog(ctx context.Context, task *taskverify.Task) client.Report {
+	one := 1
+	q, err := servicelog.Validate(task.Params, r.now())
+	if err != nil {
+		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+	}
+	run := r.JournalExec
+	if run == nil {
+		run = journalExec
+	}
+	res := servicelog.Run(ctx, run, q)
+	zero := 0
+	out := fmt.Sprintf("%d lines of %s", len(res.Lines), q.Key)
+	if res.Note != "" {
+		out = res.Note
+	}
+	return client.Report{Status: "done", ExitCode: &zero, Output: out, Result: res}
+}
+
+// journalExec runs the command with exec, never a shell.
+func journalExec(ctx context.Context, argv []string) (string, string, error) {
+	var stdout, stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
+	return stdout.String(), stderr.String(), err
 }
 
 // smoke runs the runtime's smoke test. It passes only if the script says so (SMOKE OK) and exits 0.

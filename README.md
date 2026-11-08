@@ -3,7 +3,7 @@
 The program a **Nuit Cloud Server** runs so the nuit·cloud platform can commission and look after it.
 
 - It **only calls out** to the platform over HTTPS; it listens on nothing. No SSH, no `sudo` list, no root password held by the platform.
-- It does **only what the platform signs**, and only tasks in its own closed catalog: `ping`, `survey`, `profile-check`, `profile-apply`, `update-agent`, `runtime-smoke`, `address-scan`, `ssh-confirm`, `firewall-confirm`, `runtime-repair`, `set-hostname`, `connectivity-check`. A task is run only if its Ed25519 signature verifies against a key the agent was given at enrollment, it is for this machine, it has not expired, and it has not been run before.
+- It does **only what the platform signs**, and only tasks in its own closed catalog: `ping`, `survey`, `profile-check`, `profile-apply`, `update-agent`, `runtime-smoke`, `address-scan`, `ssh-confirm`, `firewall-confirm`, `runtime-repair`, `set-hostname`, `connectivity-check`, `service-log`. A task is run only if its Ed25519 signature verifies against a key the agent was given at enrollment, it is for this machine, it has not expired, and it has not been run before.
 - One static binary (no runtime on the machine), for linux/amd64 and linux/arm64.
 
 The design and the reasons are in the platform repository: `docs/adr/0001-machines-are-commissioned-by-a-pull-agent.md`.
@@ -59,6 +59,10 @@ make build     # static binaries in dist/ (VERSION=1.2.3 to set the version)
 ## connectivity-check (read-only)
 
 Params `{targets: [{id, kind: tcp|https|dns, host, port?, path?, sni?}]}` (1 to 32; `path` and `sni` for https only). Result `{results: [{id, ok, ms, detail}]}` in target order. `detail` is `connected`, `HTTP <status>` or `resolved <ipv4>` on success, otherwise one class word: `refused`, `timeout`, `unreachable`, `dns-failed`, `tls-verify-failed`, `tls-handshake-failed`, `reset`, `other`. Hosts are re-validated by the agent (DNS name or non-loopback, non-link-local, non-multicast IPv4); no redirects are followed, no credentials sent; 8 in parallel, 5 s each, 60 s overall.
+
+## service-log (read-only)
+
+Params `{unit: scheduler|probe|tls-front, since, until?, lines?, contains?}`; no other keys. `since`/`until` are RFC3339 with a zone (`until` defaults to now, `since` < `until`, window at most 7 days); `lines` 1 to 5000 (default 1000); `contains` 1 to 64 characters of `[A-Za-z0-9 _.:=/@-]`, a literal substring filter applied by the agent. `unit` maps through a fixed table (`nuit-cloud-cp-scheduler.service`, `nuit-cloud-cp-probe.service`, `nginx.service`). The agent runs `journalctl --no-pager --utc -o short-iso -u <unit> --since 'YYYY-MM-DD HH:MM:SS' --until 'YYYY-MM-DD HH:MM:SS'` (exec, no shell, 20 s). Result `{unit, lines, truncated, earliest, latest, note?}`; `note` is `no-journal`, `unit-not-found` or `unreadable` with no lines. Lines are scrubbed of bearer tokens, `nce_`/`nca_`/`smt_`/`svc_` codes, SSH keys and PEM blocks (lines with `PRIVATE KEY` are dropped); the newest `lines` are kept, at most 200 KB.
 
 ## Status
 
