@@ -1,2 +1,6 @@
 dist/
 *.test
+
+# a downloaded signed release (nuit-cloud deploy/fetch-agent-release.sh); never committed, served only when AGENT_DIST names it (#158)
+dist-release/
+.DS_Store
