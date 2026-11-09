@@ -1,5 +1,5 @@
 // Package profiles runs a profile: a named set of check-and-fix features that makes a machine fit for a role. The features are
-// the platform's own deploy/bootstrap shell scripts, copied into the agent's release (`make sync-bootstrap`), so there is one
+// shell scripts in internal/profiles/bootstrap (the only copy; tested by test-bootstrap.sh), embedded in the agent's release, so there is one
 // definition of what a profile does whether a person runs it by hand or the agent runs it. A task names a profile; it never
 // supplies a script.
 package profiles

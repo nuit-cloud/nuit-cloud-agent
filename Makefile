@@ -3,7 +3,7 @@ LDFLAGS := -s -w -X main.version=$(VERSION)
 
 .PHONY: test build vectors clean
 
-test:
+test: test-bootstrap
 	go vet ./...
 	go test ./...
 
@@ -20,11 +20,8 @@ clean:
 	rm -rf dist
 
 # The profile features ship inside the agent's release (ADR 0001: a task names a feature, never fetches a script). They are
-# written in the platform repository, deploy/bootstrap; this copies the ones the platform asks for into the agent.
-BOOTSTRAP_SRC ?= ../nuit-cloud/deploy/bootstrap
-.PHONY: sync-bootstrap
-sync-bootstrap:
-	rm -rf internal/profiles/bootstrap
-	mkdir -p internal/profiles/bootstrap/profiles
-	cp $(BOOTSTRAP_SRC)/bootstrap.sh $(BOOTSTRAP_SRC)/features.sh internal/profiles/bootstrap/
-	cp $(BOOTSTRAP_SRC)/profiles/nuit-cloud-server.sh $(BOOTSTRAP_SRC)/profiles/nuit-container-service.sh $(BOOTSTRAP_SRC)/profiles/nuit-cloud-address.sh $(BOOTSTRAP_SRC)/profiles/nuit-cloud-vlan.sh $(BOOTSTRAP_SRC)/profiles/nuit-cloud-ssh.sh $(BOOTSTRAP_SRC)/profiles/nuit-cloud-wired.sh $(BOOTSTRAP_SRC)/profiles/nuit-cloud-login.sh $(BOOTSTRAP_SRC)/profiles/nuit-cloud-resolvers.sh $(BOOTSTRAP_SRC)/profiles/nuit-cloud-firewall.sh $(BOOTSTRAP_SRC)/profiles/nuit-container-service-record.sh $(BOOTSTRAP_SRC)/profiles/nuit-cloud-control-plane.sh internal/profiles/bootstrap/profiles/
+# written here, in internal/profiles/bootstrap (the only copy; it moved from the platform repository, mgjoyce/nuit-cloud#175).
+# Their test runs them against a scratch root with stub system commands, with the by-hand profiles (by-hand/) added.
+.PHONY: test-bootstrap
+test-bootstrap:
+	sh internal/profiles/test-bootstrap.sh

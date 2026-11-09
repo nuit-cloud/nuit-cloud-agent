@@ -242,7 +242,7 @@ OCISAAS_SMOKE="${OCISAAS_SMOKE:-/usr/local/lib/nuit-cloud/oci-saas-smoke.sh}"
 # and the platform has a *record* of it (the smoke script it keeps, and the SHA-256 of the bundle it came from). A runtime installed by hand
 # before the profile existed is running with no record; the first note below says exactly that, and the nuit-container-service-record profile
 # writes the record, after comparing what is installed with the pinned bundle, without restarting anything.
-# The platform looks for this phrase in the notes of a drifting oci_saas_runtime (nuit-cloud-servers/src/commissioning.ts).
+# The platform looks for this phrase in the notes of a drifting oci_saas_runtime (lib/src/commissioning.ts in nuit-cloud/nuit-cloud-servers).
 OCISAAS_UNRECORDED_NOTE='installed and running, but not recorded'
 ocisaas_running() {
   [ -x "$(p /usr/local/bin/crictl-ocisaas)" ] && systemctl is-active --quiet containerd-ocisaas \
@@ -689,7 +689,7 @@ STATIC
   echo "  $A_IF now uses $target/$A_PREFIX as a static address (was $A_CUR; the old configuration is in $ADDR_DIR/backup)"
 }
 
-# ─── The tenant VLAN slice (ticket #67; ports deploy/server-vlan5.sh) ───────────────────────────────────────────────────────
+# ─── The tenant VLAN slice (ticket #67; ports nuit-cloud/nuit-cloud-servers scripts/server-vlan5.sh) ───────────────────────────────────────────────────────
 # Adds a VLAN sub-interface on the machine's default-route interface carrying the slice the platform allocated: the node's own
 # address and the tenant block as secondary addresses, plus the rules that send replies for connections that arrived on the VLAN
 # back out by the VLAN gateway (without them a reply from a tenant address leaves by the wrong interface and the router drops it).
@@ -743,7 +743,7 @@ f_ncs_vlan_ok() {
   vlan_inputs_ok && addr_discover || return 1
   _file="$(p "$(vlan_file)")"
   _vif="$A_IF.$NCS_VLAN_ID"
-  # exactly what this feature writes, or an equivalent configuration made by hand (deploy/server-vlan5.sh): the same sub-interface with
+  # exactly what this feature writes, or an equivalent configuration made by hand (nuit-cloud/nuit-cloud-servers scripts/server-vlan5.sh): the same sub-interface with
   # the same address and tenant block named in it. A working VLAN made by hand is adopted as it is, never rewritten.
   if ! vlan_render "$A_IF" | cmp -s - "$_file" 2>/dev/null; then
     grep -Eq "^[[:space:]]*iface[[:space:]]+$_vif[[:space:]]+inet[[:space:]]+static" "$_file" 2>/dev/null || return 1
@@ -760,7 +760,7 @@ f_ncs_vlan_ok() {
 
 f_ncs_vlan_do() {
   vlan_inputs_ok || { echo "  the VLAN slice was not given, or is not valid: allocate one in the portal, then apply this profile from there" >&2; return 3; }
-  command -v ifup >/dev/null 2>&1 && [ -f "$(p /etc/network/interfaces)" ] || { echo "  this machine does not use ifupdown: set the VLAN up by hand (deploy/server-vlan5.sh)" >&2; return 3; }
+  command -v ifup >/dev/null 2>&1 && [ -f "$(p /etc/network/interfaces)" ] || { echo "  this machine does not use ifupdown: set the VLAN up by hand (nuit-cloud/nuit-cloud-servers scripts/server-vlan5.sh)" >&2; return 3; }
   for m in NetworkManager systemd-networkd; do
     ! systemctl is-active --quiet "$m" 2>/dev/null || { echo "  $m manages the network here; this feature only handles ifupdown" >&2; return 3; }
   done
@@ -774,7 +774,7 @@ f_ncs_vlan_do() {
   # parent was configured another way that would run its address configuration again. Found on a real kernel: only proceed if ifupdown
   # itself holds the parent up.
   command -v ifquery >/dev/null 2>&1 && ifquery --state "$A_IF" >/dev/null 2>&1 || {
-    echo "  $A_IF is not held up by ifupdown here (ifquery --state says it is not), and ifup of its VLAN would try to bring it up itself and could disturb its address: set the VLAN up by hand (deploy/server-vlan5.sh)" >&2
+    echo "  $A_IF is not held up by ifupdown here (ifquery --state says it is not), and ifup of its VLAN would try to bring it up itself and could disturb its address: set the VLAN up by hand (nuit-cloud/nuit-cloud-servers scripts/server-vlan5.sh)" >&2
     return 3
   }
   # the VLAN's own addresses must not already be somewhere else on this machine

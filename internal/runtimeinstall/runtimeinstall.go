@@ -2,7 +2,7 @@
 // profile-apply that includes it: the oci-saas bundle and a pinned containerd release. Both come from the platform's own
 // address and are checked against the SHA-256 in the signed task before anything uses them; the root-key fingerprint the
 // bundle's keys must chain to is carried the same way. The agent only stages the files and hands their paths to the profile's
-// scripts (`oci_saas_runtime` in deploy/bootstrap): installing is the scripts' job, one definition whether a person or the
+// scripts (`oci_saas_runtime` in internal/profiles/bootstrap): installing is the scripts' job, one definition whether a person or the
 // agent runs it.
 package runtimeinstall
 

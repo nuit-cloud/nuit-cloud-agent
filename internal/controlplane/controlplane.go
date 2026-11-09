@@ -6,7 +6,7 @@
 // the probe's script, and nothing secret. The bundle is downloaded, checked against the signed checksum and unpacked here, by a hardened
 // extractor (bundle.go). The secrets (the scheduler's tokens, the https front's key, the probe's tokens) come from a second, authenticated
 // read of the platform (`GET /api/agent/control-plane-config`) and are written HERE, by the agent, to root-only files. The shell features
-// of the profile (deploy/bootstrap, `ncs_cp_*`) install and run what was unpacked; they are only ever told where things are and non-secret
+// of the profile (internal/profiles/bootstrap, `ncs_cp_*`) install and run what was unpacked; they are only ever told where things are and non-secret
 // facts, as environment. No secret is ever passed to a child process, put in a command line, logged or reported.
 package controlplane
 
