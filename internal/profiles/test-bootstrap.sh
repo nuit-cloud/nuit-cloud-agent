@@ -514,10 +514,16 @@ rc=$?
 [ "$rc" = 0 ] && grep -q 'systemctl enable --now nuit-cloud-housekeeping.timer' "$CALLS" && grep -qx custom "$ROOT/etc/systemd/system/nuit-cloud-housekeeping.timer" && ok "ncs_housekeeping: the service and weekly timer are written, enabled, and a timer someone else wrote is not overwritten" || { echo "rc=$rc"; cat "$CALLS"; bad "housekeeping"; }
 export ROOT="$OLDROOT5"
 # 16. ncs_vlan on a minimal Debian: iptables is installed first instead of the feature giving up
+# bootstrap.sh puts /usr/sbin and /sbin on PATH, so on a test host that has a real iptables (GitHub's Ubuntu runners) the feature
+# finds it and a missing iptables cannot be simulated: the case is skipped there, and runs on macOS and a bare Debian/Ubuntu.
+if [ -x /usr/sbin/iptables ] || [ -x /sbin/iptables ] || [ -x /usr/local/sbin/iptables ]; then
+  echo "skip - ncs_vlan: iptables is installed when it is missing (this host has a real iptables)"
+else
 vlan_net; mv "$tmp/bin/iptables" "$tmp/iptables.away"
 vlan_run >"$tmp/out" 2>&1 && bad "the VLAN was applied with no iptables"
 mv "$tmp/iptables.away" "$tmp/bin/iptables"
 grep -q 'apt-get install -y -qq iptables' "$CALLS" && ok "ncs_vlan: iptables is installed when it is missing (a new machine has none before the runtime goes on)" || { cat "$CALLS"; bad "vlan iptables install"; }
+fi
 export ROOT="$OLDROOT"
 # 17. ncs_log_root: the shared log root exists, setgid, so logs written by root can be read by the platform's login
 OLDROOT6="$ROOT"; export ROOT="$tmp/logroot"; mkdir -p "$ROOT"; : >"$CALLS"
