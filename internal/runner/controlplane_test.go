@@ -16,10 +16,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mgjoyce/nuit-cloud-agent/internal/client"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/controlplane"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/profiles"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/taskverify"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/client"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/controlplane"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/profiles"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/taskverify"
 )
 
 const (

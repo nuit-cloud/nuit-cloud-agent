@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mgjoyce/nuit-cloud-agent/internal/taskverify"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/taskverify"
 )
 
 // Client talks to one platform.

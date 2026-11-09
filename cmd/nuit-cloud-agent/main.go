@@ -20,16 +20,16 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/mgjoyce/nuit-cloud-agent/internal/client"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/controlplane"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/loop"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/observe"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/profiles"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/runner"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/runtimeinstall"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/state"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/survey"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/update"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/client"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/controlplane"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/loop"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/observe"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/profiles"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/runner"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/runtimeinstall"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/state"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/survey"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/update"
 )
 
 // version is set at build time: -ldflags "-X main.version=1.2.3".

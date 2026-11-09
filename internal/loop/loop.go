@@ -9,10 +9,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mgjoyce/nuit-cloud-agent/internal/client"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/profiles"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/state"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/taskverify"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/client"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/profiles"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/state"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/taskverify"
 )
 
 // Platform is the part of the platform's API the loop uses.

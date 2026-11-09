@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mgjoyce/nuit-cloud-agent/internal/taskverify"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/taskverify"
 )
 
 func enrolled(dir string) *State {

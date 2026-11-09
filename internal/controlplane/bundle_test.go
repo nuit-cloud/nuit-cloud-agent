@@ -16,7 +16,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/mgjoyce/nuit-cloud-agent/internal/runtimeinstall"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/runtimeinstall"
 )
 
 type entry struct {

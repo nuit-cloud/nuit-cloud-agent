@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/mgjoyce/nuit-cloud-agent/internal/client"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/client"
 )
 
 const (

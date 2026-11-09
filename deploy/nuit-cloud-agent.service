@@ -1,6 +1,6 @@
 [Unit]
 Description=Nuit Cloud agent
-Documentation=https://github.com/mgjoyce/nuit-cloud/blob/main/docs/adr/0001-machines-are-commissioned-by-a-pull-agent.md
+Documentation=https://github.com/nuit-cloud/nuit-cloud-servers/blob/main/docs/adr/0001-machines-are-commissioned-by-a-pull-agent.md
 After=network-online.target
 Wants=network-online.target
 

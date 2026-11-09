@@ -24,7 +24,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/mgjoyce/nuit-cloud-agent/internal/client"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/client"
 )
 
 // Services is the closed list of what a control-plane host may be asked to run, in the order they are set up.

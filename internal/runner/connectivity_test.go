@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/mgjoyce/nuit-cloud-agent/internal/connectivity"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/taskverify"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/connectivity"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/taskverify"
 )
 
 func TestConnectivityCheckIsInTheCatalogValidatesAgainAndReportsResultsInOrder(t *testing.T) {

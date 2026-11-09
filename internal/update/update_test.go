@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mgjoyce/nuit-cloud-agent/internal/state"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/state"
 )
 
 // A "build" is a tiny shell script that prints its version, so the real probe (running `<binary> version`) is exercised.

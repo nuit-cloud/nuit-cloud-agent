@@ -1,3 +1,3 @@
-module github.com/mgjoyce/nuit-cloud-agent
+module github.com/nuit-cloud/nuit-cloud-agent
 
 go 1.24

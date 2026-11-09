@@ -8,15 +8,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mgjoyce/nuit-cloud-agent/internal/fwconfirm"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/hostname"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/lanscan"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/profiles"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/runtimeinstall"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/sshconfirm"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/survey"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/taskverify"
-	"github.com/mgjoyce/nuit-cloud-agent/internal/update"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/fwconfirm"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/hostname"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/lanscan"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/profiles"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/runtimeinstall"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/sshconfirm"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/survey"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/taskverify"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/update"
 )
 
 func newRunner() Runner {

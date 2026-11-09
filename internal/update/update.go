@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mgjoyce/nuit-cloud-agent/internal/state"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/state"
 )
 
 // Doer is what sends a download request: the agent's client (which knows the platform's fallback addresses) or a plain http.Client.
