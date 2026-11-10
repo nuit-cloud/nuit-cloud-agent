@@ -8,10 +8,13 @@ package taskverify
 
 import (
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"time"
 )
 
@@ -26,7 +29,8 @@ type Envelope struct {
 	Signature string `json:"signature"` // base64url Ed25519 signature over SigningDomain + payload bytes
 }
 
-// Key is a public key the agent was given at enrollment.
+// Key is a public key the agent trusts to sign its tasks: given at enrollment, or added later by a `trust-key` task signed by a
+// key it already trusted (a rollover of the platform's signing key).
 type Key struct {
 	KeyID     string `json:"keyId"`
 	PublicKey string `json:"publicKey"` // base64url of the raw 32-byte key
@@ -42,6 +46,8 @@ type Task struct {
 	IssuedAt       time.Time      `json:"issuedAt"`
 	ExpiresAt      time.Time      `json:"expiresAt"`
 	TimeoutSeconds int            `json:"timeoutSeconds"`
+	// SignedBy is the id of the trusted key whose signature verified. It is set by Verify, never read from the payload.
+	SignedBy string `json:"-"`
 }
 
 // Context is what the agent knows when it checks a task.
@@ -68,10 +74,13 @@ func refuse(format string, a ...any) error { return &Refusal{Reason: fmt.Sprintf
 
 // Verify returns the task if, and only if: the key is one the agent trusts, the signature verifies over the bytes received,
 // the task is for this machine, it has not expired, it is in the agent's catalog, and it has not been run before.
+//
+// Only the key the envelope names is tried: with several keys trusted (during a rollover) the agent never tries one the task does not
+// name, so a task cannot pass under one key's id with another key's signature.
 func Verify(env Envelope, trusted []Key, ctx Context) (*Task, error) {
 	var key *Key
 	for i := range trusted {
-		if trusted[i].KeyID == env.KeyID {
+		if env.KeyID != "" && trusted[i].KeyID == env.KeyID {
 			key = &trusted[i]
 			break
 		}
@@ -120,7 +129,49 @@ func Verify(env Envelope, trusted []Key, ctx Context) (*Task, error) {
 	if task.Params == nil {
 		task.Params = map[string]any{}
 	}
+	task.SignedBy = key.KeyID
 	return &task, nil
+}
+
+// KeyIDOf is the platform's name for a public key (`keyIdOf` in nuit-cloud-servers' task-signing.ts): the first 16 hex characters of
+// the SHA-256 of the raw 32-byte key.
+func KeyIDOf(raw []byte) string {
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+var (
+	keyIDShape     = regexp.MustCompile(`^[0-9a-f]{16}$`)
+	publicKeyShape = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
+)
+
+// ValidKeyID reports whether s has the shape of a key id: 16 lower-case hex characters.
+func ValidKeyID(s string) bool { return keyIDShape.MatchString(s) }
+
+// KeyFromParams reads the key a `trust-key` task carries ({"keyId", "publicKey"} and nothing else), checked again here: the public key is
+// 43 base64url characters that decode to 32 bytes, and its id is the one derived from it, so a key can never be trusted under another's name.
+func KeyFromParams(params map[string]any) (Key, error) {
+	for k := range params {
+		if k != "keyId" && k != "publicKey" {
+			return Key{}, fmt.Errorf("trust-key carries only keyId and publicKey, not %q", k)
+		}
+	}
+	id, _ := params["keyId"].(string)
+	pub, _ := params["publicKey"].(string)
+	if !ValidKeyID(id) {
+		return Key{}, errors.New("the key id must be 16 lower-case hex characters")
+	}
+	if !publicKeyShape.MatchString(pub) {
+		return Key{}, errors.New("the public key must be a raw Ed25519 key, base64url without padding (43 characters)")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(pub)
+	if err != nil || len(raw) != ed25519.PublicKeySize {
+		return Key{}, errors.New("the public key must be a raw Ed25519 key, base64url without padding (43 characters)")
+	}
+	if KeyIDOf(raw) != id {
+		return Key{}, errors.New("the key id is not the one derived from the public key")
+	}
+	return Key{KeyID: id, PublicKey: pub}, nil
 }
 
 // IsRefusal reports whether err is a Refusal (a task that must not be run), as opposed to an internal error.

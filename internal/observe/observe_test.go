@@ -227,8 +227,9 @@ func TestEveryKindsVersionIsOneThePlatformKeeps(t *testing.T) {
 		ReadResolvConf:   func() (string, error) { return "nameserver 10.0.0.1\n", nil },
 		Lookup:           func(context.Context, string, string) bool { return true },
 		ReadBundleRecord: func() (string, error) { return strings.Repeat("ab12", 16), nil },
+		TrustedKeyIDs:    func() []string { return []string{"fe812c12f3ab4ce6"} },
 	}
-	for _, kind := range []string{Network, Clock, Runtime, DNS} {
+	for _, kind := range []string{Network, Clock, Runtime, DNS, TaskKeys} {
 		_, v, err := c.Collect(context.Background(), kind)
 		if err != nil || !versionOK.MatchString(v) {
 			t.Errorf("%s: version %q (%v)", kind, v, err)
@@ -288,8 +289,9 @@ func TestEveryKindTheAgentCanCollectIsOneItSaysItKnows(t *testing.T) {
 		Lookup:         func(context.Context, string, string) bool { return true },
 
 		ReadBundleRecord: func() (string, error) { return "", errors.New("none") },
+		TrustedKeyIDs:    func() []string { return []string{"fe812c12f3ab4ce6"} },
 	}
-	for _, kind := range []string{Network, Clock, Runtime, DNS} {
+	for _, kind := range []string{Network, Clock, Runtime, DNS, TaskKeys} {
 		if !c.Known(kind) {
 			t.Errorf("%s is not a known kind", kind)
 		}
@@ -299,5 +301,35 @@ func TestEveryKindTheAgentCanCollectIsOneItSaysItKnows(t *testing.T) {
 	}
 	if c.Known("invented") {
 		t.Error("an invented kind is known")
+	}
+}
+
+// The platform learns which task-signing keys an agent trusts, so it can see one left trusting only a retired key. The version is the same
+// whatever order the keys were trusted in, and changes when the set does.
+func TestTheTaskKeysObservationNamesTheTrustedKeyIdsAndChangesOnlyWithThem(t *testing.T) {
+	ids := []string{"fe812c12f3ab4ce6", "0123456789abcdef"}
+	c := Collector{TrustedKeyIDs: func() []string { return ids }}
+	data, v1, err := c.Collect(context.Background(), TaskKeys)
+	if err != nil || !versionOK.MatchString(v1) {
+		t.Fatalf("version %q (%v)", v1, err)
+	}
+	if got := data.(TaskKeysFacts).KeyIDs; len(got) != 2 || got[0] != "0123456789abcdef" || got[1] != "fe812c12f3ab4ce6" {
+		t.Errorf("key ids: %v", got)
+	}
+	ids = []string{"0123456789abcdef", "fe812c12f3ab4ce6"}
+	if _, v2, _ := c.Collect(context.Background(), TaskKeys); v2 != v1 {
+		t.Errorf("the same keys in another order changed the version: %q, %q", v1, v2)
+	}
+	ids = []string{"0123456789abcdef"}
+	if _, v3, _ := c.Collect(context.Background(), TaskKeys); v3 == v1 {
+		t.Error("retiring a key did not change the version")
+	}
+	// Anything that is not a key id is not sent; an agent with no key to report sends nothing.
+	ids = []string{"not-a-key-id", "FE812C12F3AB4CE6"}
+	if data, v, _ := c.Collect(context.Background(), TaskKeys); data != nil || v != "" {
+		t.Errorf("sent %v %q", data, v)
+	}
+	if data, _, _ := (Collector{}).Collect(context.Background(), TaskKeys); data != nil {
+		t.Errorf("a collector without the agent's keys sent %v", data)
 	}
 }

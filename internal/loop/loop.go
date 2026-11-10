@@ -120,7 +120,7 @@ func (l *Loop) Once(ctx context.Context) (time.Duration, error) {
 		interval = defaultInterval
 	}
 	for _, env := range resp.Tasks {
-		task, err := taskverify.Verify(env, l.State.TrustedKeys, taskverify.Context{
+		task, err := taskverify.Verify(env, l.State.Keys(), taskverify.Context{
 			MachineID:   l.State.MachineID,
 			Now:         l.platformNow(),
 			AlreadySeen: l.State.HasSeen,

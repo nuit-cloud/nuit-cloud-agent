@@ -3,7 +3,7 @@
 The program a **Nuit Cloud Server** runs so the nuit·cloud platform can commission and look after it.
 
 - It **only calls out** to the platform over HTTPS; it listens on nothing. No SSH, no `sudo` list, no root password held by the platform.
-- It does **only what the platform signs**, and only tasks in its own closed catalog: `ping`, `survey`, `profile-check`, `profile-apply`, `update-agent`, `runtime-smoke`, `address-scan`, `ssh-confirm`, `firewall-confirm`, `runtime-repair`, `set-hostname`, `connectivity-check`, `service-log`. A task is run only if its Ed25519 signature verifies against a key the agent was given at enrollment, it is for this machine, it has not expired, and it has not been run before.
+- It does **only what the platform signs**, and only tasks in its own closed catalog: `ping`, `survey`, `profile-check`, `profile-apply`, `update-agent`, `runtime-smoke`, `address-scan`, `ssh-confirm`, `firewall-confirm`, `runtime-repair`, `set-hostname`, `connectivity-check`, `service-log`, `trust-key`, `retire-key`. A task is run only if its Ed25519 signature verifies against the key it names, one the agent trusts (given at enrollment, or added by a `trust-key` task), it is for this machine, it has not expired, and it has not been run before.
 - One static binary (no runtime on the machine), for linux/amd64 and linux/arm64.
 
 The design and the reasons are in the platform repository: `docs/adr/0001-machines-are-commissioned-by-a-pull-agent.md`.
@@ -63,6 +63,10 @@ Params `{targets: [{id, kind: tcp|https|dns, host, port?, path?, sni?}]}` (1 to 
 ## service-log (read-only)
 
 Params `{unit: scheduler|probe|tls-front, since, until?, lines?, contains?}`; no other keys. `since`/`until` are RFC3339 with a zone (`until` defaults to now, `since` < `until`, window at most 7 days); `lines` 1 to 5000 (default 1000); `contains` 1 to 64 characters of `[A-Za-z0-9 _.:=/@-]`, a literal substring filter applied by the agent. `unit` maps through a fixed table (`nuit-cloud-cp-scheduler.service`, `nuit-cloud-cp-probe.service`, `nginx.service`). The agent runs `journalctl --no-pager --utc -o short-iso -u <unit> --since 'YYYY-MM-DD HH:MM:SS' --until 'YYYY-MM-DD HH:MM:SS'` (exec, no shell, 20 s). Result `{unit, lines, truncated, earliest, latest, note?}`; `note` is `no-journal`, `unit-not-found` or `unreadable` with no lines. Lines are scrubbed of bearer tokens, `nce_`/`nca_`/`smt_`/`svc_` codes, SSH keys and PEM blocks (lines with `PRIVATE KEY` are dropped); the newest `lines` are kept, at most 200 KB.
+
+## trust-key and retire-key (the task-signing key rollover)
+
+The agent trusts a list of task-signing keys (`trustedKeys` in its state file, at most four) and checks a task only against the key its envelope's `keyId` names. `trust-key` params `{keyId, publicKey}` and nothing else: `publicKey` is the raw Ed25519 key, base64url without padding (43 characters, 32 bytes), and `keyId` must be the platform's id for it (the first 16 hex characters of the SHA-256 of the raw key). It is accepted only as an ordinary signed task, so only a key the agent already trusts can add another; trusting a key already trusted changes nothing. `retire-key` params `{keyId}` and nothing else; it never removes the key that signed the task itself nor the last key, and says why; retiring a key that is not trusted changes nothing. Both report `{keyId, changed, trustedKeyIds}`. `ping` reports `trustedKeyIds`, and the `task-keys` observation is `{keyIds}` (sorted).
 
 ## Status
 

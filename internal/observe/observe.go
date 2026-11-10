@@ -33,7 +33,14 @@ const (
 	Runtime = "runtime"
 	// DNS is which resolvers this machine uses and whether each one answers for the platform's own name and for a public one.
 	DNS = "dns"
+	// TaskKeys is which task-signing keys this agent trusts (their ids), so the platform can see an agent left trusting only a retired key.
+	TaskKeys = "task-keys"
 )
+
+// maxTaskKeys bounds the task-keys observation (an agent trusts at most four; the platform enforces its own limit again).
+const maxTaskKeys = 8
+
+var taskKeyID = regexp.MustCompile(`^[0-9a-f]{16}$`)
 
 // publicTestName is a public name every Debian machine needs to reach today (its package mirror); a resolver that cannot answer it cannot install anything.
 const publicTestName = "deb.debian.org"
@@ -101,6 +108,11 @@ type DNSFacts struct {
 	Tests     []DNSTest `json:"tests"`
 }
 
+// TaskKeysFacts is the `task-keys` observation: the ids of the task-signing keys this agent trusts, sorted.
+type TaskKeysFacts struct {
+	KeyIDs []string `json:"keyIds"`
+}
+
 // NetworkFacts is the `network` observation.
 type NetworkFacts struct {
 	Interfaces []Interface `json:"interfaces"`
@@ -123,6 +135,8 @@ type Collector struct {
 	Clock func() (time.Duration, bool)
 	// ReadBundleRecord returns the text of the installed-bundle record; nil means no record is read.
 	ReadBundleRecord func() (string, error)
+	// TrustedKeyIDs returns the ids of the task-signing keys the agent trusts (state.State.KeyIDs).
+	TrustedKeyIDs func() []string
 }
 
 func realRun(ctx context.Context, name string, args ...string) (string, error) {
@@ -162,7 +176,7 @@ func realInterfaces() []Interface {
 
 // Known says whether this agent can collect a kind. A kind the platform asks for that is not here is simply not sent.
 func (c Collector) Known(kind string) bool {
-	return kind == Network || kind == Clock || kind == Runtime || kind == DNS
+	return kind == Network || kind == Clock || kind == Runtime || kind == DNS || kind == TaskKeys
 }
 
 // Collect reads one kind: what is sent as the observation's `data`, and its version. The version is a digest of what the fact *is*, so a fact that has
@@ -186,6 +200,9 @@ func (c Collector) Collect(ctx context.Context, kind string) (any, string, error
 	}
 	if kind == DNS {
 		return c.dns(ctx)
+	}
+	if kind == TaskKeys {
+		return c.taskKeys()
 	}
 	if kind != Network {
 		return nil, "", nil
@@ -230,6 +247,26 @@ func (c Collector) runtime(ctx context.Context) (any, string, error) {
 	sum := sha256.Sum256([]byte(strings.Join(parts, ",") + "|" + bundle))
 	version := "r" + hex.EncodeToString(sum[:])[:12]
 	return RuntimeFacts{LeftoverSupervisors: pids, BundleSHA256: bundle}, version, nil
+}
+
+// taskKeys reads the ids of the keys the agent trusts from its own state: nothing on the machine is asked. An agent that trusts no key
+// (it cannot be sent a task) reports nothing.
+func (c Collector) taskKeys() (any, string, error) {
+	if c.TrustedKeyIDs == nil {
+		return nil, "", nil
+	}
+	ids := []string{}
+	for _, id := range c.TrustedKeyIDs() {
+		if taskKeyID.MatchString(id) && len(ids) < maxTaskKeys {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, "", nil
+	}
+	sort.Strings(ids)
+	sum := sha256.Sum256([]byte(strings.Join(ids, ",")))
+	return TaskKeysFacts{KeyIDs: ids}, "k" + hex.EncodeToString(sum[:])[:12], nil
 }
 
 var resolverLine = regexp.MustCompile(`^nameserver\s+(\d{1,3}(?:\.\d{1,3}){3})\s*$`)

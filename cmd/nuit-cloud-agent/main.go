@@ -167,6 +167,7 @@ func run(args []string) error {
 	if u, err := url.Parse(c.BaseURL); err == nil {
 		facts.PlatformHost = u.Hostname()
 	}
+	facts.TrustedKeyIDs = st.KeyIDs
 	c.Observer = facts
 	logger := log.New(os.Stderr, "", log.LstdFlags|log.LUTC)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -199,6 +200,7 @@ func run(args []string) error {
 			Runtime:      runtimeinstall.Stager{BaseURL: c.BaseURL, HTTP: c, Dir: filepath.Join(*dir, "stage")},
 			ControlPlane: controlplane.Provisioner{Source: c, Fetcher: runtimeinstall.Stager{BaseURL: c.BaseURL, HTTP: c, Dir: filepath.Join(*dir, "stage")}, StageDir: filepath.Join(*dir, "stage"), PlatformURL: c.BaseURL},
 			Updater:      update.Updater{BaseURL: c.BaseURL, HTTP: c, ExePath: exe, StateDir: *dir, Version: version, Arch: runtime.GOARCH, State: st},
+			Keys:         st,
 			Restart:      restart,
 		},
 		Guard:   update.Guard{ExePath: exe, Version: version, State: st},
@@ -219,10 +221,7 @@ func status(args []string) error {
 	if err != nil {
 		return err
 	}
-	keys := make([]string, 0, len(st.TrustedKeys))
-	for _, k := range st.TrustedKeys {
-		keys = append(keys, k.KeyID)
-	}
+	keys := st.KeyIDs()
 	fmt.Printf("name:        %s\nmachine id:  %s\nplatform:    %s\nenrolled at: %s\ntrusted keys: %s\nagent:       %s\n", st.Name, st.MachineID, st.PlatformURL, st.EnrolledAt.Format(time.RFC3339), strings.Join(keys, ", "), version)
 	return nil
 }

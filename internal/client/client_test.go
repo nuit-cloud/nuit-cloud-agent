@@ -317,3 +317,36 @@ func TestTheClientMeasuresTheOffsetFromThePlatformsTime(t *testing.T) {
 		t.Errorf("offset %v %v", d, ok)
 	}
 }
+
+type everyKind struct{}
+
+func (everyKind) Known(string) bool { return true }
+func (everyKind) Collect(_ context.Context, kind string) (any, string, error) {
+	return map[string]any{}, "v-" + kind, nil
+}
+
+// The platform asks for five kinds (network, clock, runtime, dns, task-keys): the agent must not drop the last one it is asked for.
+func TestEveryKindThePlatformAsksForIsSent(t *testing.T) {
+	var sent []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var b struct {
+			Observations []Observation `json:"observations"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&b)
+		for _, o := range b.Observations {
+			sent = append(sent, o.Kind)
+		}
+		_, _ = io.WriteString(w, `{"observe":[{"kind":"network","intervalSeconds":300},{"kind":"clock","intervalSeconds":300},{"kind":"runtime","intervalSeconds":300},{"kind":"dns","intervalSeconds":300},{"kind":"task-keys","intervalSeconds":300}]}`)
+	}))
+	defer srv.Close()
+	c, _ := New(srv.URL, "1", true)
+	c.Observer = everyKind{}
+	for i := 0; i < 2; i++ {
+		if _, err := c.CheckIn(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(sent) != 5 || sent[4] != "task-keys" {
+		t.Errorf("sent %v", sent)
+	}
+}

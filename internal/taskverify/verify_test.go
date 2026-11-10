@@ -192,3 +192,92 @@ func TestRefusesGarbageWithoutPanicking(t *testing.T) {
 	_, err := Verify(v.Tasks["ping"], bad, ctx(v))
 	refusedWith(t, err, "the trusted key is malformed")
 }
+
+// signWith signs a task the way the platform does, with a key of the test's own.
+func signWith(t *testing.T, priv ed25519.PrivateKey, keyID string, v vectors, name string) Envelope {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{"v": 1, "id": "bbbbbbbb-0000-0000-0000-00000000000" + name[:1], "machineId": v.MachineID, "name": name, "params": map[string]any{},
+		"issuedAt": "2026-10-20T12:00:00.000Z", "expiresAt": "2026-10-20T12:10:00.000Z", "timeoutSeconds": 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Envelope{KeyID: keyID, Payload: base64.RawURLEncoding.EncodeToString(payload),
+		Signature: base64.RawURLEncoding.EncodeToString(ed25519.Sign(priv, append([]byte(SigningDomain), payload...)))}
+}
+
+func newKey(t *testing.T) (Key, ed25519.PrivateKey) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Key{KeyID: KeyIDOf(pub), PublicKey: base64.RawURLEncoding.EncodeToString(pub)}, priv
+}
+
+// During a rollover the agent trusts two keys and a task signed by either runs; the verified task says which key signed it.
+func TestDuringARolloverATaskSignedByEitherTrustedKeyIsAccepted(t *testing.T) {
+	v := load(t)
+	next, priv := newKey(t)
+	both := append(append([]Key(nil), v.TrustedKeys...), next)
+
+	old, err := Verify(v.Tasks["ping"], both, ctx(v))
+	if err != nil || old.SignedBy != v.TrustedKeys[0].KeyID {
+		t.Fatalf("signed by the old key: %+v %v", old, err)
+	}
+	fresh, err := Verify(signWith(t, priv, next.KeyID, v, "survey"), both, ctx(v))
+	if err != nil || fresh.SignedBy != next.KeyID {
+		t.Fatalf("signed by the new key: %+v %v", fresh, err)
+	}
+	// once the old key is retired, only the new one verifies
+	_, err = Verify(v.Tasks["ping"], []Key{next}, ctx(v))
+	refusedWith(t, err, "signed by a key this machine does not trust")
+}
+
+// Only the key the task names is tried: a signature by one trusted key under the other's id, or under no id, is refused.
+func TestOnlyTheKeyTheTaskNamesIsTried(t *testing.T) {
+	v := load(t)
+	next, priv := newKey(t)
+	both := append(append([]Key(nil), v.TrustedKeys...), next)
+	env := signWith(t, priv, v.TrustedKeys[0].KeyID, v, "survey")
+	_, err := Verify(env, both, ctx(v))
+	refusedWith(t, err, "the signature does not verify")
+	env.KeyID = ""
+	_, err = Verify(env, append(both, Key{KeyID: "", PublicKey: next.PublicKey}), ctx(v))
+	refusedWith(t, err, "signed by a key this machine does not trust")
+}
+
+// The agent names a key exactly as the platform does (keyIdOf in task-signing.ts): the vectors' key id is derived from its key.
+func TestAKeyIdIsDerivedAsThePlatformDerivesIt(t *testing.T) {
+	v := load(t)
+	raw, _ := base64.RawURLEncoding.DecodeString(v.TrustedKeys[0].PublicKey)
+	if got := KeyIDOf(raw); got != v.TrustedKeys[0].KeyID {
+		t.Errorf("got %s, the platform says %s", got, v.TrustedKeys[0].KeyID)
+	}
+}
+
+func TestATrustKeyTaskCarriesOneWellFormedKeyUnderItsOwnId(t *testing.T) {
+	v := load(t)
+	good := v.TrustedKeys[0]
+	k, err := KeyFromParams(map[string]any{"keyId": good.KeyID, "publicKey": good.PublicKey})
+	if err != nil || k != good {
+		t.Fatalf("%+v %v", k, err)
+	}
+	other, _ := newKey(t)
+	for name, params := range map[string]map[string]any{
+		"another key's id":  {"keyId": other.KeyID, "publicKey": good.PublicKey},
+		"no id":             {"publicKey": good.PublicKey},
+		"upper-case id":     {"keyId": "FE812C12F3AB4CE6", "publicKey": good.PublicKey},
+		"id with a newline": {"keyId": good.KeyID + "\n", "publicKey": good.PublicKey},
+		"short key":         {"keyId": good.KeyID, "publicKey": good.PublicKey[:40]},
+		"padded key":        {"keyId": good.KeyID, "publicKey": good.PublicKey + "="},
+		"standard base64":   {"keyId": good.KeyID, "publicKey": "+" + good.PublicKey[1:]},
+		"key as a number":   {"keyId": good.KeyID, "publicKey": 42},
+		"shell in the key":  {"keyId": good.KeyID, "publicKey": "$(reboot)" + good.PublicKey[9:]},
+		"a private key too": {"keyId": good.KeyID, "publicKey": good.PublicKey, "seed": "AAAA"},
+		"nothing":           {},
+	} {
+		if _, err := KeyFromParams(params); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}

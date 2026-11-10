@@ -250,7 +250,7 @@ type checkInBody struct {
 const (
 	minObserveInterval = time.Minute
 	maxObserveInterval = 24 * time.Hour
-	maxWanted          = 4
+	maxWanted          = 8
 )
 
 func (c *Client) now() time.Time {

@@ -22,10 +22,12 @@ const SeenFor = 48 * time.Hour
 
 // State is the agent's identity and memory.
 type State struct {
-	PlatformURL string           `json:"platformUrl"`
-	MachineID   string           `json:"machineId"`
-	Name        string           `json:"name"`
-	Credential  string           `json:"credential"`
+	PlatformURL string `json:"platformUrl"`
+	MachineID   string `json:"machineId"`
+	Name        string `json:"name"`
+	Credential  string `json:"credential"`
+	// TrustedKeys are the keys a task may be signed by (a list from the first release; a rollover adds one and later retires the old).
+	// Read and change it through Keys, TrustKey and RetireKey once the agent is running: a task may change it while the loop reads it.
 	TrustedKeys []taskverify.Key `json:"trustedKeys"`
 	EnrolledAt  time.Time        `json:"enrolledAt"`
 	// Seen maps a task id to when the agent started it.
@@ -153,7 +155,95 @@ func (s *State) SetCredential(credential string) error {
 	return s.saveLocked()
 }
 
-// Pending returns a copy of the pending update, or nil.
+// MaxTrustedKeys is how many task-signing keys an agent trusts at once. A rollover needs two; a third would mean an old key was never retired.
+const MaxTrustedKeys = 4
+
+// Refusals of a change to the trusted keys; their text is reported to the platform.
+var (
+	ErrKeyIDClash      = errors.New("a different key is already trusted under this key id")
+	ErrTooManyKeys     = fmt.Errorf("this machine already trusts %d keys: retire one first", MaxTrustedKeys)
+	ErrRetireSigner    = errors.New("refused: this task is signed by the key it would retire; retire a key with a task signed by another trusted key")
+	ErrRetireLastKey   = errors.New("refused: this is the only key this machine trusts; retiring it would leave no way to send it a task")
+	ErrNoKeyToTrustYet = errors.New("this machine trusts no key yet")
+)
+
+// Keys returns a copy of the trusted keys.
+func (s *State) Keys() []taskverify.Key {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]taskverify.Key(nil), s.TrustedKeys...)
+}
+
+// KeyIDs returns the ids of the trusted keys, in the order they were trusted.
+func (s *State) KeyIDs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ids := make([]string, 0, len(s.TrustedKeys))
+	for _, k := range s.TrustedKeys {
+		ids = append(ids, k.KeyID)
+	}
+	return ids
+}
+
+// TrustKey adds a key and saves at once. It reports whether anything changed: a key already trusted is not an error. The caller has
+// checked the key (taskverify.KeyFromParams) and that the request came in a task signed by a key already trusted.
+func (s *State) TrustKey(k taskverify.Key) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.TrustedKeys) == 0 {
+		return false, ErrNoKeyToTrustYet // nothing could have signed the request
+	}
+	for _, have := range s.TrustedKeys {
+		if have.KeyID == k.KeyID {
+			if have.PublicKey == k.PublicKey {
+				return false, nil
+			}
+			return false, ErrKeyIDClash
+		}
+	}
+	if len(s.TrustedKeys) >= MaxTrustedKeys {
+		return false, ErrTooManyKeys
+	}
+	before := s.TrustedKeys
+	s.TrustedKeys = append(append([]taskverify.Key(nil), before...), k)
+	if err := s.saveLocked(); err != nil {
+		s.TrustedKeys = before // not trusted unless it is on disk
+		return false, err
+	}
+	return true, nil
+}
+
+// RetireKey stops trusting a key and saves at once. It never removes the key that signed the request (signedBy) nor the last key, so a
+// mistaken retire cannot lock the agent out. A key that is not trusted is not an error; it reports whether anything changed.
+func (s *State) RetireKey(id, signedBy string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	at := -1
+	for i, k := range s.TrustedKeys {
+		if k.KeyID == id {
+			at = i
+		}
+	}
+	if at < 0 {
+		return false, nil
+	}
+	if id == signedBy {
+		return false, ErrRetireSigner
+	}
+	if len(s.TrustedKeys) <= 1 {
+		return false, ErrRetireLastKey
+	}
+	before := s.TrustedKeys
+	kept := make([]taskverify.Key, 0, len(before)-1)
+	kept = append(append(kept, before[:at]...), before[at+1:]...)
+	s.TrustedKeys = kept
+	if err := s.saveLocked(); err != nil {
+		s.TrustedKeys = before
+		return false, err
+	}
+	return true, nil
+}
+
 // SetFallbacks remembers the fixed addresses, and writes the state only if they changed.
 func (s *State) SetFallbacks(list []string) error {
 	s.mu.Lock()
@@ -171,6 +261,7 @@ func (s *State) SetFallbacks(list []string) error {
 	return s.saveLocked()
 }
 
+// Pending returns a copy of the pending update, or nil.
 func (s *State) Pending() *PendingUpdate {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -42,6 +42,13 @@ type SelfUpdater interface {
 	Apply(ctx context.Context, p update.Params) (update.Outcome, error)
 }
 
+// KeyStore is where the agent keeps the task-signing keys it trusts (state.State; injectable for tests).
+type KeyStore interface {
+	KeyIDs() []string
+	TrustKey(k taskverify.Key) (bool, error)
+	RetireKey(id, signedBy string) (bool, error)
+}
+
 // Runner performs verified tasks.
 type Runner struct {
 	// Version is the agent's own version, reported by ping.
@@ -72,6 +79,8 @@ type Runner struct {
 	Connectivity func(ctx context.Context, targets []connectivity.Target, version string) []connectivity.Result
 	// JournalExec runs journalctl for service-log (no shell); injectable so tests read no real journal.
 	JournalExec servicelog.Exec
+	// Keys holds the trusted task-signing keys, changed by trust-key and retire-key.
+	Keys KeyStore
 	// Restart is set when a task has changed the agent itself (an update), so the loop restarts it after reporting.
 	Restart *atomic.Bool
 	Now     func() time.Time
@@ -82,7 +91,7 @@ func (r Runner) RestartRequested() bool { return r.Restart != nil && r.Restart.L
 
 // Names is the catalog: what this agent can do.
 func (r Runner) Names() []string {
-	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke", "address-scan", "ssh-confirm", "firewall-confirm", "runtime-repair", "set-hostname", "connectivity-check", "service-log"}
+	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke", "address-scan", "ssh-confirm", "firewall-confirm", "runtime-repair", "set-hostname", "connectivity-check", "service-log", "trust-key", "retire-key"}
 }
 
 // Run performs one task, bounded by its timeout, and says how it went. It never panics the agent: a task that blows up is a
@@ -104,7 +113,11 @@ func (r Runner) Run(ctx context.Context, task *taskverify.Task) (report client.R
 	zero, one := 0, 1
 	switch task.Name {
 	case "ping":
-		return client.Report{Status: "done", ExitCode: &zero, Output: "pong", Result: map[string]any{"pong": true, "agentVersion": r.Version, "at": r.now().UTC().Format(time.RFC3339)}}
+		res := map[string]any{"pong": true, "agentVersion": r.Version, "at": r.now().UTC().Format(time.RFC3339)}
+		if r.Keys != nil {
+			res["trustedKeyIds"] = r.Keys.KeyIDs()
+		}
+		return client.Report{Status: "done", ExitCode: &zero, Output: "pong", Result: res}
 	case "survey":
 		return client.Report{Status: "done", ExitCode: &zero, Output: "surveyed", Result: r.Survey(ctx)}
 	case "profile-check", "profile-apply":
@@ -127,6 +140,10 @@ func (r Runner) Run(ctx context.Context, task *taskverify.Task) (report client.R
 		return r.sshConfirm(ctx)
 	case "firewall-confirm":
 		return r.firewallConfirm(ctx)
+	case "trust-key":
+		return r.trustKey(task)
+	case "retire-key":
+		return r.retireKey(task)
 	}
 	return client.Report{Status: "failed", ExitCode: &one, Output: "unknown task " + task.Name}
 }
@@ -641,6 +658,58 @@ func sshFingerprints(raw map[string]any) ([]string, error) {
 		out = append(out, f)
 	}
 	return out, nil
+}
+
+// trustKey adds a task-signing key (the first half of a rollover). It reaches here only as a verified task, so only a key the agent already
+// trusts can add another; the key is checked again (shape, and that its id is derived from it). Adding a key already trusted changes nothing.
+func (r Runner) trustKey(task *taskverify.Task) client.Report {
+	one, zero := 1, 0
+	if r.Keys == nil || task.SignedBy == "" {
+		return client.Report{Status: "failed", ExitCode: &one, Output: "this agent cannot change the keys it trusts"}
+	}
+	key, err := taskverify.KeyFromParams(task.Params)
+	if err != nil {
+		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+	}
+	changed, err := r.Keys.TrustKey(key)
+	if err != nil {
+		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error(), Result: r.keysResult(key.KeyID, false)}
+	}
+	out := "now trusts key " + key.KeyID
+	if !changed {
+		out = "already trusted key " + key.KeyID
+	}
+	return client.Report{Status: "done", ExitCode: &zero, Output: out, Result: r.keysResult(key.KeyID, changed)}
+}
+
+// retireKey stops trusting a key (the second half of a rollover), never the one that signed this task and never the last one.
+func (r Runner) retireKey(task *taskverify.Task) client.Report {
+	one, zero := 1, 0
+	if r.Keys == nil || task.SignedBy == "" {
+		return client.Report{Status: "failed", ExitCode: &one, Output: "this agent cannot change the keys it trusts"}
+	}
+	for k := range task.Params {
+		if k != "keyId" {
+			return client.Report{Status: "failed", ExitCode: &one, Output: fmt.Sprintf("retire-key carries only keyId, not %q", k)}
+		}
+	}
+	id, _ := task.Params["keyId"].(string)
+	if !taskverify.ValidKeyID(id) {
+		return client.Report{Status: "failed", ExitCode: &one, Output: "the key id must be 16 lower-case hex characters"}
+	}
+	changed, err := r.Keys.RetireKey(id, task.SignedBy)
+	if err != nil {
+		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error(), Result: r.keysResult(id, false)}
+	}
+	out := "no longer trusts key " + id
+	if !changed {
+		out = "key " + id + " was not trusted"
+	}
+	return client.Report{Status: "done", ExitCode: &zero, Output: out, Result: r.keysResult(id, changed)}
+}
+
+func (r Runner) keysResult(id string, changed bool) map[string]any {
+	return map[string]any{"keyId": id, "changed": changed, "trustedKeyIds": r.Keys.KeyIDs()}
 }
 
 // firewallConfirm completes the baseline firewall once the platform has tested from outside.
