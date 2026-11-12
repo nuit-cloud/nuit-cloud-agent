@@ -22,9 +22,10 @@ net_resolves() { # net_resolves [host]
 f_docker_ok() { command -v docker >/dev/null 2>&1 && systemctl is-enabled --quiet docker 2>/dev/null; }
 f_docker_do() {
   if ! command -v docker >/dev/null 2>&1; then
-    net_resolves get.docker.com || return 3
-    command -v curl >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }
-    curl -fsSL https://get.docker.com | sh
+    # Debian's own package from the machine's apt sources (the platform's package source once it is in use, nuit-cloud/nuit-cloud#129),
+    # never a script fetched from the internet and piped into a shell.
+    net_resolves || return 3
+    apt-get update -qq && apt-get install -y -qq docker.io || return 1
   fi
   systemctl enable --now docker
 }

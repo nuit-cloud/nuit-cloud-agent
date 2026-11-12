@@ -45,6 +45,8 @@ bad() { echo "FAIL - $1" >&2; exit 1; }
 if run raspberry-pi-3 --check >"$tmp/out" 2>&1; then bad "check passed on a fresh box"; fi
 grep -q 'DRIFT   pi_cgroup' "$tmp/out" && ! grep -q cgroup "$ROOT/boot/firmware/cmdline.txt" && [ ! -s "$CALLS" ] && ok "--check reports drift and changes nothing" || bad "--check"
 
+# no feature fetches a script from the internet and runs it (docker comes from Debian's docker.io; nuit-cloud/nuit-cloud#129)
+! grep -Eq 'get\.docker\.com|curl[^|]*\|[[:space:]]*(sh|bash)' "$src/bootstrap/features.sh" && ok "no script piped from the internet" || bad "a feature pipes a download into a shell"
 # 2. apply (docker present already via stub PATH): Pi features are made, reboot flagged
 touch "$STATE/enabled-docker" "$STATE/active-systemd-timesyncd"
 run raspberry-pi-3 >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "apply failed"; }
