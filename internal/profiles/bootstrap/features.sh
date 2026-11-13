@@ -1037,6 +1037,14 @@ f_ncs_login_do() {
 # ranges (NCS_FIREWALL_SSH_FROM, default the private ranges) and the TCP ports the task names (NCS_FIREWALL_TCP, e.g. 80 443 on a machine
 # that serves routes; open to anyone). Forwarded traffic is not touched: a pod's published ports are DNATed and forwarded, so the
 # tenants' services are unaffected and nothing here isolates tenants from each other (that is its own design, issue #91).
+# Pod rules (nuit-cloud/nuit-cloud#91), only when the task names them (NCS_FIREWALL_POD_MODE; without it the ruleset is exactly the above):
+# INPUT from the bridges takes DNS, DHCP and ICMP and counts the rest as `pod_input`; a forward chain (policy accept, so other tables keep
+# their own say) lets pods reach their own range (10.89.0.0/16) and what NCS_FIREWALL_POD_ALLOW names, counts the rest of the private
+# ranges as `pod_private`, and lets only NCS_FIREWALL_ADMIN_FROM reach the platform services' admin ports (DNATed from
+# NCS_FIREWALL_ADMIN_TARGETS : NCS_FIREWALL_ADMIN_PORTS), counting the rest as `admin_other`. In `observe` mode every one of those is
+# logged (prefix `nc-<counter> `, rate-limited) and counted but still accepted, so nothing that passes today stops passing; in `enforce`
+# mode it is dropped. The internet is never touched. The mode is written in the file's header (`# pod-mode: ...`), which the agent's
+# `firewall` observation reads.
 # Like the SSH change, this can lock everyone out, so: the rules are syntax-checked first; a timer (nuit-cloud-firewall-rollback) that
 # deletes the table is armed before anything is loaded; after loading, sshd must still be listening; and the timer is left ARMED
 # until the platform has tested from outside (SSH reachable, the open ports not blocked, a port nobody opened dropped) and sent
@@ -1050,21 +1058,93 @@ FW_DEFAULT_SSH_FROM="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
 fw_words() { printf '%s' "$1" | tr ',' ' '; }
 fw_ports() { fw_words "${NCS_FIREWALL_TCP:-}" | tr -s ' ' '\n' | grep -v '^$' | sort -n -u | tr '\n' ' '; }
 fw_ssh_from() { v="$(fw_words "${NCS_FIREWALL_SSH_FROM:-}")"; [ -n "$v" ] || v="$FW_DEFAULT_SSH_FROM"; printf '%s' "$v" | tr -s ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' '; }
+FW_BRIDGES='{ "ocisaas0", "cni0", "docker0", "br-*" }'
+FW_POD_RANGE="10.89.0.0/16"
+FW_PRIVATE="10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16"
+fw_list() { fw_words "$1" | tr -s ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' '; }
+fw_ipv4_ok() { printf '%s' "$1" | grep -Eq '^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$'; }
+fw_net_ok() { case "$1" in */*) fw_ipv4_ok "${1%/*}" && printf '%s' "${1#*/}" | grep -Eq '^(3[0-2]|[12]?[0-9])$';; *) fw_ipv4_ok "$1";; esac; }
+fw_port_ok() { printf '%s' "$1" | grep -Eq '^[1-9][0-9]{0,4}$' && [ "$1" -le 65535 ]; }
+fw_allow_ok() { case "$1" in *:*) fw_net_ok "${1%:*}" && fw_port_ok "${1##*:}";; *) fw_net_ok "$1";; esac; }
+# a comma list of at most $2 entries (at least $3), only digits, dots, slashes and colons: nothing a shell or nft could read as more
+fw_csv_ok() {
+  case "$1" in *[!0-9./:,]*|,*|*,|*,,*) return 1;; esac
+  fw_n="$(printf '%s' "$1" | tr ',' '\n' | grep -c .)" || true
+  [ "$fw_n" -le "$2" ] && [ "$fw_n" -ge "$3" ]
+}
+fw_pod_inputs_ok() {
+  fw_m="${NCS_FIREWALL_POD_MODE:-}"; fw_a="${NCS_FIREWALL_POD_ALLOW:-}"
+  fw_t="${NCS_FIREWALL_ADMIN_TARGETS:-}"; fw_ap="${NCS_FIREWALL_ADMIN_PORTS:-}"; fw_af="${NCS_FIREWALL_ADMIN_FROM:-}"
+  if [ -z "$fw_m" ]; then [ -z "$fw_a$fw_t$fw_ap$fw_af" ]; return; fi
+  case "$fw_m" in observe|enforce) ;; *) return 1;; esac
+  fw_csv_ok "$fw_a" 32 0 || return 1
+  for fw_e in $(fw_list "$fw_a"); do fw_allow_ok "$fw_e" || return 1; done
+  [ -n "$fw_t$fw_ap$fw_af" ] || return 0
+  fw_csv_ok "$fw_t" 16 1 && fw_csv_ok "$fw_ap" 8 1 && fw_csv_ok "$fw_af" 16 1 || return 1
+  for fw_e in $(fw_list "$fw_t"); do fw_ipv4_ok "$fw_e" || return 1; done
+  for fw_e in $(fw_list "$fw_ap"); do fw_port_ok "$fw_e" || return 1; done
+  for fw_e in $(fw_list "$fw_af"); do fw_net_ok "$fw_e" || return 1; done
+}
 fw_inputs_ok() {
   for pt in $(fw_ports); do printf '%s' "$pt" | grep -Eq '^[0-9]{1,5}$' && [ "$pt" -ge 1 ] && [ "$pt" -le 65535 ] || return 1; done
   for c in $(fw_ssh_from); do printf '%s' "$c" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$' || return 1; done
+  fw_pod_inputs_ok
+}
+fw_set() { fw_list "$1" | sed 's/ *$//; s/ /, /g'; } # a sorted, de-duplicated nft set body
+fw_ports_set() { fw_words "$1" | tr -s ' ' '\n' | grep -v '^$' | sort -n -u | tr '\n' ' ' | sed 's/ *$//; s/ /, /g'; }
+# one counted rule: `<match>` logged (at most 10 a minute, the log rule has no verdict so the count and verdict below still apply to every
+# packet) and counted under <counter>; accepted in observe mode, dropped in enforce mode
+fw_counted() {
+  fw_verdict=accept; [ "$NCS_FIREWALL_POD_MODE" != enforce ] || fw_verdict=drop
+  echo "    $2 limit rate 10/minute log prefix \"nc-$1 \""
+  echo "    $2 counter name $1 $fw_verdict"
+}
+fw_render_pod_input() {
+  echo "    iifname $FW_BRIDGES udp dport { 53, 67 } accept"
+  echo "    iifname $FW_BRIDGES tcp dport 53 accept"
+  echo "    iifname $FW_BRIDGES meta l4proto { icmp, ipv6-icmp } accept"
+  fw_counted pod_input "iifname $FW_BRIDGES"
+}
+fw_render_forward() {
+  echo "  chain forward {"
+  echo "    type filter hook forward priority 0; policy accept;"
+  echo "    ct state established,related accept"
+  if [ -n "${NCS_FIREWALL_ADMIN_TARGETS:-}" ]; then
+    fw_admin="ct status dnat ct original ip daddr { $(fw_set "$NCS_FIREWALL_ADMIN_TARGETS") } ct original proto-dst { $(fw_ports_set "$NCS_FIREWALL_ADMIN_PORTS") }"
+    echo "    $fw_admin ip saddr { $(fw_set "$NCS_FIREWALL_ADMIN_FROM") } accept"
+    fw_counted admin_other "$fw_admin"
+  fi
+  echo "    iifname $FW_BRIDGES ip daddr $FW_POD_RANGE accept"
+  for fw_e in $(fw_list "${NCS_FIREWALL_POD_ALLOW:-}"); do
+    case "$fw_e" in
+      *:*) echo "    iifname $FW_BRIDGES ip daddr ${fw_e%:*} meta l4proto { tcp, udp } th dport ${fw_e##*:} accept";;
+      *) echo "    iifname $FW_BRIDGES ip daddr $fw_e accept";;
+    esac
+  done
+  fw_counted pod_private "iifname $FW_BRIDGES ip daddr { $FW_PRIVATE }"
+  echo "  }"
 }
 fw_render() { # the ruleset on stdout
   v4="$(fw_ssh_from | tr -s ' ' ',' | sed 's/,$//')"
+  fw_pods="${NCS_FIREWALL_POD_MODE:-}"
   echo "# Written by the nuit-cloud agent (profile nuit-cloud-firewall). Edit the task, not this file."
+  [ -z "$fw_pods" ] || echo "# pod-mode: $fw_pods"
   echo "table inet $FW_TABLE"
   echo "delete table inet $FW_TABLE"
   echo "table inet $FW_TABLE {"
+  if [ -n "$fw_pods" ]; then
+    for c in pod_input pod_private admin_other; do echo "  counter $c {"; echo "  }"; done
+  fi
   echo "  chain input {"
   echo "    type filter hook input priority 0; policy drop;"
   echo "    iif lo accept"
-  echo "    iifname { \"ocisaas0\", \"cni0\", \"docker0\", \"br-*\" } accept"
-  echo "    ct state established,related accept"
+  if [ -n "$fw_pods" ]; then
+    echo "    ct state established,related accept"
+    fw_render_pod_input
+  else
+    echo "    iifname $FW_BRIDGES accept"
+    echo "    ct state established,related accept"
+  fi
   echo "    ct state invalid drop"
   echo "    ip protocol icmp accept"
   echo "    ip6 nexthdr icmpv6 accept"
@@ -1074,6 +1154,7 @@ fw_render() { # the ruleset on stdout
   ports="$(fw_ports | sed 's/ *$//' | tr -s ' ' ',')"
   [ -z "$ports" ] || echo "    tcp dport { $ports } accept"
   echo "  }"
+  [ -z "$fw_pods" ] || fw_render_forward
   echo "}"
 }
 fw_loaded() { nft list table inet "$FW_TABLE" >/dev/null 2>&1; }
@@ -1081,7 +1162,7 @@ f_ncs_firewall_ok() {
   [ -f "$(p "$FW_RULES")" ] && fw_inputs_ok && [ "$(fw_render)" = "$(cat "$(p "$FW_RULES")")" ] && fw_loaded && systemctl is-enabled --quiet nuit-cloud-firewall 2>/dev/null
 }
 f_ncs_firewall_do() {
-  fw_inputs_ok || { echo "  the task's ports or ranges are not valid (ports 1-65535, ranges like 10.0.0.0/8)" >&2; return 3; }
+  fw_inputs_ok || { echo "  the task's ports, ranges or pod rules are not valid (ports 1-65535, ranges like 10.0.0.0/8, pod mode observe or enforce, at most 32 allowed destinations; admin targets, ports and sources all given or none)" >&2; return 3; }
   command -v systemd-run >/dev/null 2>&1 || { echo "  systemd-run is needed for the safety timer" >&2; return 3; }
   if ! command -v nft >/dev/null 2>&1; then apt-get install -y -qq nftables >/dev/null 2>&1 || true; fi
   command -v nft >/dev/null 2>&1 || { echo "  nftables is not installed and could not be installed" >&2; return 3; }
@@ -1127,7 +1208,7 @@ UNIT
   fw_loaded || { sh "$d/rollback.sh"; echo "  the table is not there after loading, so the change was taken away" >&2; return 1; }
   ss -ltnH 2>/dev/null | awk '{print $4}' | grep -q ":22\$" || { sh "$d/rollback.sh"; echo "  sshd is not listening on port 22, so the firewall was taken away" >&2; return 1; }
   systemctl enable nuit-cloud-firewall >/dev/null 2>&1 || true
-  echo "  the firewall is loaded: SSH from $(fw_ssh_from)${NCS_FIREWALL_TCP:+, TCP $(fw_ports)}, nothing else inbound. Waiting for the platform to test from outside and confirm within ${FW_CONFIRM_SECONDS}s; otherwise it is removed."
+  echo "  the firewall is loaded: SSH from $(fw_ssh_from)${NCS_FIREWALL_TCP:+, TCP $(fw_ports)}, nothing else inbound${NCS_FIREWALL_POD_MODE:+; pod rules in $NCS_FIREWALL_POD_MODE mode}. Waiting for the platform to test from outside and confirm within ${FW_CONFIRM_SECONDS}s; otherwise it is removed."
 }
 
 # ─── Weekly housekeeping ────────────────────────────────────────────────────────────────────────────────────────────────────────

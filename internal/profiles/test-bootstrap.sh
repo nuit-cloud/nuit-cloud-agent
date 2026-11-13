@@ -507,6 +507,89 @@ grep -q 'MANUAL  ncs_firewall' "$tmp/out" && [ ! -s "$CALLS" ] && ok "ncs_firewa
 unset FW_TCP FW_FROM
 fw_net; fw_run >"$tmp/out" 2>&1 || bad "default apply"
 grep -q 'tcp dport 22 ip saddr { 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16 } accept' "$RULES" && ! grep -q 'tcp dport {' "$RULES" && ok "ncs_firewall: with no ranges or ports named, SSH from the private ranges only" || { cat "$RULES"; bad "fw defaults"; }
+# pod rules (nuit-cloud/nuit-cloud#91): absent, the ruleset is today's byte for byte; observe counts and logs but drops nothing; enforce drops
+cat >"$tmp/fw-today.nft" <<'TODAY'
+# Written by the nuit-cloud agent (profile nuit-cloud-firewall). Edit the task, not this file.
+table inet nuit_cloud
+delete table inet nuit_cloud
+table inet nuit_cloud {
+  chain input {
+    type filter hook input priority 0; policy drop;
+    iif lo accept
+    iifname { "ocisaas0", "cni0", "docker0", "br-*" } accept
+    ct state established,related accept
+    ct state invalid drop
+    ip protocol icmp accept
+    ip6 nexthdr icmpv6 accept
+    udp dport 68 accept
+    tcp dport 22 ip saddr { 10.10.10.0/24 } accept
+    tcp dport 22 ip6 saddr { fc00::/7, fe80::/10 } accept
+    tcp dport { 80,443 } accept
+  }
+}
+TODAY
+export FW_TCP="80,443" FW_FROM="10.10.10.0/24"
+fw_net; fw_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "fw apply without pod rules"; }
+cmp -s "$RULES" "$tmp/fw-today.nft" && ok "ncs_firewall: with no pod rules the ruleset is exactly today's" || { diff "$tmp/fw-today.nft" "$RULES"; bad "fw no pods changed the ruleset"; }
+pods_observe() {
+  export NCS_FIREWALL_POD_MODE=observe NCS_FIREWALL_POD_ALLOW="10.10.10.161:5335,10.20.0.0/24,10.10.10.140:5432,10.10.10.161:5335"
+  export NCS_FIREWALL_ADMIN_TARGETS="10.20.0.4,10.20.0.3" NCS_FIREWALL_ADMIN_PORTS="53443,5380" NCS_FIREWALL_ADMIN_FROM="10.10.10.140,10.10.10.0/24"
+}
+pods_off() { unset NCS_FIREWALL_POD_MODE NCS_FIREWALL_POD_ALLOW NCS_FIREWALL_ADMIN_TARGETS NCS_FIREWALL_ADMIN_PORTS NCS_FIREWALL_ADMIN_FROM; }
+# the forward chain, alone
+fw_forward() { awk '/^  chain forward/ {f=1} f {print} f && /^  }/ {exit}' "$RULES"; }
+pods_observe; fw_net; fw_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "fw observe apply"; }
+B='{ "ocisaas0", "cni0", "docker0", "br-*" }'
+grep -q 'done    ncs_firewall' "$tmp/out" && grep -q 'pod rules in observe mode' "$tmp/out" && grep -qx '# pod-mode: observe' "$RULES" \
+  && grep -qx '  counter pod_input {' "$RULES" && grep -qx '  counter pod_private {' "$RULES" && grep -qx '  counter admin_other {' "$RULES" \
+  && ! grep -qxF "    iifname $B accept" "$RULES" \
+  && grep -qxF "    iifname $B udp dport { 53, 67 } accept" "$RULES" && grep -qxF "    iifname $B tcp dport 53 accept" "$RULES" \
+  && grep -qxF "    iifname $B limit rate 10/minute log prefix \"nc-pod_input \"" "$RULES" && grep -qxF "    iifname $B counter name pod_input accept" "$RULES" \
+  && grep -qx '    type filter hook forward priority 0; policy accept;' "$RULES" \
+  && fw_forward | grep -qxF '    ct status dnat ct original ip daddr { 10.20.0.3, 10.20.0.4 } ct original proto-dst { 5380, 53443 } ip saddr { 10.10.10.0/24, 10.10.10.140 } accept' \
+  && fw_forward | grep -qxF '    ct status dnat ct original ip daddr { 10.20.0.3, 10.20.0.4 } ct original proto-dst { 5380, 53443 } counter name admin_other accept' \
+  && fw_forward | grep -qxF "    iifname $B ip daddr 10.89.0.0/16 accept" \
+  && fw_forward | grep -qxF "    iifname $B ip daddr 10.10.10.140 meta l4proto { tcp, udp } th dport 5432 accept" \
+  && [ "$(fw_forward | grep -cF 'ip daddr 10.10.10.161 meta l4proto { tcp, udp } th dport 5335 accept')" = 1 ] \
+  && fw_forward | grep -qxF "    iifname $B ip daddr 10.20.0.0/24 accept" \
+  && fw_forward | grep -qF 'counter name pod_private accept' && fw_forward | grep -qF 'log prefix "nc-pod_private "' \
+  && ! fw_forward | grep -qw drop && ! grep -Eq 'counter name [a-z_]+ drop' "$RULES" \
+  && ok "ncs_firewall: observe mode adds the forward chain, the counters and the allowed destinations (sorted, once each) and drops nothing" || { cat "$tmp/out"; cat "$RULES"; bad "fw observe render"; }
+# the admin rules come before the pods' own, and the allowed destinations before the catch-all for private ranges
+fw_forward | awk '/admin_other accept/ {a=NR} /10.89.0.0\/16 accept/ {p=NR} /th dport 5432 accept/ {l=NR} /pod_private accept/ {c=NR} END { exit (a && p && l && c && a < p && p < l && l < c) ? 0 : 1 }' \
+  && ok "ncs_firewall: the forward chain is in order (admin, the pods' own range, what the task allows, then the private ranges)" || { fw_forward; bad "fw forward order"; }
+: >"$CALLS"; fw_run --check >/dev/null 2>&1 && ok "ncs_firewall: observe rules check clean once applied" || { cat "$RULES"; bad "fw observe check"; }
+NCS_FIREWALL_POD_ALLOW="10.10.10.161:5335,10.20.0.0/24,10.10.10.140:5432" fw_run --check >/dev/null 2>&1 && ok "ncs_firewall: the same allow list in another order with duplicates removed is the same ruleset" || bad "fw observe order-insensitive"
+NCS_FIREWALL_POD_MODE=enforce fw_run --check >/dev/null 2>&1 && bad "a change of pod mode passed the check" || ok "ncs_firewall: a change of pod mode is drift"
+pods_off; fw_run --check >/dev/null 2>&1 && bad "removing the pod rules passed the check" || ok "ncs_firewall: removing the pod rules is drift"
+cp "$RULES" "$tmp/fw-observe.nft"
+# a real nft, where this machine has one and may use it, checks the rendered rules (the stub above stands in for it otherwise)
+real_nft=""; for c in /usr/sbin/nft /sbin/nft /usr/bin/nft; do [ -x "$c" ] && { real_nft="$c"; break; }; done
+pods_observe; NCS_FIREWALL_POD_MODE=enforce; fw_net; fw_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "fw enforce apply"; }
+grep -qx '# pod-mode: enforce' "$RULES" && grep -qxF "    iifname $B counter name pod_input drop" "$RULES" && fw_forward | grep -qF 'counter name pod_private drop' && fw_forward | grep -qF 'counter name admin_other drop' \
+  && fw_forward | grep -qF 'ip saddr { 10.10.10.0/24, 10.10.10.140 } accept' && grep -qx '    type filter hook forward priority 0; policy accept;' "$RULES" \
+  && ok "ncs_firewall: enforce mode drops what observe mode only counts, and the chain's policy stays accept" || { cat "$RULES"; bad "fw enforce render"; }
+if [ -n "$real_nft" ] && "$real_nft" -c -f "$tmp/fw-today.nft" >/dev/null 2>&1; then
+  "$real_nft" -c -f "$tmp/fw-observe.nft" && "$real_nft" -c -f "$RULES" && ok "ncs_firewall: $real_nft accepts the observe and enforce rules" || bad "nft rejected the pod rules"
+else
+  echo "ok - ncs_firewall: SKIPPED checking the pod rules with a real nft (none here, or it may not use netlink; checked by hand on Debian 13's nft 1.1.3)"
+fi
+# what the task may not say is refused before anything changes: the machine keeps its observe rules
+for case in "NCS_FIREWALL_POD_MODE=permissive" "NCS_FIREWALL_POD_ALLOW=10.0.0.1:99999" "NCS_FIREWALL_POD_ALLOW=10.0.0.1:0" "NCS_FIREWALL_POD_ALLOW=10.0.0.256" \
+  "NCS_FIREWALL_POD_ALLOW=10.0.0.0/33" "NCS_FIREWALL_POD_ALLOW=10.0.0.1;reboot" "NCS_FIREWALL_POD_ALLOW=*" "NCS_FIREWALL_POD_ALLOW=10.0.0.1,,10.0.0.2" \
+  "NCS_FIREWALL_POD_ALLOW=10.0.0.1 accept" "NCS_FIREWALL_POD_ALLOW=$(seq 1 33 | sed 's/^/10.0.0./' | paste -sd, -)" \
+  "NCS_FIREWALL_ADMIN_FROM=" "NCS_FIREWALL_ADMIN_TARGETS=10.20.0.0/24" "NCS_FIREWALL_ADMIN_PORTS=1,2,3,4,5,6,7,8,9" "NCS_FIREWALL_ADMIN_PORTS=5380/tcp"; do
+  pods_observe; fw_net; cp "$tmp/fw-observe.nft" "$RULES" 2>/dev/null || { mkdir -p "$(dirname "$RULES")"; cp "$tmp/fw-observe.nft" "$RULES"; }
+  env "$case" sh "$here/bootstrap.sh" nuit-cloud-firewall >"$tmp/out" 2>&1 && bad "the pod rules $case were accepted"
+  grep -q 'MANUAL  ncs_firewall' "$tmp/out" && [ ! -s "$CALLS" ] && cmp -s "$RULES" "$tmp/fw-observe.nft" || { cat "$tmp/out"; cat "$CALLS"; bad "fw hostile $case"; }
+done
+ok "ncs_firewall: a bad pod mode, address, port, list or admin set (or one that is not all three) changes nothing"
+pods_off; fw_net; NCS_FIREWALL_POD_ALLOW=10.0.0.1 fw_run >"$tmp/out" 2>&1 && bad "pod rules without a mode were accepted"
+grep -q 'MANUAL  ncs_firewall' "$tmp/out" && [ ! -s "$CALLS" ] && ok "ncs_firewall: pod rules without a mode change nothing" || { cat "$tmp/out"; bad "fw pods without mode"; }
+pods_off; NCS_FIREWALL_POD_MODE=observe; export NCS_FIREWALL_POD_MODE; fw_net; fw_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "fw observe minimal"; }
+! grep -q 'admin_other accept' "$RULES" && grep -qx '  counter admin_other {' "$RULES" && fw_forward | grep -qF 'counter name pod_private accept' \
+  && ok "ncs_firewall: observe mode with nothing allowed and no admin set still counts every private destination" || { cat "$RULES"; bad "fw observe minimal render"; }
+pods_off; unset FW_TCP FW_FROM
 export ROOT="$OLDROOT4"
 # 15. ncs_housekeeping: a weekly timer, written once and never over someone else's
 HKROOT="$tmp/hkroot"; mkdir -p "$HKROOT"; OLDROOT5="$ROOT"; export ROOT="$HKROOT"; : >"$CALLS"

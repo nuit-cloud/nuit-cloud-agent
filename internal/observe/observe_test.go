@@ -229,7 +229,7 @@ func TestEveryKindsVersionIsOneThePlatformKeeps(t *testing.T) {
 		ReadBundleRecord: func() (string, error) { return strings.Repeat("ab12", 16), nil },
 		TrustedKeyIDs:    func() []string { return []string{"fe812c12f3ab4ce6"} },
 	}
-	for _, kind := range []string{Network, Clock, Runtime, DNS, TaskKeys} {
+	for _, kind := range []string{Network, Clock, Runtime, DNS, TaskKeys, Firewall} {
 		_, v, err := c.Collect(context.Background(), kind)
 		if err != nil || !versionOK.MatchString(v) {
 			t.Errorf("%s: version %q (%v)", kind, v, err)
@@ -291,7 +291,7 @@ func TestEveryKindTheAgentCanCollectIsOneItSaysItKnows(t *testing.T) {
 		ReadBundleRecord: func() (string, error) { return "", errors.New("none") },
 		TrustedKeyIDs:    func() []string { return []string{"fe812c12f3ab4ce6"} },
 	}
-	for _, kind := range []string{Network, Clock, Runtime, DNS, TaskKeys} {
+	for _, kind := range []string{Network, Clock, Runtime, DNS, TaskKeys, Firewall} {
 		if !c.Known(kind) {
 			t.Errorf("%s is not a known kind", kind)
 		}

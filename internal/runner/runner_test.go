@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -454,6 +455,88 @@ func TestFirewallParametersBecomeTheScriptsSettingsAndAreCheckedAgain(t *testing
 		if _, err := firewallEnvironment(bad); err == nil {
 			t.Errorf("%v was accepted", bad)
 		}
+	}
+}
+
+// The pod rules (nuit-cloud/nuit-cloud#91) reach the script only in the contract's shape: anything else refuses the task with a plain error.
+func TestFirewallPodRulesBecomeTheScriptsSettingsAndAnythingElseIsRefused(t *testing.T) {
+	pods := func() map[string]any {
+		return map[string]any{
+			"mode":  "observe",
+			"allow": []any{"10.10.10.161:5335", "10.20.0.0/24", "10.10.10.140", "10.10.10.0/24:9000"},
+			"admin": map[string]any{
+				"targets": []any{"10.20.0.3", "10.20.0.4"},
+				"ports":   []any{float64(5380), float64(53443)},
+				"from":    []any{"10.10.10.140", "10.10.10.0/24"},
+			},
+		}
+	}
+	env, err := firewallEnvironment(map[string]any{"tcp": []any{float64(443)}, "pods": pods()})
+	want := "NCS_FIREWALL_TCP=443|NCS_FIREWALL_SSH_FROM=|NCS_FIREWALL_POD_MODE=observe|NCS_FIREWALL_POD_ALLOW=10.10.10.161:5335,10.20.0.0/24,10.10.10.140,10.10.10.0/24:9000" +
+		"|NCS_FIREWALL_ADMIN_TARGETS=10.20.0.3,10.20.0.4|NCS_FIREWALL_ADMIN_PORTS=5380,53443|NCS_FIREWALL_ADMIN_FROM=10.10.10.140,10.10.10.0/24"
+	if err != nil || strings.Join(env, "|") != want {
+		t.Fatalf("%v %v", env, err)
+	}
+	// enforce, nothing allowed, no admin rules: only the mode and an empty allow list
+	env, err = firewallEnvironment(map[string]any{"pods": map[string]any{"mode": "enforce", "allow": []any{}}})
+	if err != nil || strings.Join(env, "|") != "NCS_FIREWALL_TCP=|NCS_FIREWALL_SSH_FROM=|NCS_FIREWALL_POD_MODE=enforce|NCS_FIREWALL_POD_ALLOW=" {
+		t.Fatalf("%v %v", env, err)
+	}
+	// without pod rules nothing about pods is set, so the ruleset stays exactly what it was
+	env, _ = firewallEnvironment(map[string]any{"tcp": []any{float64(443)}})
+	if strings.Contains(strings.Join(env, "|"), "POD") || strings.Contains(strings.Join(env, "|"), "ADMIN") {
+		t.Errorf("%v", env)
+	}
+	many := func(n int, f func(i int) any) []any {
+		out := []any{}
+		for i := 0; i < n; i++ {
+			out = append(out, f(i))
+		}
+		return out
+	}
+	addr := func(i int) any { return "10.0." + strconv.Itoa(i/250) + "." + strconv.Itoa(i%250+1) }
+	for name, change := range map[string]func(p map[string]any){
+		"no mode":              func(p map[string]any) { delete(p, "mode") },
+		"another mode":         func(p map[string]any) { p["mode"] = "permissive" },
+		"an unknown key":       func(p map[string]any) { p["deny"] = []any{"10.0.0.1"} },
+		"no allow list":        func(p map[string]any) { delete(p, "allow") },
+		"33 allowed":           func(p map[string]any) { p["allow"] = many(33, addr) },
+		"a port of 0":          func(p map[string]any) { p["allow"] = []any{"10.0.0.1:0"} },
+		"a port too high":      func(p map[string]any) { p["allow"] = []any{"10.0.0.1:65536"} },
+		"a range too wide":     func(p map[string]any) { p["allow"] = []any{"10.0.0.0/33"} },
+		"an octet over 255":    func(p map[string]any) { p["allow"] = []any{"10.0.0.256"} },
+		"a leading zero":       func(p map[string]any) { p["allow"] = []any{"010.0.0.1"} },
+		"IPv6":                 func(p map[string]any) { p["allow"] = []any{"fd00::1"} },
+		"a name":               func(p map[string]any) { p["allow"] = []any{"example.com"} },
+		"a shell word":         func(p map[string]any) { p["allow"] = []any{"10.0.0.1;reboot"} },
+		"a second rule":        func(p map[string]any) { p["allow"] = []any{"10.0.0.1 accept\nflush ruleset"} },
+		"a list in one":        func(p map[string]any) { p["allow"] = []any{"10.0.0.1,10.0.0.2"} },
+		"a glob":               func(p map[string]any) { p["allow"] = []any{"*"} },
+		"a number":             func(p map[string]any) { p["allow"] = []any{float64(10)} },
+		"a port with a sign":   func(p map[string]any) { p["allow"] = []any{"10.0.0.1:+53"} },
+		"a port range":         func(p map[string]any) { p["allow"] = []any{"10.0.0.1:53-54"} },
+		"admin not an object":  func(p map[string]any) { p["admin"] = "all" },
+		"admin unknown key":    func(p map[string]any) { p["admin"].(map[string]any)["proto"] = "tcp" },
+		"admin without from":   func(p map[string]any) { delete(p["admin"].(map[string]any), "from") },
+		"admin no targets":     func(p map[string]any) { p["admin"].(map[string]any)["targets"] = []any{} },
+		"admin 17 targets":     func(p map[string]any) { p["admin"].(map[string]any)["targets"] = many(17, addr) },
+		"admin target a range": func(p map[string]any) { p["admin"].(map[string]any)["targets"] = []any{"10.20.0.0/24"} },
+		"admin 9 ports": func(p map[string]any) {
+			p["admin"].(map[string]any)["ports"] = many(9, func(i int) any { return float64(5380 + i) })
+		},
+		"admin port as text":  func(p map[string]any) { p["admin"].(map[string]any)["ports"] = []any{"5380"} },
+		"admin port fraction": func(p map[string]any) { p["admin"].(map[string]any)["ports"] = []any{5380.5} },
+		"admin 17 sources":    func(p map[string]any) { p["admin"].(map[string]any)["from"] = many(17, addr) },
+		"admin source bad":    func(p map[string]any) { p["admin"].(map[string]any)["from"] = []any{"10.0.0.0/8 accept"} },
+	} {
+		p := pods()
+		change(p)
+		if env, err := firewallEnvironment(map[string]any{"pods": p}); err == nil {
+			t.Errorf("%s was accepted: %v", name, env)
+		}
+	}
+	if _, err := firewallEnvironment(map[string]any{"pods": "observe"}); err == nil {
+		t.Error("pod rules that are not an object were accepted")
 	}
 }
 

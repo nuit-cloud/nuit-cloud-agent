@@ -35,6 +35,9 @@ const (
 	DNS = "dns"
 	// TaskKeys is which task-signing keys this agent trusts (their ids), so the platform can see an agent left trusting only a retired key.
 	TaskKeys = "task-keys"
+	// Firewall is the pod rules of the machine's firewall (nuit-cloud/nuit-cloud#91): their mode, their counters and what they recently
+	// counted (destination, port and protocol only), so the platform can see what enforcing them would stop before it does.
+	Firewall = "firewall"
 )
 
 // maxTaskKeys bounds the task-keys observation (an agent trusts at most four; the platform enforces its own limit again).
@@ -137,6 +140,8 @@ type Collector struct {
 	ReadBundleRecord func() (string, error)
 	// TrustedKeyIDs returns the ids of the task-signing keys the agent trusts (state.State.KeyIDs).
 	TrustedKeyIDs func() []string
+	// ReadFirewallRules returns the text of the firewall's rules file (FirewallRules); nil means the mode is not read (it is reported off).
+	ReadFirewallRules func() (string, error)
 }
 
 func realRun(ctx context.Context, name string, args ...string) (string, error) {
@@ -151,6 +156,9 @@ func realRun(ctx context.Context, name string, args ...string) (string, error) {
 func Real() Collector {
 	return Collector{Run: realRun, Interfaces: realInterfaces, ReadBundleRecord: func() (string, error) {
 		b, err := os.ReadFile(RuntimeBundleRecord)
+		return string(b), err
+	}, ReadFirewallRules: func() (string, error) {
+		b, err := os.ReadFile(FirewallRules)
 		return string(b), err
 	}}
 }
@@ -176,7 +184,7 @@ func realInterfaces() []Interface {
 
 // Known says whether this agent can collect a kind. A kind the platform asks for that is not here is simply not sent.
 func (c Collector) Known(kind string) bool {
-	return kind == Network || kind == Clock || kind == Runtime || kind == DNS || kind == TaskKeys
+	return kind == Network || kind == Clock || kind == Runtime || kind == DNS || kind == TaskKeys || kind == Firewall
 }
 
 // Collect reads one kind: what is sent as the observation's `data`, and its version. The version is a digest of what the fact *is*, so a fact that has
@@ -203,6 +211,10 @@ func (c Collector) Collect(ctx context.Context, kind string) (any, string, error
 	}
 	if kind == TaskKeys {
 		return c.taskKeys()
+	}
+	if kind == Firewall {
+		facts := c.firewall(ctx)
+		return facts, facts.version(), nil
 	}
 	if kind != Network {
 		return nil, "", nil

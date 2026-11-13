@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"regexp"
@@ -620,7 +621,126 @@ func firewallEnvironment(raw map[string]any) ([]string, error) {
 			from = append(from, c)
 		}
 	}
-	return []string{"NCS_FIREWALL_TCP=" + strings.Join(ports, ","), "NCS_FIREWALL_SSH_FROM=" + strings.Join(from, ",")}, nil
+	env := []string{"NCS_FIREWALL_TCP=" + strings.Join(ports, ","), "NCS_FIREWALL_SSH_FROM=" + strings.Join(from, ",")}
+	if p, ok := raw["pods"]; ok {
+		podEnv, err := podFirewallEnvironment(p)
+		if err != nil {
+			return nil, fmt.Errorf("the firewall's pod rules: %w", err)
+		}
+		env = append(env, podEnv...)
+	}
+	return env, nil
+}
+
+// podFirewallEnvironment turns the signed pod rules (nuit-cloud/nuit-cloud#91) into the scripts' settings: the mode (observe counts and logs,
+// enforce drops), the destinations pods may reach beyond their own range, and who may reach the platform services' admin ports. Every entry
+// is checked here for shape, count and character set before it reaches the script (which checks again); anything the contract does not
+// name is refused, so a key the agent does not understand cannot be silently ignored.
+func podFirewallEnvironment(v any) ([]string, error) {
+	raw, ok := v.(map[string]any)
+	if !ok {
+		return nil, errors.New("they are not an object")
+	}
+	for k := range raw {
+		if k != "mode" && k != "allow" && k != "admin" {
+			return nil, fmt.Errorf("%q is not something the agent knows", k)
+		}
+	}
+	mode, _ := raw["mode"].(string)
+	if mode != "observe" && mode != "enforce" {
+		return nil, errors.New("the mode is observe or enforce")
+	}
+	list, ok := raw["allow"].([]any)
+	if !ok || len(list) > 32 {
+		return nil, errors.New("they allow a list of 0 to 32 destinations")
+	}
+	allow := make([]string, 0, len(list))
+	for _, e := range list {
+		s, _ := e.(string)
+		if !podDestination(s) {
+			return nil, fmt.Errorf("%q is not a destination such as 10.20.0.0/24 or 10.10.10.140:5432", s)
+		}
+		allow = append(allow, s)
+	}
+	env := []string{"NCS_FIREWALL_POD_MODE=" + mode, "NCS_FIREWALL_POD_ALLOW=" + strings.Join(allow, ",")}
+	a, ok := raw["admin"]
+	if !ok {
+		return env, nil
+	}
+	admin, ok := a.(map[string]any)
+	if !ok {
+		return nil, errors.New("the admin rules are not an object")
+	}
+	for k := range admin {
+		if k != "targets" && k != "ports" && k != "from" {
+			return nil, fmt.Errorf("the admin rules: %q is not something the agent knows", k)
+		}
+	}
+	targets, err := podList(admin["targets"], 16, "targets", "an IPv4 address", podAddress)
+	if err != nil {
+		return nil, err
+	}
+	from, err := podList(admin["from"], 16, "sources", "an IPv4 address or range", podNetwork)
+	if err != nil {
+		return nil, err
+	}
+	pl, ok := admin["ports"].([]any)
+	if !ok || len(pl) < 1 || len(pl) > 8 {
+		return nil, errors.New("the admin rules name 1 to 8 ports")
+	}
+	adminPorts := make([]string, 0, len(pl))
+	for _, e := range pl {
+		n, ok := e.(float64)
+		if !ok || n != float64(int(n)) || n < 1 || n > 65535 {
+			return nil, fmt.Errorf("%v is not a port", e)
+		}
+		adminPorts = append(adminPorts, strconv.Itoa(int(n)))
+	}
+	return append(env, "NCS_FIREWALL_ADMIN_TARGETS="+strings.Join(targets, ","), "NCS_FIREWALL_ADMIN_PORTS="+strings.Join(adminPorts, ","),
+		"NCS_FIREWALL_ADMIN_FROM="+strings.Join(from, ",")), nil
+}
+
+// podList is a list of 1 to max strings, each accepted by ok.
+func podList(v any, max int, plural, what string, ok func(string) bool) ([]string, error) {
+	list, isList := v.([]any)
+	if !isList || len(list) < 1 || len(list) > max {
+		return nil, fmt.Errorf("the admin rules name 1 to %d %s", max, plural)
+	}
+	out := make([]string, 0, len(list))
+	for _, e := range list {
+		s, _ := e.(string)
+		if !ok(s) {
+			return nil, fmt.Errorf("%q is not %s", s, what)
+		}
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+// podAddress is an IPv4 address written plainly (no leading zeros, nothing around it).
+func podAddress(s string) bool {
+	a, err := netip.ParseAddr(s)
+	return err == nil && a.Is4() && a.String() == s
+}
+
+// podNetwork is an IPv4 address or an IPv4 range such as 10.0.0.0/8.
+func podNetwork(s string) bool {
+	addr, bits, cut := strings.Cut(s, "/")
+	if !cut {
+		return podAddress(s)
+	}
+	n, err := strconv.Atoi(bits)
+	return podAddress(addr) && err == nil && strconv.Itoa(n) == bits && n >= 0 && n <= 32
+}
+
+// podDestination is a podNetwork, optionally with :port (1-65535).
+func podDestination(s string) bool {
+	host, port, cut := strings.Cut(s, ":")
+	if !cut {
+		return podNetwork(s)
+	}
+	n, err := strconv.Atoi(port)
+	return podNetwork(host) && err == nil && strconv.Itoa(n) == port && n >= 1 && n <= 65535
 }
 
 // dnsServers is the platform's list of resolvers for the machine: one to three IPv4 addresses, nothing else (it goes into a file the machine
