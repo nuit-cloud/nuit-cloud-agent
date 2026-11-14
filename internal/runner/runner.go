@@ -32,6 +32,7 @@ import (
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/survey"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/taskverify"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/update"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/volume"
 )
 
 // ProfileRunner checks or applies a profile (profiles.Runner; injectable so tests touch no real system).
@@ -85,6 +86,9 @@ type Runner struct {
 	JournalExec servicelog.Exec
 	// Keys holds the trusted task-signing keys, changed by trust-key and retire-key.
 	Keys KeyStore
+	// Volumes copies, writes and removes the Nuit Container Service's persistent volume images (volume-export, volume-import,
+	// volume-remove): its Root is the volumes root (empty: volume.DefaultRoot, /var/lib/oci-saas/volumes) and its Platform the agent's client.
+	Volumes volume.Mover
 	// Restart is set when a task has changed the agent itself (an update), so the loop restarts it after reporting.
 	Restart *atomic.Bool
 	Now     func() time.Time
@@ -95,7 +99,7 @@ func (r Runner) RestartRequested() bool { return r.Restart != nil && r.Restart.L
 
 // Names is the catalog: what this agent can do.
 func (r Runner) Names() []string {
-	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke", "address-scan", "ssh-confirm", "firewall-confirm", "runtime-repair", "set-hostname", "connectivity-check", "service-log", "trust-key", "retire-key"}
+	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke", "address-scan", "ssh-confirm", "firewall-confirm", "runtime-repair", "set-hostname", "connectivity-check", "service-log", "trust-key", "retire-key", "volume-export", "volume-import", "volume-remove"}
 }
 
 // Run performs one task, bounded by its timeout, and says how it went. It never panics the agent: a task that blows up is a
@@ -148,6 +152,8 @@ func (r Runner) Run(ctx context.Context, task *taskverify.Task) (report client.R
 		return r.trustKey(task)
 	case "retire-key":
 		return r.retireKey(task)
+	case "volume-export", "volume-import", "volume-remove":
+		return r.volume(ctx, task)
 	}
 	return client.Report{Status: "failed", ExitCode: &one, Output: "unknown task " + task.Name}
 }
@@ -859,6 +865,57 @@ func (r Runner) retireKey(task *taskverify.Task) client.Report {
 
 func (r Runner) keysResult(id string, changed bool) map[string]any {
 	return map[string]any{"keyId": id, "changed": changed, "trustedKeyIds": r.Keys.KeyIDs()}
+}
+
+// volume runs one of the three tasks that copy a tenant's persistent volume between machines (nuit-cloud/nuit-cloud#186). Every parameter
+// is checked again here (exactly the keys the task carries; the volume a path of the shape t-<tenant uuid>/<name>.img below the volumes
+// root, nothing else); a parameter that does not pass changes nothing.
+func (r Runner) volume(ctx context.Context, task *taskverify.Task) client.Report {
+	one, zero := 1, 0
+	fail := func(err error) client.Report {
+		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+	}
+	switch task.Name {
+	case "volume-export":
+		p, err := volume.ParseExport(task.Params)
+		if err != nil {
+			return fail(err)
+		}
+		res, err := r.Volumes.Export(ctx, p)
+		if err != nil {
+			return fail(err)
+		}
+		return client.Report{Status: "done", ExitCode: &zero, Result: res,
+			Output: fmt.Sprintf("sent %s: %d bytes as %d chunks (%d bytes compressed), SHA-256 %s", p.Volume, res.Size, res.Chunks, res.CompressedBytes, res.SHA256)}
+	case "volume-import":
+		p, err := volume.ParseImport(task.Params)
+		if err != nil {
+			return fail(err)
+		}
+		res, err := r.Volumes.Import(ctx, p)
+		if err != nil {
+			return fail(err)
+		}
+		out := fmt.Sprintf("wrote %s: %d bytes, SHA-256 %s", p.Volume, res.Size, res.SHA256)
+		if res.Already {
+			out = fmt.Sprintf("%s was already here, the same copy (%d bytes, SHA-256 %s)", p.Volume, res.Size, res.SHA256)
+		}
+		return client.Report{Status: "done", ExitCode: &zero, Output: out, Result: res}
+	default: // volume-remove
+		p, err := volume.ParseRemove(task.Params)
+		if err != nil {
+			return fail(err)
+		}
+		res, err := r.Volumes.Remove(ctx, p)
+		if err != nil {
+			return fail(err)
+		}
+		out := "removed " + p.Volume
+		if !res.Removed {
+			out = "no volume " + p.Volume + " on this machine: nothing to remove"
+		}
+		return client.Report{Status: "done", ExitCode: &zero, Output: out, Result: res}
+	}
 }
 
 // firewallConfirm completes the baseline firewall once the platform has tested from outside.

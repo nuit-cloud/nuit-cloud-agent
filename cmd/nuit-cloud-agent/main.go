@@ -31,6 +31,7 @@ import (
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/state"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/survey"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/update"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/volume"
 )
 
 // version is set at build time: -ldflags "-X main.version=1.2.3".
@@ -203,6 +204,7 @@ func run(args []string) error {
 			Ingress:      ingress.Provisioner{Source: c},
 			Updater:      update.Updater{BaseURL: c.BaseURL, HTTP: c, ExePath: exe, StateDir: *dir, Version: version, Arch: runtime.GOARCH, State: st},
 			Keys:         st,
+			Volumes:      volume.Mover{Platform: c},
 			Restart:      restart,
 		},
 		Guard:   update.Guard{ExePath: exe, Version: version, State: st},
