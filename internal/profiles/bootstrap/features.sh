@@ -1115,6 +1115,9 @@ fw_render_forward() {
     fw_counted admin_other "$fw_admin"
   fi
   echo "    iifname $FW_BRIDGES ip daddr $FW_POD_RANGE accept"
+  # Containers on this machine talking to each other (Docker's own networks, a pod reaching a service published on this node): in on a bridge
+  # and out on a bridge never leaves the machine. After the admin rules, so a local pod still cannot reach the platform services' admin ports.
+  echo "    iifname $FW_BRIDGES oifname $FW_BRIDGES accept"
   for fw_e in $(fw_list "${NCS_FIREWALL_POD_ALLOW:-}"); do
     case "$fw_e" in
       *:*) echo "    iifname $FW_BRIDGES ip daddr ${fw_e%:*} meta l4proto { tcp, udp } th dport ${fw_e##*:} accept";;

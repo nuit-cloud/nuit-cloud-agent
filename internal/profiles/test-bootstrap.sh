@@ -558,6 +558,9 @@ grep -q 'done    ncs_firewall' "$tmp/out" && grep -q 'pod rules in observe mode'
 # the admin rules come before the pods' own, and the allowed destinations before the catch-all for private ranges
 fw_forward | awk '/admin_other accept/ {a=NR} /10.89.0.0\/16 accept/ {p=NR} /th dport 5432 accept/ {l=NR} /pod_private accept/ {c=NR} END { exit (a && p && l && c && a < p && p < l && l < c) ? 0 : 1 }' \
   && ok "ncs_firewall: the forward chain is in order (admin, the pods' own range, what the task allows, then the private ranges)" || { fw_forward; bad "fw forward order"; }
+# containers on the machine talking to each other (in on a bridge, out on a bridge) pass, after the admin rules and before the private-range catch-all
+fw_forward | awk -v line="    iifname $B oifname $B accept" '$0 == line {x=NR} /admin_other accept/ {a=NR} /pod_private accept/ {c=NR} END { exit (x && a && c && a < x && x < c) ? 0 : 1 }' \
+  && ok "ncs_firewall: containers on the machine reaching each other pass, after the admin rules and before the private-range catch-all" || { fw_forward; bad "fw container exemption"; }
 : >"$CALLS"; fw_run --check >/dev/null 2>&1 && ok "ncs_firewall: observe rules check clean once applied" || { cat "$RULES"; bad "fw observe check"; }
 NCS_FIREWALL_POD_ALLOW="10.10.10.161:5335,10.20.0.0/24,10.10.10.140:5432" fw_run --check >/dev/null 2>&1 && ok "ncs_firewall: the same allow list in another order with duplicates removed is the same ruleset" || bad "fw observe order-insensitive"
 NCS_FIREWALL_POD_MODE=enforce fw_run --check >/dev/null 2>&1 && bad "a change of pod mode passed the check" || ok "ncs_firewall: a change of pod mode is drift"
