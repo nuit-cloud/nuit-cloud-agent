@@ -31,6 +31,7 @@ import (
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/sshconfirm"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/survey"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/taskverify"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/tenantaddress"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/update"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/volume"
 )
@@ -89,6 +90,9 @@ type Runner struct {
 	// Volumes copies, writes and removes the Nuit Container Service's persistent volume images (volume-export, volume-import,
 	// volume-remove): its Root is the volumes root (empty: volume.DefaultRoot, /var/lib/oci-saas/volumes) and its Platform the agent's client.
 	Volumes volume.Mover
+	// TenantAddresses moves a tenant address on the tenant VLAN onto or off this machine (tenant-address): its zero value works on the real
+	// machine (`ip`, /etc/network/interfaces.d, a packet socket for ARP); tests give it a scratch root and fakes.
+	TenantAddresses tenantaddress.Mover
 	// Restart is set when a task has changed the agent itself (an update), so the loop restarts it after reporting.
 	Restart *atomic.Bool
 	Now     func() time.Time
@@ -99,7 +103,7 @@ func (r Runner) RestartRequested() bool { return r.Restart != nil && r.Restart.L
 
 // Names is the catalog: what this agent can do.
 func (r Runner) Names() []string {
-	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke", "address-scan", "ssh-confirm", "firewall-confirm", "runtime-repair", "set-hostname", "connectivity-check", "service-log", "trust-key", "retire-key", "volume-export", "volume-import", "volume-remove"}
+	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke", "address-scan", "ssh-confirm", "firewall-confirm", "runtime-repair", "set-hostname", "connectivity-check", "service-log", "trust-key", "retire-key", "volume-export", "volume-import", "volume-remove", "tenant-address"}
 }
 
 // Run performs one task, bounded by its timeout, and says how it went. It never panics the agent: a task that blows up is a
@@ -154,6 +158,8 @@ func (r Runner) Run(ctx context.Context, task *taskverify.Task) (report client.R
 		return r.retireKey(task)
 	case "volume-export", "volume-import", "volume-remove":
 		return r.volume(ctx, task)
+	case "tenant-address":
+		return r.tenantAddress(ctx, task)
 	}
 	return client.Report{Status: "failed", ExitCode: &one, Output: "unknown task " + task.Name}
 }
@@ -916,6 +922,46 @@ func (r Runner) volume(ctx context.Context, task *taskverify.Task) client.Report
 		}
 		return client.Report{Status: "done", ExitCode: &zero, Output: out, Result: res}
 	}
+}
+
+// tenantAddress moves a tenant address on the tenant VLAN onto (take) or off (release) this machine, live and in the VLAN configuration
+// (nuit-cloud/nuit-cloud#187). Every parameter is checked again here (exactly action, address, prefix and vlanId; a private IPv4 address);
+// a parameter that does not pass changes nothing.
+func (r Runner) tenantAddress(ctx context.Context, task *taskverify.Task) client.Report {
+	one, zero := 1, 0
+	p, err := tenantaddress.Parse(task.Params)
+	if err != nil {
+		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+	}
+	if p.Action == "release" {
+		res, err := r.TenantAddresses.Release(ctx, p)
+		if err != nil {
+			return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+		}
+		out := "released " + res.Address
+		if !res.WasPresent {
+			out = res.Address + " was not on this machine"
+		}
+		if res.FileChanged {
+			out += "; removed from the VLAN configuration"
+		} else {
+			out += "; not in the VLAN configuration"
+		}
+		return client.Report{Status: "done", ExitCode: &zero, Output: out, Result: res}
+	}
+	res, err := r.TenantAddresses.Take(ctx, p)
+	if err != nil {
+		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+	}
+	out := "took " + res.Address
+	if res.AlreadyHere {
+		out = res.Address + " was already on this machine"
+	}
+	if res.FileChanged {
+		out += "; added to the VLAN configuration"
+	}
+	out += fmt.Sprintf("; announced %d times", res.Announcements)
+	return client.Report{Status: "done", ExitCode: &zero, Output: out, Result: res}
 }
 
 // firewallConfirm completes the baseline firewall once the platform has tested from outside.
