@@ -97,7 +97,7 @@ func TestNamesListsTheProfilesCarried(t *testing.T) {
 
 func TestTheRealEmbeddedProfilesAreTheOnesThePlatformAsksFor(t *testing.T) {
 	got := Runner{}.Names()
-	if !reflect.DeepEqual(got, []string{"nuit-cloud-address", "nuit-cloud-control-plane", "nuit-cloud-firewall", "nuit-cloud-login", "nuit-cloud-resolvers", "nuit-cloud-server", "nuit-cloud-ssh", "nuit-cloud-vlan", "nuit-cloud-wired", "nuit-container-service", "nuit-container-service-record"}) {
+	if !reflect.DeepEqual(got, []string{"nuit-cloud-address", "nuit-cloud-control-plane", "nuit-cloud-firewall", "nuit-cloud-ingress", "nuit-cloud-login", "nuit-cloud-resolvers", "nuit-cloud-server", "nuit-cloud-ssh", "nuit-cloud-vlan", "nuit-cloud-wired", "nuit-container-service", "nuit-container-service-record"}) {
 		t.Errorf("embedded profiles: %v (internal/profiles/bootstrap/profiles holds exactly the profiles the platform asks for)", got)
 	}
 }

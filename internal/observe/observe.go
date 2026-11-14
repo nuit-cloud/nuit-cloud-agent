@@ -38,6 +38,10 @@ const (
 	// Firewall is the pod rules of the machine's firewall (nuit-cloud/nuit-cloud#91): their mode, their counters and what they recently
 	// counted (destination, port and protocol only), so the platform can see what enforcing them would stop before it does.
 	Firewall = "firewall"
+	// Ingress is what the Ingress Service last applied (nuit-cloud/nuit-cloud#184): the revision, whether its nginx container runs, how many
+	// of the platform's site files are in its directory and whether nginx accepts the configuration. Sent only by a machine the
+	// nuit-cloud-ingress profile has been applied to.
+	Ingress = "ingress"
 )
 
 // maxTaskKeys bounds the task-keys observation (an agent trusts at most four; the platform enforces its own limit again).
@@ -142,6 +146,11 @@ type Collector struct {
 	TrustedKeyIDs func() []string
 	// ReadFirewallRules returns the text of the firewall's rules file (FirewallRules); nil means the mode is not read (it is reported off).
 	ReadFirewallRules func() (string, error)
+	// ReadIngressState returns the text of a file the ingress profile records (`settings` or `revision` in ingress.StateDir); nil means
+	// this machine is not looked at as an Ingress Service.
+	ReadIngressState func(name string) (string, error)
+	// ListDir lists the names of the regular files in a directory (the ingress observation counts the platform's site files).
+	ListDir func(dir string) ([]string, error)
 }
 
 func realRun(ctx context.Context, name string, args ...string) (string, error) {
@@ -160,7 +169,7 @@ func Real() Collector {
 	}, ReadFirewallRules: func() (string, error) {
 		b, err := os.ReadFile(FirewallRules)
 		return string(b), err
-	}}
+	}, ReadIngressState: readIngressState, ListDir: listFiles}
 }
 
 func realInterfaces() []Interface {
@@ -184,7 +193,7 @@ func realInterfaces() []Interface {
 
 // Known says whether this agent can collect a kind. A kind the platform asks for that is not here is simply not sent.
 func (c Collector) Known(kind string) bool {
-	return kind == Network || kind == Clock || kind == Runtime || kind == DNS || kind == TaskKeys || kind == Firewall
+	return kind == Network || kind == Clock || kind == Runtime || kind == DNS || kind == TaskKeys || kind == Firewall || kind == Ingress
 }
 
 // Collect reads one kind: what is sent as the observation's `data`, and its version. The version is a digest of what the fact *is*, so a fact that has
@@ -214,6 +223,13 @@ func (c Collector) Collect(ctx context.Context, kind string) (any, string, error
 	}
 	if kind == Firewall {
 		facts := c.firewall(ctx)
+		return facts, facts.version(), nil
+	}
+	if kind == Ingress {
+		facts, ok := c.ingress(ctx)
+		if !ok {
+			return nil, "", nil
+		}
 		return facts, facts.version(), nil
 	}
 	if kind != Network {

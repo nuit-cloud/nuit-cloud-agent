@@ -1636,3 +1636,56 @@ f_ncs_cp_tls_front_do() {
   cp_marker tls-front >"$(cp_dir)/applied-tls-front.nuit-new" && mv "$(cp_dir)/applied-tls-front.nuit-new" "$(cp_dir)/applied-tls-front" || return 1
   echo "  nginx forwards /api/agent/ on port 8443 to $NCS_CP_TLS_UPSTREAM"
 }
+
+# ─── The Ingress Service: the platform's routes in an nginx container (the nuit-cloud-ingress profile; nuit-cloud/nuit-cloud#184) ───────────
+# nginx runs in a container (NCS_INGRESS_CONTAINER, today `nuit-nginx`) that reads its site files from NCS_INGRESS_CONF_DIR and the routes'
+# certificates from directories below NCS_INGRESS_CERT_ROOT. Those three and the revision (NCS_INGRESS_REVISION) come from the signed task. For
+# an apply the AGENT has already read the content with its own credential, computed its revision again (it must be the signed one) and staged
+# it in a root-only directory on tmpfs (NCS_INGRESS_STAGE: sites.list, sites/<file>, certs.list "<n> <dir>", certs/<n>/{fullchain,privkey}.pem).
+# ingress-apply.sh writes it: it backs up our files, writes the certificates and site files (each via a temporary file and a rename, owned like
+# the directory it is in), removes the platform's site files that are no longer wanted (never anything else), runs `nginx -t` in the container,
+# puts every previous file back if nginx refuses, and otherwise reloads nginx and records the revision. Nothing here prints a certificate or a
+# key; they are only ever copied from the stage. The container is checked as running, never started or rebuilt.
+# The agent's own service may not write under /home (ProtectHome=read-only), so the writer runs as a transient systemd unit (as ncs_login does);
+# without systemd, and in tests, it runs directly.
+ING_STATE="${NCS_INGRESS_STATE_DIR:-/var/lib/nuit-cloud/ingress}"
+ing_path_ok() { # an absolute, clean directory of plain names (as the agent checks it)
+  printf '%s' "$1" | grep -Eq '^(/[A-Za-z0-9_-][A-Za-z0-9._-]{0,127})+$' && [ "${#1}" -le 255 ]
+}
+ing_inputs_ok() {
+  printf '%s' "${NCS_INGRESS_REVISION:-}" | grep -Eq '^[0-9a-f]{64}$' || return 1
+  printf '%s' "${NCS_INGRESS_CONTAINER:-}" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$' || return 1
+  ing_path_ok "${NCS_INGRESS_CONF_DIR:-}" && ing_path_ok "${NCS_INGRESS_CERT_ROOT:-}" || return 1
+  case "$NCS_INGRESS_CONF_DIR/" in "$NCS_INGRESS_CERT_ROOT/"*) return 1 ;; esac
+  case "$NCS_INGRESS_CERT_ROOT/" in "$NCS_INGRESS_CONF_DIR/"*) return 1 ;; esac
+  return 0
+}
+ing_settings() { printf 'conf-dir=%s\ncert-root=%s\ncontainer=%s\n' "$NCS_INGRESS_CONF_DIR" "$NCS_INGRESS_CERT_ROOT" "$NCS_INGRESS_CONTAINER"; }
+ing_running() { [ "$(docker inspect --format '{{.State.Running}}' "$NCS_INGRESS_CONTAINER" 2>/dev/null)" = true ]; }
+f_ncs_ingress_ok() {
+  ing_inputs_ok || return 1
+  [ "$(cat "$(p "$ING_STATE")/revision" 2>/dev/null || true)" = "$NCS_INGRESS_REVISION" ] || return 1
+  [ "$(cat "$(p "$ING_STATE")/settings" 2>/dev/null || true)" = "$(ing_settings)" ] || return 1
+  ing_running
+}
+f_ncs_ingress_do() {
+  ing_inputs_ok || { echo "  the task carries no usable ingress settings (revision, confDir, certRoot, container)" >&2; return 1; }
+  if ! ing_running; then
+    echo "  the nginx container $NCS_INGRESS_CONTAINER is not running: start it (the platform does not start or rebuild it), then apply this again. Nothing was changed." >&2
+    return 3
+  fi
+  st="${NCS_INGRESS_STAGE:-}"
+  [ -n "$st" ] && [ -d "$st" ] && [ "$(cat "$st/revision" 2>/dev/null || true)" = "$NCS_INGRESS_REVISION" ] \
+    || { echo "  the ingress configuration for this revision was not fetched (the agent fetches it when it applies)" >&2; return 1; }
+  cp "$here/ingress-apply.sh" "$st/apply.sh" && chmod 700 "$st/apply.sh" || return 1
+  set -- "${ROOT:-}" "$st" "$NCS_INGRESS_CONF_DIR" "$NCS_INGRESS_CERT_ROOT" "$NCS_INGRESS_CONTAINER" "$NCS_INGRESS_REVISION" "$ING_STATE"
+  ing_rc=0
+  if [ -z "${ROOT:-}" ] && [ -d /run/systemd/system ] && command -v systemd-run >/dev/null 2>&1; then
+    systemd-run --quiet --wait --collect --pipe /bin/sh "$st/apply.sh" "$@" || ing_rc=$?
+  else
+    sh "$st/apply.sh" "$@" || ing_rc=$?
+  fi
+  [ "$ing_rc" = 0 ] || return 1
+  case "${NCS_INGRESS_PROBLEMS:-0}" in 0|'') ;; *) echo "  the platform left out ${NCS_INGRESS_PROBLEMS} route(s) it could not render (the portal names them)" ;; esac
+  return 0
+}

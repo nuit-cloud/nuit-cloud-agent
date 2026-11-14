@@ -23,6 +23,7 @@ import (
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/controlplane"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/fwconfirm"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/hostname"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/ingress"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/lanscan"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/profiles"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/runtimeinstall"
@@ -63,7 +64,9 @@ type Runner struct {
 	Runtime RuntimeStager
 	// ControlPlane gives the nuit-cloud-control-plane profile the secrets it needs (never through the task).
 	ControlPlane ControlPlaneProvisioner
-	Updater      SelfUpdater
+	// Ingress gives the nuit-cloud-ingress profile the site files and certificates it writes (never through the task).
+	Ingress IngressProvisioner
+	Updater SelfUpdater
 	// SSHConfirm completes the SSH hardening: re-checks what sshd uses and cancels the rollback timer; injectable for tests.
 	SSHConfirm func(ctx context.Context) (sshconfirm.Result, error)
 	// FirewallConfirm completes the baseline firewall: checks the table is loaded and cancels the rollback timer; injectable for tests.
@@ -251,6 +254,26 @@ func (r Runner) profile(ctx context.Context, task *taskverify.Task) client.Repor
 		}
 		env, scrub = append(env, cpEnv...), cpScrub
 	}
+	if raw, ok := task.Params["ingress"]; ok || name == ingress.Profile {
+		if name != ingress.Profile {
+			return client.Report{Status: "failed", ExitCode: &one, Output: "ingress belongs to the " + ingress.Profile + " profile only"}
+		}
+		params, err := ingress.ParseParams(raw)
+		if err != nil {
+			return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+		}
+		if r.Ingress == nil {
+			return client.Report{Status: "failed", ExitCode: &one, Output: "this agent was built without ingress support"}
+		}
+		// The content (site files, certificates, keys) is read here, with the agent's own credential, checked against the signed revision
+		// and staged; the scripts get only where it is.
+		inEnv, inScrub, cleanup, err := r.Ingress.Prepare(ctx, params, apply)
+		if err != nil {
+			return client.Report{Status: "failed", ExitCode: &one, Output: inScrub(err.Error())}
+		}
+		defer cleanup()
+		env, scrub = append(env, inEnv...), inScrub
+	}
 	res, exit, err := r.Profiles.Run(ctx, name, apply, env...)
 	if err != nil {
 		return client.Report{Status: "failed", ExitCode: &one, Output: scrub(err.Error())}
@@ -282,6 +305,12 @@ const controlPlaneProfile = "nuit-cloud-control-plane"
 // function that removes any secret value from a text.
 type ControlPlaneProvisioner interface {
 	Prepare(ctx context.Context, p controlplane.Params, apply bool) (env []string, scrub func(string) string, err error)
+}
+
+// IngressProvisioner reads and stages the platform's rendered ingress configuration (ingress.Provisioner; injectable for tests). It returns the
+// non-secret environment for the scripts, a function that removes any certificate or key from a text, and a cleanup that removes the stage.
+type IngressProvisioner interface {
+	Prepare(ctx context.Context, p ingress.Params, apply bool) (env []string, scrub func(string) string, cleanup func(), err error)
 }
 
 // RuntimeStager downloads and checks the runtime's files (runtimeinstall.Stager).

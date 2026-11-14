@@ -22,6 +22,7 @@ import (
 
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/client"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/controlplane"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/ingress"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/loop"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/observe"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/profiles"
@@ -199,6 +200,7 @@ func run(args []string) error {
 			PlatformURL:  c.BaseURL,
 			Runtime:      runtimeinstall.Stager{BaseURL: c.BaseURL, HTTP: c, Dir: filepath.Join(*dir, "stage")},
 			ControlPlane: controlplane.Provisioner{Source: c, Fetcher: runtimeinstall.Stager{BaseURL: c.BaseURL, HTTP: c, Dir: filepath.Join(*dir, "stage")}, StageDir: filepath.Join(*dir, "stage"), PlatformURL: c.BaseURL},
+			Ingress:      ingress.Provisioner{Source: c},
 			Updater:      update.Updater{BaseURL: c.BaseURL, HTTP: c, ExePath: exe, StateDir: *dir, Version: version, Arch: runtime.GOARCH, State: st},
 			Keys:         st,
 			Restart:      restart,

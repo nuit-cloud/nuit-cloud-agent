@@ -888,4 +888,144 @@ rm -rf "$STATE"/cp-* "$STATE"/user-* "$STATE"/pkg-* "$STATE"/nginx-bad "$STATE"/
 unset NCS_CP_CONFIG_DIR NCS_CP_INSTALL_DIR NCS_CP_SERVICES NCS_CP_REVISION NCS_CP_MISSING NCS_CP_TLS_UPSTREAM NCS_CP_START_WAIT_SECONDS NCS_CP_BUNDLE_VERSION NCS_CP_BUNDLE_SHA256
 for c in systemctl apt-get id; do cp -p "$tmp/$c.orig" "$tmp/bin/$c"; done; rm -f "$tmp/bin/useradd" "$tmp/bin/nginx"
 export ROOT="$OLDROOT21"
+# 22. the Ingress Service (nuit-cloud-ingress, nuit-cloud/nuit-cloud#184): the agent stages the content; ingress-apply.sh writes it next to
+# files that are not ours, tests it with nginx in the container and puts everything back if nginx refuses. Distinctive fake keys are planted
+# in the stage and must never appear in an output or a command.
+cp -p "$tmp/bin/docker" "$tmp/docker.orig"
+stub docker 'echo "docker $*" >>"$CALLS"
+case "$1" in
+  inspect) [ -e "$STATE/ing-running" ] && echo true || echo false; exit 0;;
+  exec) shift; shift; case "$*" in
+    "nginx -t") if [ -e "$STATE/ing-bad" ]; then echo "nginx: [emerg] unknown directive \"bogus\" in /etc/nginx/conf.d/nuit-cloud-abc12345-shop.conf:1" >&2; exit 1; fi
+      echo "nginx: configuration file /etc/nginx/nginx.conf test is successful" >&2; exit 0;;
+    "nginx -s reload") exit 0;;
+  esac;;
+esac; exit 1'
+OLDROOT22="$ROOT"; export ROOT="$tmp/ingroot"; rm -rf "$ROOT" "$STATE"/ing-*
+ICONF=/home/nuitcloud/nginx/conf.d; ICERTS=/home/nuitcloud/nginx/certs
+mkdir -p "$ROOT$ICONF" "$ROOT$ICERTS/abc12345/shop.example.com" "$ROOT$ICERTS/zzz/old.example.com"
+printf 'server { listen 8080; } # someone else\n' >"$ROOT$ICONF/other.conf"
+printf '# stale route\n' >"$ROOT$ICONF/nuit-cloud-old.conf"
+printf '# default v1\n' >"$ROOT$ICONF/00-nuit-cloud-default.conf"
+printf '# shop v1\n' >"$ROOT$ICONF/nuit-cloud-abc12345-shop.conf"
+printf 'old chain\n' >"$ROOT$ICERTS/abc12345/shop.example.com/fullchain.pem"; printf 'old key\n' >"$ROOT$ICERTS/abc12345/shop.example.com/privkey.pem"
+chmod 640 "$ROOT$ICERTS/abc12345/shop.example.com/"*.pem
+printf 'not ours\n' >"$ROOT$ICERTS/abc12345/shop.example.com/README"; printf 'other chain\n' >"$ROOT$ICERTS/zzz/old.example.com/fullchain.pem"
+ING_KEY1="FIXTURE-INGRESS-KEY-ONE-6a1f0c93"; ING_KEY2="FIXTURE-INGRESS-KEY-TWO-d2e47b18"; ING_KEY3="FIXTURE-INGRESS-KEY-THREE-81c0aa5e"
+IREV1="$(hex64 1)"; IREV2="$(hex64 2)"
+# mkstage <dir> <revision> then lines "site <file> <content>" and "cert <dir> <chain> <key>" on stdin: what the agent leaves in its stage
+mkstage() {
+  rm -rf "$1"; mkdir -m 700 -p "$1/sites" "$1/certs"; printf '%s\n' "$2" >"$1/revision"; : >"$1/sites.list"; : >"$1/certs.list"; k=0
+  while IFS=' ' read -r kind a b c; do
+    case "$kind" in
+      site) printf '%s\n' "$b" >"$1/sites/$a"; echo "$a" >>"$1/sites.list";;
+      cert) k=$((k + 1)); mkdir -m 700 "$1/certs/$k"; printf -- '-----BEGIN CERTIFICATE-----\n%s\n-----END CERTIFICATE-----\n' "$b" >"$1/certs/$k/fullchain.pem"
+        printf -- '-----BEGIN PRIVATE KEY-----\n%s\n-----END PRIVATE KEY-----\n' "$c" >"$1/certs/$k/privkey.pem"; echo "$k $a" >>"$1/certs.list";;
+    esac
+  done
+  chmod 600 "$1"/sites/* "$1"/certs/*/* "$1"/*.list "$1/revision" 2>/dev/null || true
+}
+IST="$tmp/ingstage"
+mkstage "$IST" "$IREV1" <<STAGE
+site 00-nuit-cloud-default.conf # default v2
+site nuit-cloud-abc12345-shop.conf # shop v2
+site nuit-cloud-abc12345-new.conf # new route
+cert $ICERTS/abc12345/shop.example.com chain-shop $ING_KEY1
+cert $ICERTS/abc12345/*.example.com chain-wild $ING_KEY2
+STAGE
+export NCS_INGRESS_REVISION="$IREV1" NCS_INGRESS_CONF_DIR="$ICONF" NCS_INGRESS_CERT_ROOT="$ICERTS" NCS_INGRESS_CONTAINER=nuit-nginx NCS_INGRESS_STAGE="$IST"
+ing_run() { sh "$here/bootstrap.sh" nuit-cloud-ingress "$@"; }
+ingout="$tmp/ing-all"; : >"$ingout"
+# snap: every path under ROOT with its mode, owner and content checksum (what "exactly as it was" means)
+snap() { (cd "$ROOT" && find . -print | LC_ALL=C sort | while IFS= read -r x; do if [ -f "$x" ] && [ ! -L "$x" ]; then printf '%s %s %s\n' "$x" "$(ls -ln "$x" | awk '{print $1" "$3":"$4}')" "$(cksum <"$x")"; else printf '%s %s\n' "$x" "$(ls -ldn "$x" | awk '{print $1" "$3":"$4}')"; fi; done); }
+mode() { ls -ln "$ROOT$1" | cut -c1-10; }
+before="$(snap)"; : >"$CALLS"
+if ing_run --check >"$tmp/out" 2>&1; then bad "ingress: a fresh machine passed the check"; fi; cat "$tmp/out" >>"$ingout"
+grep -q 'DRIFT   ncs_ingress' "$tmp/out" && [ "$before" = "$(snap)" ] && ! grep -q 'docker exec' "$CALLS" && ok "ingress: --check on a fresh machine is drift and changes nothing" || { cat "$tmp/out" "$CALLS"; bad "ingress check"; }
+
+# the container is not running: a person's job, and nothing is changed
+ing_run >"$tmp/out" 2>&1 && bad "ingress: applied with the container stopped"; cat "$tmp/out" >>"$ingout"
+grep -q 'MANUAL  ncs_ingress' "$tmp/out" && grep -q 'nuit-nginx is not running' "$tmp/out" && grep -q 'Nothing was changed' "$tmp/out" && [ "$before" = "$(snap)" ] && ! grep -q 'docker exec' "$CALLS" \
+  && ok "ingress: a container that is not running is MANUAL with a plain message, and nothing is changed" || { cat "$tmp/out"; bad "ingress not running"; }
+
+touch "$STATE/ing-running"; : >"$CALLS"
+ing_run >"$tmp/out" 2>&1 || { cat "$tmp/out" "$CALLS"; bad "ingress apply failed"; }; cat "$tmp/out" >>"$ingout"
+grep -q 'done    ncs_ingress' "$tmp/out" || { cat "$tmp/out"; bad "ingress apply result"; }
+for f in 00-nuit-cloud-default.conf nuit-cloud-abc12345-shop.conf nuit-cloud-abc12345-new.conf; do
+  cmp -s "$IST/sites/$f" "$ROOT$ICONF/$f" && [ "$(mode "$ICONF/$f")" = "-rw-r--r--" ] || bad "ingress: $f is not the staged file, mode 0644"
+done
+for pair in "1 shop.example.com" "2 *.example.com"; do
+  k="${pair%% *}"; d="$ROOT$ICERTS/abc12345/${pair#* }"
+  cmp -s "$IST/certs/$k/fullchain.pem" "$d/fullchain.pem" && cmp -s "$IST/certs/$k/privkey.pem" "$d/privkey.pem" && [ "$(ls -ln "$d/fullchain.pem" | cut -c1-10)" = "-rw-r--r--" ] && [ "$(ls -ln "$d/privkey.pem" | cut -c1-10)" = "-rw-------" ] \
+    || bad "ingress: the certificate in $d is not the staged one with modes 0644/0600"
+done
+ok "ingress: the site files and certificates are exactly the staged bytes, sites and chains 0644, keys 0600 (a wildcard's directory too)"
+[ "$(ls -ldn "$ROOT$ICERTS/abc12345/*.example.com" | cut -c1-10)" = "drwxr-xr-x" ] && [ "$(ls -ldn "$ROOT$ICONF/nuit-cloud-abc12345-new.conf" | awk '{print $3":"$4}')" = "$(ls -ldn "$ROOT$ICONF" | awk '{print $3":"$4}')" ] \
+  && ok "ingress: a new certificate directory is made 0755, and files are owned like the directory they are in" || bad "ingress: directory mode or ownership"
+[ ! -e "$ROOT$ICONF/nuit-cloud-old.conf" ] && grep -q 'someone else' "$ROOT$ICONF/other.conf" && grep -q 'not ours' "$ROOT$ICERTS/abc12345/shop.example.com/README" && grep -q 'other chain' "$ROOT$ICERTS/zzz/old.example.com/fullchain.pem" \
+  && ok "ingress: the stale nuit-cloud-old.conf is removed; other.conf, a file beside a certificate and another certificate directory are left alone" || bad "ingress: removal"
+[ -z "$(find "$ROOT" -name '*.nuit-new' -o -name '*.nuit-old')" ] && ok "ingress: no temporary file is left behind" || bad "ingress: temporary files left"
+[ "$(cat "$ROOT/var/lib/nuit-cloud/ingress/revision")" = "$IREV1" ] && grep -qx "conf-dir=$ICONF" "$ROOT/var/lib/nuit-cloud/ingress/settings" && grep -qx "container=nuit-nginx" "$ROOT/var/lib/nuit-cloud/ingress/settings" \
+  && ok "ingress: the revision and the settings are recorded" || bad "ingress: record"
+grep -n 'docker exec nuit-nginx nginx -t' "$CALLS" >/dev/null && [ "$(grep -n 'nginx -t' "$CALLS" | head -n1 | cut -d: -f1)" -lt "$(grep -n 'nginx -s reload' "$CALLS" | head -n1 | cut -d: -f1)" ] \
+  && ok "ingress: nginx -t runs in the named container before it is reloaded" || { cat "$CALLS"; bad "ingress: nginx order"; }
+ing_run --check >"$tmp/out" 2>&1 && grep -q 'ok      ncs_ingress' "$tmp/out" && ok "ingress: --check is clean after the apply" || { cat "$tmp/out"; bad "ingress check after apply"; }
+cat "$tmp/out" >>"$ingout"
+: >"$CALLS"; ing_run >"$tmp/out" 2>&1 && ! grep -q applying "$tmp/out" && ! grep -q 'docker exec' "$CALLS" && ok "ingress: a second apply of the same revision changes nothing" || { cat "$tmp/out"; bad "ingress idempotent"; }
+
+# nginx refuses the next revision: every file is put back exactly (the removed one too, the new directory gone) and nothing is recorded
+IST2="$tmp/ingstage2"
+mkstage "$IST2" "$IREV2" <<STAGE
+site 00-nuit-cloud-default.conf # default v3
+site nuit-cloud-abc12345-shop.conf bogus;
+cert $ICERTS/abc12345/shop.example.com chain-shop-3 $ING_KEY3
+cert $ICERTS/def67890/www.example.org chain-www $ING_KEY3
+STAGE
+export NCS_INGRESS_REVISION="$IREV2" NCS_INGRESS_STAGE="$IST2"
+touch "$STATE/ing-bad"; before="$(snap)"; : >"$CALLS"
+ing_run >"$tmp/out" 2>&1 && bad "ingress: a configuration nginx refused was applied"; cat "$tmp/out" >>"$ingout"
+grep -q 'FAILED  ncs_ingress' "$tmp/out" && grep -q 'nginx -t refused the configuration' "$tmp/out" && grep -q 'unknown directive "bogus"' "$tmp/out" && [ "$before" = "$(snap)" ] && [ -e "$ROOT$ICONF/nuit-cloud-abc12345-new.conf" ] && [ ! -e "$ROOT$ICERTS/def67890" ] \
+  && ! grep -q 'nginx -s reload' "$CALLS" && [ "$(cat "$ROOT/var/lib/nuit-cloud/ingress/revision")" = "$IREV1" ] \
+  && ok "ingress: when nginx -t fails every previous file is back exactly (a removed one too), nothing is reloaded or recorded, and nginx's own message is said" || { cat "$tmp/out"; echo "$before" >"$tmp/snap-before"; snap >"$tmp/snap-after"; diff "$tmp/snap-before" "$tmp/snap-after" || true; bad "ingress restore"; }
+rm -f "$STATE/ing-bad"; : >"$CALLS"
+ing_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "ingress apply of the second revision"; }; cat "$tmp/out" >>"$ingout"
+[ ! -e "$ROOT$ICONF/nuit-cloud-abc12345-new.conf" ] && cmp -s "$IST2/certs/2/privkey.pem" "$ROOT$ICERTS/def67890/www.example.org/privkey.pem" && [ "$(cat "$ROOT/var/lib/nuit-cloud/ingress/revision")" = "$IREV2" ] && grep -q 'nginx -s reload' "$CALLS" \
+  && ok "ingress: once nginx accepts it the next revision is applied, reloaded and recorded" || { cat "$tmp/out"; bad "ingress second revision"; }
+
+# what the stage or the task names is checked again: a site file off the pattern, a directory outside certRoot, a stage of another revision,
+# a hostile directory or container: FAILED, and nothing on the machine changes
+before="$(snap)"; export NCS_INGRESS_REVISION="$IREV1"
+mkstage "$IST" "$IREV1" <<STAGE
+site ../evil.conf x
+STAGE
+ing_run >"$tmp/out" 2>&1 && bad "ingress: a site file off the pattern was accepted"; cat "$tmp/out" >>"$ingout"
+grep -q 'FAILED  ncs_ingress' "$tmp/out" && [ "$before" = "$(snap)" ] && ok "ingress: a staged site file name off the pattern is refused before anything is written" || { cat "$tmp/out"; bad "ingress hostile site"; }
+for d in /etc/nginx/x "$ICERTS/../../../etc" "$ICERTS"; do
+  mkstage "$IST" "$IREV1" <<STAGE
+site nuit-cloud-a.conf x
+cert $d chain $ING_KEY1
+STAGE
+  ing_run >"$tmp/out" 2>&1 && bad "ingress: the certificate directory $d was accepted"; cat "$tmp/out" >>"$ingout"
+  grep -q 'FAILED  ncs_ingress' "$tmp/out" && [ "$before" = "$(snap)" ] || { cat "$tmp/out"; bad "ingress hostile cert dir $d"; }
+done
+ok "ingress: a certificate directory outside certRoot, with .., or certRoot itself is refused before anything is written"
+mkstage "$IST" "$IREV2" </dev/null
+ing_run >"$tmp/out" 2>&1 && bad "ingress: a stage of another revision was applied"
+grep -q 'FAILED  ncs_ingress' "$tmp/out" && grep -q 'not fetched' "$tmp/out" && [ "$before" = "$(snap)" ] && ok "ingress: a stage that is not the signed revision is refused" || { cat "$tmp/out"; bad "ingress stage revision"; }
+mkstage "$IST" "$IREV1" </dev/null
+for bad_env in "NCS_INGRESS_CONF_DIR=/home/nuitcloud/../etc" "NCS_INGRESS_CONF_DIR=etc/nginx" "NCS_INGRESS_CONF_DIR=$ICERTS/x" "NCS_INGRESS_CONTAINER=nuit;reboot" "NCS_INGRESS_CERT_ROOT=/home/nuit cloud" "NCS_INGRESS_REVISION=$(hex64 A)"; do
+  env "$bad_env" sh "$here/bootstrap.sh" nuit-cloud-ingress >"$tmp/out" 2>&1 && bad "ingress: $bad_env was accepted"
+  grep -q 'FAILED  ncs_ingress' "$tmp/out" && [ "$before" = "$(snap)" ] || { cat "$tmp/out"; bad "ingress hostile setting $bad_env"; }
+done
+ok "ingress: a hostile directory, container or revision in the settings changes nothing"
+
+leaks=0
+for s in "$ING_KEY1" "$ING_KEY2" "$ING_KEY3" chain-shop chain-wild; do
+  grep -qF -- "$s" "$ingout" "$CALLS" && { echo "leaked: $s" >&2; leaks=1; }
+  grep -rqF -- "$s" "$ROOT/var" "$STATE" 2>/dev/null && { echo "recorded: $s" >&2; leaks=1; }
+done
+[ "$leaks" = 0 ] && ok "ingress: no certificate or key appears in any output, command or record" || bad "ingress leaked key material"
+rm -f "$STATE"/ing-*; unset NCS_INGRESS_REVISION NCS_INGRESS_CONF_DIR NCS_INGRESS_CERT_ROOT NCS_INGRESS_CONTAINER NCS_INGRESS_STAGE
+cp -p "$tmp/docker.orig" "$tmp/bin/docker"
+export ROOT="$OLDROOT22"
 echo "all passed"
