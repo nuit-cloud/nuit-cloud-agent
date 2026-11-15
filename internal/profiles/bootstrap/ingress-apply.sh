@@ -3,6 +3,8 @@
 # on a real machine). Arguments, all from the signed task or the agent, never from the fetched content:
 #   <root> <stage> <confDir> <certRoot> <container> <revision> <stateDir>
 # <root> prefixes every path on the machine (empty on a real machine; a scratch directory in test-bootstrap.sh). The stage is the agent's.
+# <container> is the nginx container's name, or the word `host`: nginx is then Debian's package on the machine itself, tested and reloaded
+# directly (`nginx -t`, `systemctl reload nginx`, or `systemctl start nginx` when it is not running) and never through docker.
 #
 # It never prints a certificate or a key, and never puts one on a command line: they are only copied, file to file. Our files are the
 # platform's site files in confDir (00-nuit-cloud-default.conf, nuit-cloud-<name>.conf) and fullchain.pem/privkey.pem in the certificate
@@ -128,15 +130,27 @@ for f in "$CONFP"/nuit-cloud-*.conf; do
 done
 
 # ─── nginx decides ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-if ! out="$(bounded docker exec "$C" nginx -t 2>&1)"; then
+# in the container, or (C=host) Debian's nginx on the machine
+ngx() { if [ "$C" = host ]; then bounded nginx "$@"; else bounded docker exec "$C" nginx "$@"; fi; }
+if ! out="$(ngx -t 2>&1)"; then
   restore
   say "nginx -t refused the configuration, so the previous files were put back and nginx was not reloaded:" >&2
   printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | head -n 5 | cut -c1-300 | sed 's/^/    /' >&2
   exit 1
 fi
 reloaded=""
-if [ "$changed" = 1 ]; then
-  rout="$(bounded docker exec "$C" nginx -s reload 2>&1)" || { say "nginx accepted the configuration but did not reload: $(printf '%s' "$rout" | head -n 1 | cut -c1-300)" >&2; exit 1; }
+if [ "$C" = host ]; then
+  # the feature only runs this when something drifted (the role's base too: the include file, Debian's default site), so a host nginx is
+  # always reloaded once nginx -t accepts; one that is not running (it would not start with the files it had) is started instead
+  if ! systemctl is-active --quiet nginx; then
+    rout="$(bounded systemctl start nginx 2>&1)" || { say "nginx accepted the configuration but did not start: $(printf '%s' "$rout" | head -n 1 | cut -c1-300) (journalctl -u nginx says why)" >&2; exit 1; }
+    reloaded="; nginx started"
+  else
+    rout="$(bounded systemctl reload nginx 2>&1)" || { say "nginx accepted the configuration but did not reload: $(printf '%s' "$rout" | head -n 1 | cut -c1-300)" >&2; exit 1; }
+    reloaded="; nginx reloaded"
+  fi
+elif [ "$changed" = 1 ]; then
+  rout="$(ngx -s reload 2>&1)" || { say "nginx accepted the configuration but did not reload: $(printf '%s' "$rout" | head -n 1 | cut -c1-300)" >&2; exit 1; }
   reloaded="; nginx reloaded"
 fi
 

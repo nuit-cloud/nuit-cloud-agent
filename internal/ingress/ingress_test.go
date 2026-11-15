@@ -45,6 +45,12 @@ func TestTheSignedSettingsAreCheckedAgain(t *testing.T) {
 	if err != nil || p.Container != "nuit-nginx" || p.ConfDir != "/home/nuitcloud/nginx/conf.d" || p.CertRoot != "/home/nuitcloud/nginx/certs" || p.Revision != rev {
 		t.Fatalf("%+v %v", p, err)
 	}
+	// `host` (the machine's own nginx) is a setting like any container name, and nothing near it is
+	hostParams := goodParams()
+	hostParams["container"] = Host
+	if p, err := ParseParams(hostParams); err != nil || p.Container != "host" {
+		t.Errorf("container host was refused: %+v %v", p, err)
+	}
 	hostile := map[string]func(m map[string]any){
 		"an extra key":            func(m map[string]any) { m["command"] = "rm -rf /" },
 		"no revision":             func(m map[string]any) { delete(m, "revision") },
@@ -69,6 +75,8 @@ func TestTheSignedSettingsAreCheckedAgain(t *testing.T) {
 		"a container with -":      func(m map[string]any) { m["container"] = "-H tcp://evil" },
 		"a long container":        func(m map[string]any) { m["container"] = strings.Repeat("a", 64) },
 		"a number":                func(m map[string]any) { m["container"] = 7 },
+		"host with a command":     func(m map[string]any) { m["container"] = "host;reboot" },
+		"host with a space":       func(m map[string]any) { m["container"] = "host nginx" },
 		"a very long path":        func(m map[string]any) { m["confDir"] = "/" + strings.Repeat("a/", 140) + "b" },
 	}
 	for name, change := range hostile {

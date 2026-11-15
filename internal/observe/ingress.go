@@ -18,12 +18,13 @@ import (
 type IngressFacts struct {
 	// Revision is the revision last applied; null when none is recorded (or the record is not a revision).
 	Revision *string `json:"revision"`
-	// ContainerRunning says whether the nginx container the profile applies to is running.
+	// ContainerRunning says whether the nginx container the profile applies to is running (with container `host`: whether the machine's
+	// own nginx service is active).
 	ContainerRunning bool `json:"containerRunning"`
 	// Sites is how many of the platform's site files (00-nuit-cloud-default.conf, nuit-cloud-<name>.conf) are in the site directory.
 	Sites int `json:"sites"`
-	// NginxOK is whether `nginx -t` in the container accepts the configuration; null when it was not run (the container is not running,
-	// or it did not answer in time).
+	// NginxOK is whether `nginx -t` (in the container, or on the machine) accepts the configuration; null when it was not run (nginx is
+	// not running, or it did not answer in time).
 	NginxOK *bool `json:"nginxOk"`
 }
 
@@ -52,9 +53,9 @@ func listFiles(dir string) ([]string, error) {
 	return names, nil
 }
 
-// ingress reads what the profile recorded and looks at the container and the site directory. A machine the profile was never applied to
-// (no usable settings record) reports nothing at all. The directory and container come only from that record, checked again; nothing the
-// platform sends is used here.
+// ingress reads what the profile recorded and looks at the container (or, with container `host`, the machine's own nginx) and the site
+// directory. A machine the profile was never applied to (no usable settings record) reports nothing at all. The directory and container
+// come only from that record, checked again; nothing the platform sends is used here.
 func (c Collector) ingress(ctx context.Context) (IngressFacts, bool) {
 	if c.ReadIngressState == nil {
 		return IngressFacts{}, false
@@ -84,16 +85,26 @@ func (c Collector) ingress(ctx context.Context) (IngressFacts, bool) {
 	if c.Run == nil {
 		return facts, true
 	}
+	host := s.Container == ingress.Host
 	ictx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	out, err := c.Run(ictx, "docker", "inspect", "--format", "{{.State.Running}}", s.Container)
+	if host {
+		_, err := c.Run(ictx, "systemctl", "is-active", "--quiet", "nginx")
+		facts.ContainerRunning = err == nil
+	} else {
+		out, err := c.Run(ictx, "docker", "inspect", "--format", "{{.State.Running}}", s.Container)
+		facts.ContainerRunning = err == nil && strings.TrimSpace(out) == "true"
+	}
 	cancel()
-	facts.ContainerRunning = err == nil && strings.TrimSpace(out) == "true"
 	if !facts.ContainerRunning {
 		return facts, true
 	}
 	tctx, cancel := context.WithTimeout(ctx, nginxTestTimeout)
 	defer cancel()
-	_, err = c.Run(tctx, "docker", "exec", s.Container, "nginx", "-t")
+	if host {
+		_, err = c.Run(tctx, "nginx", "-t")
+	} else {
+		_, err = c.Run(tctx, "docker", "exec", s.Container, "nginx", "-t")
+	}
 	if tctx.Err() == nil {
 		ok := err == nil
 		facts.NginxOK = &ok

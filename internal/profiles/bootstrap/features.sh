@@ -1637,18 +1637,25 @@ f_ncs_cp_tls_front_do() {
   echo "  nginx forwards /api/agent/ on port 8443 to $NCS_CP_TLS_UPSTREAM"
 }
 
-# ─── The Ingress Service: the platform's routes in an nginx container (the nuit-cloud-ingress profile; nuit-cloud/nuit-cloud#184) ───────────
-# nginx runs in a container (NCS_INGRESS_CONTAINER, today `nuit-nginx`) that reads its site files from NCS_INGRESS_CONF_DIR and the routes'
-# certificates from directories below NCS_INGRESS_CERT_ROOT. Those three and the revision (NCS_INGRESS_REVISION) come from the signed task. For
-# an apply the AGENT has already read the content with its own credential, computed its revision again (it must be the signed one) and staged
-# it in a root-only directory on tmpfs (NCS_INGRESS_STAGE: sites.list, sites/<file>, certs.list "<n> <dir>", certs/<n>/{fullchain,privkey}.pem).
-# ingress-apply.sh writes it: it backs up our files, writes the certificates and site files (each via a temporary file and a rename, owned like
-# the directory it is in), removes the platform's site files that are no longer wanted (never anything else), runs `nginx -t` in the container,
-# puts every previous file back if nginx refuses, and otherwise reloads nginx and records the revision. Nothing here prints a certificate or a
-# key; they are only ever copied from the stage. The container is checked as running, never started or rebuilt.
-# The agent's own service may not write under /home (ProtectHome=read-only), so the writer runs as a transient systemd unit (as ncs_login does);
-# without systemd, and in tests, it runs directly.
+# ─── The Ingress Service: the platform's routes in nginx (the nuit-cloud-ingress profile; nuit-cloud/nuit-cloud#184) ──────────────────────
+# nginx reads its site files from NCS_INGRESS_CONF_DIR and the routes' certificates from directories below NCS_INGRESS_CERT_ROOT. It is either
+# a container (NCS_INGRESS_CONTAINER names it, `nuit-nginx` on a Docker host) or, when NCS_INGRESS_CONTAINER is the word `host`, Debian's own
+# nginx package on the machine itself (a Nuit Container Service machine has no Docker). Those three and the revision (NCS_INGRESS_REVISION)
+# come from the signed task. For an apply the AGENT has already read the content with its own credential, computed its revision again (it
+# must be the signed one) and staged it in a root-only directory on tmpfs (NCS_INGRESS_STAGE: sites.list, sites/<file>, certs.list
+# "<n> <dir>", certs/<n>/{fullchain,privkey}.pem). ingress-apply.sh writes it: it backs up our files, writes the certificates and site files
+# (each via a temporary file and a rename, owned like the directory it is in), removes the platform's site files that are no longer wanted
+# (never anything else), runs `nginx -t` (in the container, or on the machine), puts every previous file back if nginx refuses, and otherwise
+# reloads nginx and records the revision. Nothing here prints a certificate or a key; they are only ever copied from the stage. A container
+# is checked as running, never started or rebuilt. With `host` the feature keeps the package itself: it installs nginx when it is missing
+# (without letting the package start it with Debian's default site), makes the two directories, takes out Debian's default site (its
+# default_server would make nginx refuse the platform's own), writes one include file in /etc/nginx/conf.d that names the site directory,
+# and enables and starts nginx.
+# The agent's own service may not write under /home (ProtectHome=read-only), so the writers run as a transient systemd unit (as ncs_login
+# does); without systemd, and in tests, they run directly.
 ING_STATE="${NCS_INGRESS_STATE_DIR:-/var/lib/nuit-cloud/ingress}"
+ING_INCLUDE=/etc/nginx/conf.d/nuit-cloud-ingress.conf
+ING_DEFAULT_SITE=/etc/nginx/sites-enabled/default
 ing_path_ok() { # an absolute, clean directory of plain names (as the agent checks it)
   printf '%s' "$1" | grep -Eq '^(/[A-Za-z0-9_-][A-Za-z0-9._-]{0,127})+$' && [ "${#1}" -le 255 ]
 }
@@ -1661,31 +1668,104 @@ ing_inputs_ok() {
   return 0
 }
 ing_settings() { printf 'conf-dir=%s\ncert-root=%s\ncontainer=%s\n' "$NCS_INGRESS_CONF_DIR" "$NCS_INGRESS_CERT_ROOT" "$NCS_INGRESS_CONTAINER"; }
-ing_running() { [ "$(docker inspect --format '{{.State.Running}}' "$NCS_INGRESS_CONTAINER" 2>/dev/null)" = true ]; }
+ing_host() { [ "$NCS_INGRESS_CONTAINER" = host ]; }
+ing_running() {
+  if ing_host; then systemctl is-active --quiet nginx; return; fi
+  [ "$(docker inspect --format '{{.State.Running}}' "$NCS_INGRESS_CONTAINER" 2>/dev/null)" = true ]
+}
+# ing_privileged <script> <arg>...: run a writer as a transient systemd unit on a real machine (outside the agent's ProtectHome), else directly
+ing_privileged() {
+  if [ -z "${ROOT:-}" ] && [ -d /run/systemd/system ] && command -v systemd-run >/dev/null 2>&1; then
+    systemd-run --quiet --wait --collect --pipe /bin/sh "$@"
+  else
+    sh "$@"
+  fi
+}
+ing_include() {
+  cat <<INC
+# Managed by the nuit-cloud agent (the ncs_ingress feature): the Ingress Service's site files. Changes made here are replaced.
+include $NCS_INGRESS_CONF_DIR/*.conf;
+INC
+}
+# Debian's default site is enabled: the package's link to sites-available/default (relative or absolute), and nothing else
+ing_default_site_on() {
+  l="$(p "$ING_DEFAULT_SITE")"
+  [ -L "$l" ] || return 1
+  case "$(readlink "$l")" in ../sites-available/default | /etc/nginx/sites-available/default) return 0 ;; esac
+  return 1
+}
+ing_host_base_ok() {
+  dpkg -s nginx >/dev/null 2>&1 || return 1
+  ing_include | cmp -s - "$(p "$ING_INCLUDE")" || return 1
+  ! ing_default_site_on || return 1
+  systemctl is-enabled --quiet nginx && systemctl is-active --quiet nginx
+}
+# the role's base on a machine whose nginx is Debian's: package, directories, no default site, the include file, enabled and started. It
+# stays when nginx -t later refuses the site files (only those are put back); ingress-apply.sh reloads (or starts) nginx once nginx -t accepts.
+ING_MKDIRS='for d; do
+  if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then echo "  $d is there but is not a directory; the agent writes only into real directories" >&2; exit 1; fi
+  [ -d "$d" ] && continue
+  mkdir -p "$d" && chmod 755 "$d" || { echo "  could not make $d" >&2; exit 1; }
+done'
+ing_host_base() {
+  if ! dpkg -s nginx >/dev/null 2>&1; then
+    net_resolves || return 3
+    # the package starts nginx on install, with Debian's default site on port 80: say no to that start (as the control plane's front does)
+    rcd="$(p /usr/sbin/policy-rc.d)"; made=0
+    if [ ! -e "$rcd" ]; then mkdir -p "$(dirname "$rcd")" && printf '#!/bin/sh\nexit 101\n' >"$rcd" && chmod 755 "$rcd" && made=1; fi
+    ib_rc=0; out="$( { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx; } 2>&1)" || ib_rc=$?
+    if [ "$made" = 1 ]; then rm -f "$rcd"; fi
+    if [ "$ib_rc" != 0 ]; then
+      echo "  could not install nginx: $(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -n 1 | cut -c1-300)" >&2
+      return 1
+    fi
+    echo "  installed Debian's nginx"
+  fi
+  ing_privileged -c "$ING_MKDIRS" sh "$(p "$NCS_INGRESS_CONF_DIR")" "$(p "$NCS_INGRESS_CERT_ROOT")" || return 1
+  l="$(p "$ING_DEFAULT_SITE")"
+  if ing_default_site_on; then
+    rm -f "$l" || { echo "  could not take out Debian's default site ($ING_DEFAULT_SITE)" >&2; return 1; }
+    echo "  Debian's default site is no longer enabled"
+  elif [ -e "$l" ] || [ -L "$l" ]; then
+    echo "  $ING_DEFAULT_SITE is not Debian's link to its default site, so it was left alone (a default_server in it makes nginx refuse the platform's)"
+  fi
+  ib_rc=0; ing_include | cp_put "$(p "$ING_INCLUDE")" 644 || ib_rc=$?
+  if [ "$ib_rc" = 10 ]; then echo "  $ING_INCLUDE names $NCS_INGRESS_CONF_DIR"
+  elif [ "$ib_rc" != 0 ]; then echo "  could not write $ING_INCLUDE" >&2; return 1; fi
+  systemctl enable nginx >/dev/null 2>&1 || { echo "  could not enable nginx" >&2; return 1; }
+  # an nginx that will not start with the site files it has now is started again once nginx -t accepts the new ones (ingress-apply.sh)
+  if ! systemctl is-active --quiet nginx && ! systemctl start nginx >/dev/null 2>&1; then
+    echo "  nginx did not start with the site files it has now; it is started again after nginx -t accepts the new ones"
+  fi
+  return 0
+}
+ing_staged() {
+  [ -n "$1" ] && [ -d "$1" ] && [ "$(cat "$1/revision" 2>/dev/null || true)" = "$NCS_INGRESS_REVISION" ]
+}
 f_ncs_ingress_ok() {
   ing_inputs_ok || return 1
   [ "$(cat "$(p "$ING_STATE")/revision" 2>/dev/null || true)" = "$NCS_INGRESS_REVISION" ] || return 1
   [ "$(cat "$(p "$ING_STATE")/settings" 2>/dev/null || true)" = "$(ing_settings)" ] || return 1
-  ing_running
+  if ing_host; then ing_host_base_ok; else ing_running; fi
 }
 f_ncs_ingress_do() {
   ing_inputs_ok || { echo "  the task carries no usable ingress settings (revision, confDir, certRoot, container)" >&2; return 1; }
-  if ! ing_running; then
+  st="${NCS_INGRESS_STAGE:-}"
+  if ing_host; then
+    # nothing is installed or changed for a revision the agent has not staged
+    ing_staged "$st" || { echo "  the ingress configuration for this revision was not fetched (the agent fetches it when it applies)" >&2; return 1; }
+    ing_rc=0; ing_host_base || ing_rc=$?
+    [ "$ing_rc" = 0 ] || return "$ing_rc"
+  elif ! ing_running; then
     echo "  the nginx container $NCS_INGRESS_CONTAINER is not running: start it (the platform does not start or rebuild it), then apply this again. Nothing was changed." >&2
     return 3
   fi
-  st="${NCS_INGRESS_STAGE:-}"
-  [ -n "$st" ] && [ -d "$st" ] && [ "$(cat "$st/revision" 2>/dev/null || true)" = "$NCS_INGRESS_REVISION" ] \
-    || { echo "  the ingress configuration for this revision was not fetched (the agent fetches it when it applies)" >&2; return 1; }
+  ing_staged "$st" || { echo "  the ingress configuration for this revision was not fetched (the agent fetches it when it applies)" >&2; return 1; }
   cp "$here/ingress-apply.sh" "$st/apply.sh" && chmod 700 "$st/apply.sh" || return 1
-  set -- "${ROOT:-}" "$st" "$NCS_INGRESS_CONF_DIR" "$NCS_INGRESS_CERT_ROOT" "$NCS_INGRESS_CONTAINER" "$NCS_INGRESS_REVISION" "$ING_STATE"
   ing_rc=0
-  if [ -z "${ROOT:-}" ] && [ -d /run/systemd/system ] && command -v systemd-run >/dev/null 2>&1; then
-    systemd-run --quiet --wait --collect --pipe /bin/sh "$st/apply.sh" "$@" || ing_rc=$?
-  else
-    sh "$st/apply.sh" "$@" || ing_rc=$?
-  fi
+  ing_privileged "$st/apply.sh" "${ROOT:-}" "$st" "$NCS_INGRESS_CONF_DIR" "$NCS_INGRESS_CERT_ROOT" "$NCS_INGRESS_CONTAINER" "$NCS_INGRESS_REVISION" "$ING_STATE" || ing_rc=$?
   [ "$ing_rc" = 0 ] || return 1
+  if ing_host && ! ing_running; then echo "  nginx did not stay up (journalctl -u nginx says why)" >&2; return 1; fi
   case "${NCS_INGRESS_PROBLEMS:-0}" in 0|'') ;; *) echo "  the platform left out ${NCS_INGRESS_PROBLEMS} route(s) it could not render (the portal names them)" ;; esac
   return 0
 }

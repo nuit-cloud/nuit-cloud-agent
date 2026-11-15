@@ -95,6 +95,61 @@ func TestTheIngressObservationSaysWhatWasAppliedAndWhetherNginxAcceptsIt(t *test
 	}
 }
 
+// hostNginx stands in for a machine whose nginx is Debian's package: whether the service is active and whether nginx -t passes.
+func hostNginx(active, nginxOK bool, asked *[]string) func(context.Context, string, ...string) (string, error) {
+	return func(_ context.Context, name string, args ...string) (string, error) {
+		*asked = append(*asked, name+" "+strings.Join(args, " "))
+		switch name + " " + strings.Join(args, " ") {
+		case "systemctl is-active --quiet nginx":
+			if active {
+				return "", nil
+			}
+			return "", errors.New("exit status 3")
+		case "nginx -t":
+			if nginxOK {
+				return "", nil
+			}
+			return "", errors.New("exit status 1")
+		}
+		return "", errors.New("unexpected")
+	}
+}
+
+func TestWithContainerHostTheIngressObservationLooksAtTheMachinesOwnNginxAndNeverAtDocker(t *testing.T) {
+	var asked []string
+	hostSettings := strings.Replace(goodIngressSettings, "container=nuit-nginx", "container=host", 1)
+	c := Collector{Run: hostNginx(true, true, &asked), ReadIngressState: ingressRecord(hostSettings, ingressRev)}
+	data, v1, err := c.Collect(context.Background(), Ingress)
+	if err != nil || !versionOK.MatchString(v1) {
+		t.Fatalf("%v %q", err, v1)
+	}
+	raw, _ := json.Marshal(data)
+	if string(raw) != `{"revision":"`+ingressRev+`","containerRunning":true,"sites":0,"nginxOk":true}` {
+		t.Errorf("%s", raw)
+	}
+	if strings.Join(asked, "\n") != "systemctl is-active --quiet nginx\nnginx -t" {
+		t.Errorf("asked: %v", asked)
+	}
+	c.Run = hostNginx(true, false, &asked)
+	if data, _, _ = c.Collect(context.Background(), Ingress); !strings.Contains(mustJSON(data), `"nginxOk":false`) {
+		t.Errorf("%s", mustJSON(data))
+	}
+	// nginx not running: nginx -t is not run, and its answer is null
+	asked = nil
+	c.Run = hostNginx(false, true, &asked)
+	data, _, _ = c.Collect(context.Background(), Ingress)
+	if j := mustJSON(data); !strings.Contains(j, `"containerRunning":false`) || !strings.Contains(j, `"nginxOk":null`) || len(asked) != 1 {
+		t.Errorf("%s %v", j, asked)
+	}
+	for _, a := range asked {
+		if strings.HasPrefix(a, "docker") {
+			t.Errorf("docker was asked: %v", asked)
+		}
+	}
+}
+
+func mustJSON(v any) string { b, _ := json.Marshal(v); return string(b) }
+
 func TestAMachineThatIsNotTheIngressServiceSendsNoIngressObservation(t *testing.T) {
 	var asked []string
 	for name, settings := range map[string]string{

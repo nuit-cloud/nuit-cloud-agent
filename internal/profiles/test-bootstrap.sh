@@ -1028,4 +1028,145 @@ done
 rm -f "$STATE"/ing-*; unset NCS_INGRESS_REVISION NCS_INGRESS_CONF_DIR NCS_INGRESS_CERT_ROOT NCS_INGRESS_CONTAINER NCS_INGRESS_STAGE
 cp -p "$tmp/docker.orig" "$tmp/bin/docker"
 export ROOT="$OLDROOT22"
+
+# 23. the Ingress Service on a machine with no Docker (container `host`): nginx is Debian's package, installed and kept by the profile. It is
+# installed only when missing (without starting on Debian's default site), Debian's default-site link alone is taken out, one include file
+# names the site directory, nginx is tested and reloaded on the machine itself, and docker is never asked anything.
+for c in systemctl apt-get docker; do cp -p "$tmp/bin/$c" "$tmp/$c.orig23"; done
+stub systemctl 'case "$1" in is-active|is-enabled) ;; *) echo "systemctl $*" >>"$CALLS";; esac
+case "$1" in
+  enable) touch "$STATE/h-enabled-$2";;
+  start) [ -e "$STATE/h-nostart" ] && exit 1; touch "$STATE/h-active-$2";;
+  stop) rm -f "$STATE/h-active-$2";;
+  reload) [ -e "$STATE/h-active-$2" ] || { echo "nginx.service is not active, cannot reload." >&2; exit 1; };;
+  is-active) shift; [ "$1" = --quiet ] && shift; [ -e "$STATE/h-active-$1" ]; exit $?;;
+  is-enabled) shift; [ "$1" = --quiet ] && shift; [ -e "$STATE/h-enabled-$1" ]; exit $?;;
+esac; exit 0'
+stub apt-get 'echo "apt-get $* (DEBIAN_FRONTEND=${DEBIAN_FRONTEND:-})" >>"$CALLS"
+[ "$1" = install ] || [ "$1" = -y ] || [ "$2" = install ] || exit 0
+if [ -e "$STATE/h-apt-fail" ]; then echo "Reading package lists..."; echo "E: Unable to locate package nginx" >&2; exit 100; fi
+for a in "$@"; do [ "$a" = nginx ] || continue
+  touch "$STATE/pkg-nginx"; [ ! -e "$ROOT/usr/sbin/policy-rc.d" ] || touch "$STATE/policy-rc-seen"
+  mkdir -p "$ROOT/etc/nginx/sites-available" "$ROOT/etc/nginx/sites-enabled" "$ROOT/etc/nginx/conf.d"
+  printf "server { listen 80 default_server; }\n" >"$ROOT/etc/nginx/sites-available/default"; ln -sf /etc/nginx/sites-available/default "$ROOT/etc/nginx/sites-enabled/default"
+done; exit 0'
+stub nginx 'echo "nginx $*" >>"$CALLS"; [ "$1" = -t ] || exit 0
+if [ -e "$STATE/h-bad" ]; then echo "nginx: [emerg] unknown directive \"bogus\" in /home/nuitcloud/nginx/conf.d/nuit-cloud-abc12345-shop.conf:1" >&2; exit 1; fi
+echo "nginx: configuration file /etc/nginx/nginx.conf test is successful" >&2; exit 0'
+stub docker 'echo "docker $*" >>"$CALLS"; exit 1'
+OLDROOT23="$ROOT"; export ROOT="$tmp/hostroot"; rm -rf "$ROOT" "$STATE"/h-* "$STATE"/pkg-nginx "$STATE"/policy-rc-seen; mkdir -p "$ROOT/etc"
+INC="$ROOT/etc/nginx/conf.d/nuit-cloud-ingress.conf"; DEFSITE="$ROOT/etc/nginx/sites-enabled/default"
+want_inc="$(printf '%s\n' "# Managed by the nuit-cloud agent (the ncs_ingress feature): the Ingress Service's site files. Changes made here are replaced." "include $ICONF/*.conf;")"
+IST3="$tmp/hoststage"
+mkstage "$IST3" "$IREV1" <<STAGE
+site 00-nuit-cloud-default.conf # default h1
+site nuit-cloud-abc12345-shop.conf # shop h1
+cert $ICERTS/abc12345/shop.example.com chain-shop $ING_KEY1
+STAGE
+export NCS_INGRESS_REVISION="$IREV1" NCS_INGRESS_CONF_DIR="$ICONF" NCS_INGRESS_CERT_ROOT="$ICERTS" NCS_INGRESS_CONTAINER=host NCS_INGRESS_STAGE="$IST3"
+hout="$tmp/host-all"; : >"$hout"
+line_of() { grep -n "$1" "$CALLS" | head -n 1 | cut -d: -f1; }
+
+before="$(snap)"; : >"$CALLS"
+if ing_run --check >"$tmp/out" 2>&1; then bad "host ingress: a fresh machine passed the check"; fi; cat "$tmp/out" >>"$hout"
+grep -q 'DRIFT   ncs_ingress' "$tmp/out" && [ "$before" = "$(snap)" ] && [ ! -s "$CALLS" ] && ok "host ingress: --check on a fresh machine is drift and changes nothing" || { cat "$tmp/out" "$CALLS"; bad "host ingress check"; }
+
+# apt cannot install nginx: FAILED with apt's last line, nothing else done, and the install guard is gone again
+touch "$STATE/h-apt-fail"; : >"$CALLS"
+ing_run >"$tmp/out" 2>&1 && bad "host ingress: went ahead without nginx"; cat "$tmp/out" >>"$hout"
+grep -q 'FAILED  ncs_ingress' "$tmp/out" && grep -q 'could not install nginx: E: Unable to locate package nginx' "$tmp/out" && [ ! -e "$ROOT/usr/sbin/policy-rc.d" ] && [ ! -e "$ROOT$ICONF" ] && ! grep -q '^systemctl\|^nginx' "$CALLS" \
+  && ok "host ingress: an nginx apt cannot install is FAILED with apt's own last line, and nothing else is done" || { cat "$tmp/out" "$CALLS"; bad "host ingress apt failure"; }
+rm -f "$STATE/h-apt-fail"
+
+: >"$CALLS"
+ing_run >"$tmp/out" 2>&1 || { cat "$tmp/out" "$CALLS"; bad "host ingress apply failed"; }; cat "$tmp/out" >>"$hout"
+grep -q 'done    ncs_ingress' "$tmp/out" || { cat "$tmp/out"; bad "host ingress apply result"; }
+grep -q 'apt-get update -qq' "$CALLS" && grep -q 'apt-get install -y -qq nginx (DEBIAN_FRONTEND=noninteractive)' "$CALLS" && [ "$(count 'apt-get install')" = 1 ] && [ -e "$STATE/policy-rc-seen" ] && [ ! -e "$ROOT/usr/sbin/policy-rc.d" ] \
+  && ok "host ingress: a missing nginx is installed from Debian's package, non-interactively, without the package starting it" || { cat "$CALLS"; bad "host ingress install"; }
+[ ! -e "$DEFSITE" ] && [ ! -L "$DEFSITE" ] && [ -f "$ROOT/etc/nginx/sites-available/default" ] && ok "host ingress: Debian's default-site link is taken out (the site itself is left in sites-available)" || bad "host ingress default site"
+[ "$(cat "$INC")" = "$want_inc" ] && [ "$(ls -ln "$INC" | cut -c1-10)" = "-rw-r--r--" ] && ok "host ingress: the include file says it is the agent's and names the site directory, and nothing else" || { cat "$INC"; bad "host ingress include"; }
+[ "$(ls -ldn "$ROOT$ICONF" | cut -c1-10)" = drwxr-xr-x ] && [ "$(ls -ldn "$ROOT$ICERTS" | cut -c1-10)" = drwxr-xr-x ] && ok "host ingress: the site directory and certificate root are made when missing" || bad "host ingress directories"
+cmp -s "$IST3/sites/nuit-cloud-abc12345-shop.conf" "$ROOT$ICONF/nuit-cloud-abc12345-shop.conf" && cmp -s "$IST3/certs/1/privkey.pem" "$ROOT$ICERTS/abc12345/shop.example.com/privkey.pem" \
+  && [ "$(ls -ln "$ROOT$ICERTS/abc12345/shop.example.com/privkey.pem" | cut -c1-10)" = "-rw-------" ] && ok "host ingress: the staged site files and certificates are written, the key 0600" || bad "host ingress files"
+[ -e "$STATE/h-enabled-nginx" ] && [ -e "$STATE/h-active-nginx" ] && [ "$(line_of 'systemctl enable nginx')" -lt "$(line_of '^nginx -t')" ] && [ "$(line_of 'systemctl start nginx')" -lt "$(line_of '^nginx -t')" ] \
+  && [ "$(line_of '^nginx -t')" -lt "$(line_of 'systemctl reload nginx')" ] && ok "host ingress: nginx is enabled and started, then nginx -t runs on the machine before systemctl reloads it" || { cat "$CALLS"; bad "host ingress nginx order"; }
+! grep -q '^docker' "$CALLS" && ok "host ingress: docker is never asked anything" || { cat "$CALLS"; bad "host ingress used docker"; }
+[ "$(cat "$ROOT/var/lib/nuit-cloud/ingress/revision")" = "$IREV1" ] && grep -qx 'container=host' "$ROOT/var/lib/nuit-cloud/ingress/settings" && ok "host ingress: the revision and container=host are recorded" || bad "host ingress record"
+ing_run --check >"$tmp/out" 2>&1 && grep -q 'ok      ncs_ingress' "$tmp/out" && ok "host ingress: --check is clean after the apply" || { cat "$tmp/out"; bad "host ingress check after apply"; }
+: >"$CALLS"; ing_run >"$tmp/out" 2>&1 && ! grep -q applying "$tmp/out" && [ ! -s "$CALLS" ] && ok "host ingress: a second apply of the same revision changes nothing" || { cat "$tmp/out" "$CALLS"; bad "host ingress idempotent"; }
+
+# each part of the role's base is checked: an edited include file, Debian's link back (relative, as some versions write it), nginx stopped
+for drift in include link stopped; do
+  case "$drift" in
+    include) echo '# edited' >>"$INC";;
+    link) ln -s ../sites-available/default "$DEFSITE";;
+    stopped) rm -f "$STATE/h-active-nginx";;
+  esac
+  ing_run --check >"$tmp/out" 2>&1 && bad "host ingress: the check missed $drift"
+  : >"$CALLS"; ing_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "host ingress repair $drift"; }; cat "$tmp/out" >>"$hout"
+  [ "$(cat "$INC")" = "$want_inc" ] && [ ! -L "$DEFSITE" ] && [ -e "$STATE/h-active-nginx" ] && [ "$(count 'apt-get')" = 0 ] && ! grep -q '^docker' "$CALLS" || { cat "$tmp/out" "$CALLS"; bad "host ingress repair $drift"; }
+done
+ok "host ingress: an edited include file, Debian's default site back or nginx stopped is drift, and an apply puts it right without installing anything"
+
+# a default site that is not Debian's link is left alone, and said so
+ln -s /etc/nginx/sites-available/mine "$DEFSITE"; printf '# mine\n' >"$ROOT/etc/nginx/sites-available/mine"
+export NCS_INGRESS_REVISION="$IREV2"; mkstage "$IST3" "$IREV2" <<STAGE
+site 00-nuit-cloud-default.conf # default h2
+site nuit-cloud-abc12345-shop.conf # shop h2
+STAGE
+: >"$CALLS"; ing_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "host ingress with a foreign default link"; }; cat "$tmp/out" >>"$hout"
+[ "$(readlink "$DEFSITE")" = /etc/nginx/sites-available/mine ] && grep -q "sites-enabled/default is not Debian's link to its default site, so it was left alone" "$tmp/out" || { cat "$tmp/out"; bad "host ingress foreign link"; }
+rm -f "$DEFSITE"; printf 'server { listen 80; }\n' >"$DEFSITE"
+export NCS_INGRESS_REVISION="$IREV1"; mkstage "$IST3" "$IREV1" <<STAGE
+site 00-nuit-cloud-default.conf # default h3
+STAGE
+: >"$CALLS"; ing_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "host ingress with a default file"; }; cat "$tmp/out" >>"$hout"
+grep -q 'listen 80;' "$DEFSITE" && [ ! -L "$DEFSITE" ] && grep -q "is not Debian's link to its default site, so it was left alone" "$tmp/out" \
+  && ok "host ingress: a sites-enabled/default that is not Debian's link (a file, a link elsewhere) is left alone, with a note" || { cat "$tmp/out"; bad "host ingress default file"; }
+rm -f "$DEFSITE"
+
+# nginx -t refuses: the site files and certificates are put back exactly, nothing is reloaded or recorded; the role's base stays
+mkstage "$IST3" "$IREV2" <<STAGE
+site 00-nuit-cloud-default.conf # default h4
+site nuit-cloud-abc12345-shop.conf bogus;
+cert $ICERTS/def67890/www.example.org chain-www $ING_KEY3
+STAGE
+export NCS_INGRESS_REVISION="$IREV2"
+echo '# edited' >>"$INC"; ln -s /etc/nginx/sites-available/default "$DEFSITE"
+touch "$STATE/h-bad"; sites_before="$(cd "$ROOT/home" && find . -print | LC_ALL=C sort | while IFS= read -r x; do printf '%s %s\n' "$x" "$( [ -f "$x" ] && cksum <"$x")"; done)"; : >"$CALLS"
+ing_run >"$tmp/out" 2>&1 && bad "host ingress: a configuration nginx refused was applied"; cat "$tmp/out" >>"$hout"
+sites_after="$(cd "$ROOT/home" && find . -print | LC_ALL=C sort | while IFS= read -r x; do printf '%s %s\n' "$x" "$( [ -f "$x" ] && cksum <"$x")"; done)"
+grep -q 'FAILED  ncs_ingress' "$tmp/out" && grep -q 'nginx -t refused the configuration' "$tmp/out" && grep -q 'unknown directive "bogus"' "$tmp/out" && [ "$sites_before" = "$sites_after" ] \
+  && ! grep -q 'systemctl reload\|nginx -s' "$CALLS" && [ "$(cat "$ROOT/var/lib/nuit-cloud/ingress/revision")" = "$IREV1" ] && [ "$(cat "$INC")" = "$want_inc" ] && [ ! -L "$DEFSITE" ] && ! grep -q '^docker' "$CALLS" \
+  && ok "host ingress: when nginx -t refuses, the site files and certificates are put back and nothing is reloaded or recorded, while the include file and the default site stay put right" \
+  || { cat "$tmp/out" "$CALLS"; printf '%s\n' "$sites_before" >"$tmp/h-before"; printf '%s\n' "$sites_after" >"$tmp/h-after"; diff "$tmp/h-before" "$tmp/h-after" || true; bad "host ingress restore"; }
+rm -f "$STATE/h-bad"; : >"$CALLS"
+ing_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "host ingress apply after a refusal"; }; cat "$tmp/out" >>"$hout"
+[ "$(cat "$ROOT/var/lib/nuit-cloud/ingress/revision")" = "$IREV2" ] && [ "$(count 'systemctl reload nginx')" = 1 ] && ok "host ingress: once nginx accepts it, the revision is applied and nginx reloaded" || { cat "$CALLS"; bad "host ingress after refusal"; }
+
+# an nginx that will not start on the files it had is started once nginx -t accepts the new ones; one that will not start at all is FAILED
+rm -f "$STATE/h-active-nginx"; export NCS_INGRESS_REVISION="$IREV1"; mkstage "$IST3" "$IREV1" <<STAGE
+site 00-nuit-cloud-default.conf # default h5
+STAGE
+touch "$STATE/h-nostart"; : >"$CALLS"
+ing_run >"$tmp/out" 2>&1 && bad "host ingress: an nginx that would not start passed"; cat "$tmp/out" >>"$hout"
+grep -q 'FAILED  ncs_ingress' "$tmp/out" && grep -q 'nginx accepted the configuration but did not start' "$tmp/out" && [ "$(cat "$ROOT/var/lib/nuit-cloud/ingress/revision")" = "$IREV2" ] \
+  && ok "host ingress: an nginx that will not start is FAILED plainly, and the revision is not recorded" || { cat "$tmp/out" "$CALLS"; bad "host ingress no start"; }
+rm -f "$STATE/h-nostart"; : >"$CALLS"
+ing_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "host ingress start"; }; cat "$tmp/out" >>"$hout"
+[ -e "$STATE/h-active-nginx" ] && [ "$(cat "$ROOT/var/lib/nuit-cloud/ingress/revision")" = "$IREV1" ] && ok "host ingress: a stopped nginx is started again" || { cat "$CALLS"; bad "host ingress started"; }
+
+# only the exact word is the machine's nginx: `Host` is a container name like any other (and not running here, so a person's job)
+: >"$CALLS"; env NCS_INGRESS_CONTAINER=Host sh "$here/bootstrap.sh" nuit-cloud-ingress >"$tmp/out" 2>&1 && bad "host ingress: Host was taken for host"
+grep -q 'MANUAL  ncs_ingress' "$tmp/out" && grep -q 'docker inspect' "$CALLS" && ! grep -q 'apt-get\|^nginx\|^systemctl' "$CALLS" && ok "host ingress: only the exact word host means the machine's nginx" || { cat "$tmp/out" "$CALLS"; bad "host ingress word"; }
+
+leaks=0
+for s in "$ING_KEY1" "$ING_KEY3" chain-shop chain-www; do
+  grep -qF -- "$s" "$hout" "$CALLS" && { echo "leaked: $s" >&2; leaks=1; }
+  grep -rqF -- "$s" "$ROOT/var" "$ROOT/etc" "$STATE" 2>/dev/null && { echo "recorded: $s" >&2; leaks=1; }
+done
+[ "$leaks" = 0 ] && ok "host ingress: no certificate or key appears in any output, command or record" || bad "host ingress leaked key material"
+rm -f "$STATE"/h-* "$STATE"/pkg-nginx "$STATE"/policy-rc-seen; unset NCS_INGRESS_REVISION NCS_INGRESS_CONF_DIR NCS_INGRESS_CERT_ROOT NCS_INGRESS_CONTAINER NCS_INGRESS_STAGE
+for c in systemctl apt-get docker; do cp -p "$tmp/$c.orig23" "$tmp/bin/$c"; done; rm -f "$tmp/bin/nginx"
+export ROOT="$OLDROOT23"
 echo "all passed"

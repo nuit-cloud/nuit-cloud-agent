@@ -1,13 +1,15 @@
 // Package ingress is the agent's half of the `nuit-cloud-ingress` profile (nuit-cloud/nuit-cloud#184): the machine that plays the Ingress
-// Service runs nginx in a container, and the platform's routes become site files and certificates in two directories it reads.
+// Service runs nginx, in a container or (container `host`) as Debian's own package on the machine, and the platform's routes become site files
+// and certificates in two directories it reads.
 //
 // The signed task carries only non-secret facts: the revision the platform wants applied, where the site files go (confDir), under which
-// directory the certificates go (certRoot) and which container is tested and reloaded. The content (site files, certificates, private keys)
+// directory the certificates go (certRoot) and which container is tested and reloaded (or `host`). The content (site files, certificates, private keys)
 // is read here, by the agent, with its own credential (`GET /api/agent/ingress-config`), never from the task. What ties that unsigned
 // content to the signature is the revision: it is computed again here from the content and must equal the signed one, or nothing is done.
 // Every name and directory in the content is checked against the signed settings (a site file is a name in confDir and nothing else; a
 // certificate's directory is below certRoot). The content is staged in a root-only directory on tmpfs and the profile's scripts are told
-// only where it is; they write it, test it with nginx in the named container and put the previous files back if nginx refuses it.
+// only where it is; they write it, test it with nginx (in the named container, or on the machine) and put the previous files back if nginx
+// refuses it.
 package ingress
 
 import (
@@ -73,7 +75,11 @@ type Params struct {
 // ValidRevision says whether s is a revision: 64 lower-case hex characters.
 func ValidRevision(s string) bool { return revisionRe.MatchString(s) }
 
-// ValidContainer says whether s can be a Docker container's name.
+// Host is the container setting that means nginx is not in a container: it is Debian's nginx package on the machine itself, which the
+// profile installs and keeps (nuit-cloud/nuit-cloud#184, for a Nuit Container Service machine, which has no Docker).
+const Host = "host"
+
+// ValidContainer says whether s can be a Docker container's name (Host is one too, and means the machine's own nginx).
 func ValidContainer(s string) bool { return containerRe.MatchString(s) }
 
 // ValidSiteFile says whether name is one of the platform's site files (and so one the profile may write, replace or remove).
