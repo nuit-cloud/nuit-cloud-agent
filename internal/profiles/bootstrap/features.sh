@@ -694,7 +694,10 @@ STATIC
 # Adds a VLAN sub-interface on the machine's default-route interface carrying the slice the platform allocated: the node's own
 # address and the tenant block as secondary addresses, plus the rules that send replies for connections that arrived on the VLAN
 # back out by the VLAN gateway (without them a reply from a tenant address leaves by the wrong interface and the router drops it).
-# The agent passes NCS_VLAN_ID, NCS_VLAN_ADDRESS, NCS_VLAN_PREFIX, NCS_VLAN_GATEWAY and NCS_VLAN_TENANT_ADDRESSES.
+# The agent passes NCS_VLAN_ID, NCS_VLAN_ADDRESS, NCS_VLAN_PREFIX, NCS_VLAN_GATEWAY and NCS_VLAN_TENANT_ADDRESSES (may be empty).
+# Tenant addresses are leases that follow their services between machines (nuit-cloud/nuit-cloud#189): the tenant-address task adds
+# and removes them, one `post-up ip addr add` line each in the same file. This feature owns the interface and the node's own address; it
+# makes sure every tenant address it is given is there, and never removes a tenant line it finds (those belong to the task).
 # The VLAN is assumed to be carried to the port already, so a gateway that does not answer is a note, not a failure. What can hurt
 # is the change taking the machine's own connectivity with it, so as for the management address: a timer that undoes it is armed
 # first; nothing existing is touched (a new interface only); a snapshot proves no address or route was lost; and the platform must
@@ -704,7 +707,28 @@ VLAN_MARK="${VLAN_MARK:-0x5}"
 
 vlan_file() { printf '/etc/network/interfaces.d/nuit-cloud-vlan%s' "$NCS_VLAN_ID"; }
 
-vlan_render() { # vlan_render <interface>  -> the stanza on stdout
+# vlan_tenant_lines <vlan interface> [existing file] -> the tenant lines: every `ip addr add <a>/` line already in the file (not comments),
+# as it is, then one line for each given address the file does not have yet. One line per address (the first kept), in that order.
+vlan_tenant_lines() {
+  _tv="$1"; _tf="${2:-}"; _seen=" "
+  if [ -n "$_tf" ] && [ -f "$_tf" ]; then
+    while IFS= read -r _tl || [ -n "$_tl" ]; do
+      case "$_tl" in *"ip addr add "*) ;; *) continue;; esac
+      printf '%s\n' "$_tl" | grep -q '^[[:space:]]*#' && continue
+      _ta="$(printf '%s\n' "$_tl" | sed -n 's/.*ip addr add \([0-9][0-9.]*\)\/.*/\1/p')"
+      [ -n "$_ta" ] || continue
+      case "$_seen" in *" $_ta "*) continue;; esac
+      _seen="$_seen$_ta "; printf '%s\n' "$_tl"
+    done <"$_tf"
+  fi
+  for _ta in ${NCS_VLAN_TENANT_ADDRESSES:-}; do
+    case "$_seen" in *" $_ta "*) continue;; esac
+    _seen="$_seen$_ta "
+    echo "    post-up ip addr add ${_ta}/${NCS_VLAN_PREFIX} dev ${_tv} 2>/dev/null || true"
+  done
+}
+
+vlan_render() { # vlan_render <interface> [existing file]  -> the stanza on stdout, keeping the existing file's tenant lines
   _if="$1"; _vif="$_if.$NCS_VLAN_ID"
   cat <<EOF
 # Managed by the nuit-cloud agent (ncs_vlan): the tenant VLAN slice the platform allocated for this machine.
@@ -714,9 +738,7 @@ iface ${_vif} inet static
     pre-up modprobe 8021q 2>/dev/null || true
     pre-up ip link show ${_vif} >/dev/null 2>&1 || ip link add link ${_if} name ${_vif} type vlan id ${NCS_VLAN_ID}
 EOF
-  for a in $NCS_VLAN_TENANT_ADDRESSES; do
-    echo "    post-up ip addr add ${a}/${NCS_VLAN_PREFIX} dev ${_vif} 2>/dev/null || true"
-  done
+  vlan_tenant_lines "$_vif" "${2:-}"
   cat <<EOF
     post-up sysctl -qw net.ipv4.conf.${_if}/${NCS_VLAN_ID}.rp_filter=2
     post-up iptables -t mangle -C PREROUTING -i ${_vif} -m conntrack --ctstate NEW -j CONNMARK --set-mark ${VLAN_MARK} 2>/dev/null || iptables -t mangle -A PREROUTING -i ${_vif} -m conntrack --ctstate NEW -j CONNMARK --set-mark ${VLAN_MARK}
@@ -735,8 +757,7 @@ vlan_inputs_ok() {
   printf '%s' "${NCS_VLAN_ID:-}" | grep -Eq '^[0-9]{1,4}$' || return 1
   printf '%s' "${NCS_VLAN_PREFIX:-}" | grep -Eq '^[0-9]{1,2}$' || return 1
   addr_is_ipv4 "${NCS_VLAN_ADDRESS:-}" && addr_is_ipv4 "${NCS_VLAN_GATEWAY:-}" || return 1
-  [ -n "${NCS_VLAN_TENANT_ADDRESSES:-}" ] || return 1
-  for a in $NCS_VLAN_TENANT_ADDRESSES; do addr_is_ipv4 "$a" || return 1; done
+  for a in ${NCS_VLAN_TENANT_ADDRESSES:-}; do addr_is_ipv4 "$a" || return 1; done
   return 0
 }
 
@@ -744,18 +765,14 @@ f_ncs_vlan_ok() {
   vlan_inputs_ok && addr_discover || return 1
   _file="$(p "$(vlan_file)")"
   _vif="$A_IF.$NCS_VLAN_ID"
-  # exactly what this feature writes, or an equivalent configuration made by hand (nuit-cloud/nuit-cloud-servers scripts/server-vlan5.sh): the same sub-interface with
-  # the same address and tenant block named in it. A working VLAN made by hand is adopted as it is, never rewritten.
-  if ! vlan_render "$A_IF" | cmp -s - "$_file" 2>/dev/null; then
-    grep -Eq "^[[:space:]]*iface[[:space:]]+$_vif[[:space:]]+inet[[:space:]]+static" "$_file" 2>/dev/null || return 1
-    grep -Eq "^[[:space:]]*address[[:space:]]+$NCS_VLAN_ADDRESS/$NCS_VLAN_PREFIX" "$_file" || return 1
-    # the tenant block must be exactly the same set, not a part of it
-    _in_file="$(grep -o 'ip addr add [0-9.]*' "$_file" | awk '{print $4}' | sort | tr '\n' ' ')"
-    _wanted="$(printf '%s\n' $NCS_VLAN_TENANT_ADDRESSES | sort | tr '\n' ' ')"
-    [ "$_in_file" = "$_wanted" ] || return 1
-  fi
+  # what this feature writes, or an equivalent configuration made by hand (nuit-cloud/nuit-cloud-servers scripts/server-vlan5.sh): the
+  # sub-interface with the node's own address, and every given tenant address named in it. Other tenant lines are the tenant-address
+  # task's and are allowed. A working VLAN made by hand is adopted as it is, never rewritten.
+  grep -Eq "^[[:space:]]*iface[[:space:]]+$_vif[[:space:]]+inet[[:space:]]+static" "$_file" 2>/dev/null || return 1
+  grep -Eq "^[[:space:]]*address[[:space:]]+$NCS_VLAN_ADDRESS/$NCS_VLAN_PREFIX([[:space:]]|$)" "$_file" || return 1
+  for a in ${NCS_VLAN_TENANT_ADDRESSES:-}; do grep -v '^[[:space:]]*#' "$_file" | grep -Fq "ip addr add $a/" || return 1; done
   _have="$(ip -4 -o addr show dev "$_vif" 2>/dev/null | awk '{print $4}')"
-  for a in "$NCS_VLAN_ADDRESS" $NCS_VLAN_TENANT_ADDRESSES; do printf '%s\n' "$_have" | grep -qx "$a/$NCS_VLAN_PREFIX" || return 1; done
+  for a in "$NCS_VLAN_ADDRESS" ${NCS_VLAN_TENANT_ADDRESSES:-}; do printf '%s\n' "$_have" | grep -qx "$a/$NCS_VLAN_PREFIX" || return 1; done
   return 0
 }
 
@@ -779,7 +796,7 @@ f_ncs_vlan_do() {
     return 3
   }
   # the VLAN's own addresses must not already be somewhere else on this machine
-  for a in "$NCS_VLAN_ADDRESS" $NCS_VLAN_TENANT_ADDRESSES; do
+  for a in "$NCS_VLAN_ADDRESS" ${NCS_VLAN_TENANT_ADDRESSES:-}; do
     if ip -4 -o addr show 2>/dev/null | awk -v v="$vif" '$2 != v {print $4}' | grep -qx "$a/$NCS_VLAN_PREFIX"; then echo "  $a is already on another interface of this machine: nothing was changed" >&2; return 1; fi
   done
 
@@ -805,7 +822,8 @@ ROLLBACK
   : >"$d/armed"
 
   mkdir -p "$(dirname "$file")"
-  vlan_render "$A_IF" >"$file"
+  # the tenant lines already there (the tenant-address task's, or a hand setup's) are kept; the given ones are added
+  if [ "$existing" = 1 ]; then vlan_render "$A_IF" "$d/previous" >"$file"; else vlan_render "$A_IF" >"$file"; fi
   [ -e "$(p /etc/modules-load.d/8021q.conf)" ] || { mkdir -p "$(p /etc/modules-load.d)"; echo 8021q >"$(p /etc/modules-load.d/8021q.conf)"; }   # load the VLAN module at boot
   systemctl restart systemd-modules-load.service >/dev/null 2>&1 || true   # the agent's own sandbox may not load modules; systemd can
   if ! ifup "$vif" >"$d/ifup.out" 2>&1; then

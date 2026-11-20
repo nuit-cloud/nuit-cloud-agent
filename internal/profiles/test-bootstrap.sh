@@ -317,7 +317,7 @@ stub ifdown 'echo "ifdown $*" >>"$CALLS"; grep -v "^eth0.5 " "$STATE/ip-addrs" >
 stub ping 'echo "ping $*" >>"$CALLS"; [ ! -e "$STATE/gw-silent" ]'
 stub iptables 'true'
 stub ifquery '[ ! -e "$STATE/no-ifstate" ]'
-vlan_run() { env NCS_VLAN_ID=5 NCS_VLAN_PREFIX=24 NCS_VLAN_ADDRESS=10.20.0.18 NCS_VLAN_GATEWAY=10.20.0.1 NCS_VLAN_TENANT_ADDRESSES="${TENANTS:-10.20.0.19 10.20.0.20 10.20.0.21}" NCS_PLATFORM_URL=https://agent.example sh "$here/bootstrap.sh" nuit-cloud-vlan ${1:+"$1"}; }
+vlan_run() { env NCS_VLAN_ID=5 NCS_VLAN_PREFIX=24 NCS_VLAN_ADDRESS=10.20.0.18 NCS_VLAN_GATEWAY=10.20.0.1 NCS_VLAN_TENANT_ADDRESSES="${TENANTS-10.20.0.19 10.20.0.20 10.20.0.21}" NCS_PLATFORM_URL=https://agent.example sh "$here/bootstrap.sh" nuit-cloud-vlan ${1:+"$1"}; }
 vlan_net() { mk_net 10.10.10.170; sed -i.bak '/^eth0.5 /d' "$STATE/ip-addrs"; rm -f "$STATE/ifup-fail" "$STATE/gw-silent" "$STATE/no-ifstate"; : >"$CALLS"; rm -f "$ROOT/etc/network/interfaces.d/nuit-cloud-vlan5" "$ROOT/etc/modules-load.d/8021q.conf"; }
 
 vlan_net
@@ -330,7 +330,15 @@ grep -q 'done    ncs_vlan' "$tmp/out" && grep -q '^iface eth0.5 inet static$' "$
   && grep -q 'systemd-run.*nuit-cloud-vlan-rollback' "$CALLS" && grep -q 'ifup eth0.5' "$CALLS" && grep -q 'systemctl stop nuit-cloud-vlan-rollback.timer' "$CALLS" && grep -qx 'eth0 10.10.10.170/24' "$STATE/ip-addrs" && grep -qx 'eth0.5 10.20.0.19/24' "$STATE/ip-addrs" \
   && grep -q 'VLAN gateway 10.20.0.1 answers' "$tmp/out" && ok "ncs_vlan: the sub-interface is written like server-vlan5.sh, brought up, the machine's own address untouched, the timer cancelled" || { cat "$tmp/out"; cat "$f"; cat "$CALLS"; bad "vlan apply result"; }
 : >"$CALLS"; vlan_run >"$tmp/out" 2>&1 && vlan_run --check >/dev/null 2>&1 && [ ! -s "$CALLS" ] && ok "ncs_vlan: a second run is a no-op and --check is clean" || { cat "$tmp/out"; cat "$CALLS"; bad "vlan idempotent"; }
-(TENANTS="10.20.0.19 10.20.0.20"; vlan_run --check >/dev/null 2>&1) && bad "a changed tenant block passed the check" || ok "ncs_vlan: a different tenant block is drift"
+# tenant addresses are leases the tenant-address task moves (nuit-cloud/nuit-cloud#189): a line in the file that was not given is the task's
+(TENANTS="10.20.0.19 10.20.0.20"; vlan_run --check >/dev/null 2>&1) && ok "ncs_vlan: a tenant line in the file that was not given is allowed (the tenant-address task's)" || bad "an extra tenant line failed the check"
+(TENANTS=""; vlan_run --check >/dev/null 2>&1) && ok "ncs_vlan: with no tenant addresses given the check is the interface and the node's own address" || bad "an empty tenant list failed the check"
+(TENANTS="10.20.0.19 10.20.0.22"; vlan_run --check >/dev/null 2>&1) && bad "a given tenant address missing from the file passed the check" || ok "ncs_vlan: a given tenant address that is not in the file is drift"
+sed -i.bak '/ip addr add 10.20.0.20\//d' "$f"
+(TENANTS="10.20.0.19 10.20.0.20"; vlan_run --check >/dev/null 2>&1) && bad "a given tenant address missing from the file (but live) passed the check" || ok "ncs_vlan: a given tenant address live but not in the file is drift"
+grep -v '^eth0.5 10.20.0.21/24$' "$STATE/ip-addrs" >"$STATE/ip-addrs.new"; mv "$STATE/ip-addrs.new" "$STATE/ip-addrs"
+(TENANTS="10.20.0.21"; vlan_run --check >/dev/null 2>&1) && bad "a given tenant address in the file but not live passed the check" || ok "ncs_vlan: a given tenant address in the file but not live is drift"
+echo "eth0.5 10.20.0.21/24" >>"$STATE/ip-addrs"
 # a VLAN set up by hand with nuit-cloud/nuit-cloud-servers scripts/server-vlan5.sh is adopted as it is
 cat >"$f" <<HAND
 # Managed by deploy/server-vlan5.sh (nuit-cloud). Remove with: sh server-vlan5.sh --remove
@@ -343,6 +351,39 @@ iface eth0.5 inet static
     post-up ip addr add 10.20.0.21/24 dev eth0.5 2>/dev/null || true
 HAND
 : >"$CALLS"; vlan_run --check >"$tmp/out" 2>&1 && [ ! -s "$CALLS" ] && ok "ncs_vlan: an equivalent VLAN made by hand is adopted, not rewritten" || { cat "$tmp/out"; cat "$f"; bad "vlan adopt"; }
+
+# an empty tenant list is accepted: the file carries the interface and the node's own address only
+vlan_net
+(TENANTS=""; vlan_run) >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "vlan apply with no tenant addresses"; }
+grep -q 'done    ncs_vlan' "$tmp/out" && grep -q '^    address 10.20.0.18/24$' "$f" && ! grep -q 'ip addr add' "$f" && (TENANTS=""; vlan_run --check >/dev/null 2>&1) \
+  && ok "ncs_vlan: an empty tenant list is accepted, and the file then has no tenant lines" || { cat "$tmp/out"; cat "$f"; bad "vlan empty tenants"; }
+# an apply keeps every tenant line already in the file (the tenant-address task's, in an old agent file or a hand-made one) and adds the given ones
+for kind in agent hand; do
+  vlan_net
+  if [ "$kind" = agent ]; then
+    # what the feature wrote for 10.20.0.19, then two lines the tenant-address task added around it
+    (TENANTS="10.20.0.19"; vlan_run >/dev/null 2>&1) || bad "vlan apply ($kind setup)"
+    awk '/ip addr add 10.20.0.19\//{print "    post-up ip addr add 10.20.0.40/24 dev eth0.5 2>/dev/null || true"; print; print "    post-up ip addr add 10.20.0.41/24 dev eth0.5 2>/dev/null || true"; next} {print}' "$f" >"$f.new"; mv "$f.new" "$f"
+  else
+    cat >"$f" <<HAND
+# Managed by deploy/server-vlan5.sh (nuit-cloud). Remove with: sh server-vlan5.sh --remove
+auto eth0.5
+iface eth0.5 inet static
+    address 10.20.0.18/24
+    pre-up modprobe 8021q
+    # secondary addresses for tenants' DNS
+    post-up ip addr add 10.20.0.40/24 dev eth0.5 2>/dev/null || true
+    post-up ip addr add 10.20.0.19/24 dev eth0.5 2>/dev/null || true
+    post-up ip addr add 10.20.0.41/24 dev eth0.5 2>/dev/null || true
+    # post-up ip addr add 10.20.0.20/24 dev eth0.5 2>/dev/null || true
+HAND
+  fi
+  sed -i.bak '/^eth0.5 /d' "$STATE/ip-addrs"; : >"$CALLS"
+  (TENANTS="10.20.0.19 10.20.0.20 10.20.0.21"; vlan_run) >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "vlan apply over a $kind file"; }
+  [ "$(grep -o 'ip addr add [0-9.]*/24 dev eth0.5' "$f" | grep -v '^#' | awk '{print $4}' | tr '\n' ' ')" = "10.20.0.40/24 10.20.0.19/24 10.20.0.41/24 10.20.0.20/24 10.20.0.21/24 " ] \
+    && [ "$(grep -c 'ip addr add 10.20.0.19/' "$f")" = 1 ] && ! grep -q '^[[:space:]]*#.*ip addr add' "$f" && grep -q 'done    ncs_vlan' "$tmp/out" && grep -q '^# Managed by the nuit-cloud agent (ncs_vlan)' "$f" \
+    && ok "ncs_vlan: an apply over a $kind file keeps every tenant line there, in order, and adds the given ones once" || { cat "$tmp/out"; cat "$f"; bad "vlan keeps tenant lines ($kind)"; }
+done
 
 # the VLAN is assumed to be carried: a silent gateway is a note, not a failure
 vlan_net; touch "$STATE/gw-silent"
@@ -370,7 +411,8 @@ grep -q 'MANUAL  ncs_vlan' "$tmp/out" && grep -q 'not held up by ifupdown' "$tmp
 vlan_net
 env NCS_VLAN_ID=5 NCS_VLAN_PREFIX=24 NCS_VLAN_ADDRESS="10.20.0.18; reboot" NCS_VLAN_GATEWAY=10.20.0.1 NCS_VLAN_TENANT_ADDRESSES="10.20.0.19" sh "$here/bootstrap.sh" nuit-cloud-vlan >"$tmp/out" 2>&1 && bad "a bad address was accepted"
 sh "$here/bootstrap.sh" nuit-cloud-vlan >"$tmp/out2" 2>&1 && bad "no slice was accepted"
-grep -q 'MANUAL  ncs_vlan' "$tmp/out" && grep -q 'MANUAL  ncs_vlan' "$tmp/out2" && [ ! -s "$CALLS" ] && ok "ncs_vlan: no slice, or an invalid one, changes nothing" || { cat "$tmp/out"; bad "vlan inputs"; }
+(TENANTS='10.20.0.19 $(touch /tmp/nuit-pwned) 10.20.0.999'; vlan_run) >"$tmp/out3" 2>&1 && bad "a bad tenant address was accepted"
+grep -q 'MANUAL  ncs_vlan' "$tmp/out" && grep -q 'MANUAL  ncs_vlan' "$tmp/out2" && grep -q 'MANUAL  ncs_vlan' "$tmp/out3" && [ ! -s "$CALLS" ] && [ ! -e "$f" ] && ok "ncs_vlan: no slice, or an invalid one, changes nothing" || { cat "$tmp/out"; bad "vlan inputs"; }
 
 # 11. ncs_ssh_harden: passwords and root login off only when a key the platform names can still get in, with a timer until confirmed
 ssh-keygen -q -t ed25519 -N '' -C test-admin -f "$tmp/adminkey" && FP="$(ssh-keygen -lf "$tmp/adminkey.pub" | awk '{print $2}')"

@@ -7,8 +7,9 @@
 //	post-up ip addr add 10.20.0.3/24 dev enp0s31f6.5 2>/dev/null || true
 //
 // (indented four spaces; written by the ncs_vlan feature, or by hand with an equivalent script). The task `tenant-address` changes that
-// address both live (`ip addr add`/`del`) and in the file, so it survives a reboot and the profile check (which compares the file's
-// `ip addr add` addresses with the platform's list) agrees with the machine. Every other line of the file is left byte for byte as it was.
+// address both live (`ip addr add`/`del`) and in the file, so it survives a reboot. Every other line of the file is left byte for byte as
+// it was. The ncs_vlan feature owns the interface and the node's own address (nuit-cloud/nuit-cloud#189): its check allows tenant lines it
+// was not given, and its apply keeps every tenant line already in the file, so it never undoes this task's work.
 //
 //   - release removes the address from the VLAN interface and its line from the file. It never releases the node's own address.
 //   - take refuses an address that is on another interface of this machine, or that another machine on the VLAN still answers for (three

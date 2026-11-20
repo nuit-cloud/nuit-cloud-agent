@@ -605,9 +605,18 @@ func vlanEnvironment(raw map[string]any, platformURL string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("the VLAN gateway: %w", err)
 	}
-	list, _ := raw["tenantAddresses"].([]any)
-	if len(list) < 1 || len(list) > 32 {
-		return nil, errors.New("the VLAN carries 1 to 32 tenant addresses")
+	// Tenant addresses are leases the tenant-address task moves between machines (nuit-cloud/nuit-cloud#189): the slice may name none.
+	// Absent or a list of 0 to 32; anything else (null, a string, a number) is refused, never read as none.
+	var list []any
+	if v, given := raw["tenantAddresses"]; given {
+		l, ok := v.([]any)
+		if !ok {
+			return nil, errors.New("the VLAN's tenant addresses are not a list")
+		}
+		list = l
+	}
+	if len(list) > 32 {
+		return nil, errors.New("the VLAN carries at most 32 tenant addresses")
 	}
 	var tenants []string
 	for _, v := range list {

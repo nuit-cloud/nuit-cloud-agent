@@ -393,12 +393,21 @@ func TestTheVLANSliceReachesTheScriptsAsEnvironmentAndBadPartsAreRefused(t *test
 		t.Errorf("%+v env=%v", rep, f.env)
 	}
 	for name, mutate := range map[string]func(map[string]any){
-		"id":         func(m map[string]any) { m["id"] = float64(5000) },
-		"prefix":     func(m map[string]any) { m["prefix"] = float64(8) },
-		"address":    func(m map[string]any) { m["address"] = "10.20.0.18; reboot" },
-		"gateway":    func(m map[string]any) { m["gateway"] = "fe80::1" },
-		"no tenant":  func(m map[string]any) { m["tenantAddresses"] = []any{} },
-		"bad tenant": func(m map[string]any) { m["tenantAddresses"] = []any{"10.20.0.19", "$(id)"} },
+		"id":              func(m map[string]any) { m["id"] = float64(5000) },
+		"prefix":          func(m map[string]any) { m["prefix"] = float64(8) },
+		"address":         func(m map[string]any) { m["address"] = "10.20.0.18; reboot" },
+		"gateway":         func(m map[string]any) { m["gateway"] = "fe80::1" },
+		"bad tenant":      func(m map[string]any) { m["tenantAddresses"] = []any{"10.20.0.19", "$(id)"} },
+		"spaced tenant":   func(m map[string]any) { m["tenantAddresses"] = []any{"10.20.0.19 10.20.0.20"} },
+		"tenant not list": func(m map[string]any) { m["tenantAddresses"] = "10.20.0.19" },
+		"null tenants":    func(m map[string]any) { m["tenantAddresses"] = nil },
+		"too many tenants": func(m map[string]any) {
+			l := make([]any, 33)
+			for i := range l {
+				l[i] = "10.20.0." + strconv.Itoa(19+i)
+			}
+			m["tenantAddresses"] = l
+		},
 	} {
 		v := good()
 		mutate(v)
@@ -406,6 +415,24 @@ func TestTheVLANSliceReachesTheScriptsAsEnvironmentAndBadPartsAreRefused(t *test
 		task.Params["vlan"] = v
 		if rep := withProfiles(f2).Run(context.Background(), task); rep.Status != "failed" || len(f2.calls) != 0 {
 			t.Errorf("%s: %+v calls=%v", name, rep, f2.calls)
+		}
+	}
+}
+
+// Tenant addresses are leases the tenant-address task moves (nuit-cloud/nuit-cloud#189): a slice with none, given as an empty list or not
+// at all, reaches the scripts as an empty list.
+func TestAVLANSliceWithNoTenantAddressesReachesTheScriptsAsAnEmptyList(t *testing.T) {
+	for name, tenants := range map[string]any{"empty": []any{}, "absent": nil} {
+		v := map[string]any{"id": float64(5), "address": "10.20.0.18", "prefix": float64(24), "gateway": "10.20.0.1"}
+		if tenants != nil {
+			v["tenantAddresses"] = tenants
+		}
+		f := &fakeProfiles{res: profiles.Result{Features: []profiles.Feature{{Name: "ncs_vlan", Status: "applied"}}}}
+		r := withProfiles(f)
+		r.PlatformURL = "https://agent.example"
+		task := &taskverify.Task{Name: "profile-apply", TimeoutSeconds: 30, Params: map[string]any{"profile": "nuit-cloud-vlan", "vlan": v}}
+		if rep := r.Run(context.Background(), task); rep.Status != "done" || strings.Join(f.env, "|") != "NCS_VLAN_ID=5|NCS_VLAN_PREFIX=24|NCS_VLAN_ADDRESS=10.20.0.18|NCS_VLAN_GATEWAY=10.20.0.1|NCS_VLAN_TENANT_ADDRESSES=|NCS_PLATFORM_URL=https://agent.example" {
+			t.Errorf("%s: %+v env=%v", name, rep, f.env)
 		}
 	}
 }
