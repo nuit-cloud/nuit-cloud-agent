@@ -1013,16 +1013,77 @@ f_ncs_wifi_off_do() {
 }
 
 # ─── The platform's SSH login ──────────────────────────────────────────────────────────────────────────────────────────────────────
-# Installs the platform's own public key (NCS_PLATFORM_SSH_KEY, from the signed task) for the login the platform uses, $NC_USER.
-# It adds the one key line if it is missing and nothing else: other keys stay, the account is never created (MANUAL if it is
-# missing), and the directory and file get the owner and modes sshd insists on. Public key only; nothing secret passes through.
+# Keeps the platform's SSH public keys authorised for the login the platform uses, $NC_USER. The account is never created (MANUAL if it
+# is missing), and the directory and file keep the owner and modes sshd insists on. Public keys only; nothing secret passes through,
+# and no key body is ever printed. Two forms, from the signed task:
+#
+#   NCS_LOGIN_KEYS (the key registry, nuit-cloud/nuit-cloud#92): 1 to 64 words `<id>=<base64>`, each an ssh-ed25519 key. Each is
+#     written as the line `ssh-ed25519 <base64> nuit-cloud:<id>`; that trailing comment marks a line as the platform's. The marked
+#     lines are kept equal to the list: a missing key is added, a marked line whose id or key is no longer listed is removed (how a
+#     revocation lands), and an unmarked line holding a listed key is adopted (rewritten as its marked line, in place). Every other
+#     line is left exactly as it was. The new file is written beside the old and renamed over it, so no moment has a partial file.
+#   NCS_PLATFORM_SSH_KEY (an older platform): one key line, added if missing; nothing is ever removed.
 login_home() { getent passwd "$NC_USER" 2>/dev/null | cut -d: -f6; }
 login_key_ok() { # the key's body (type and base64) is already authorised
   home="$(login_home)"; [ -n "$home" ] || return 1
   body="$(printf '%s' "$NCS_PLATFORM_SSH_KEY" | awk '{print $1" "$2}')"
   [ -f "$home/.ssh/authorized_keys" ] && awk -v b="$body" '{ if (($1" "$2)==b) f=1 } END { exit f?0:1 }' "$home/.ssh/authorized_keys"
 }
-f_ncs_login_ok() { [ -n "${NCS_PLATFORM_SSH_KEY:-}" ] && f_user_ok && login_key_ok; }
+# login_keys_valid: NCS_LOGIN_KEYS holds 1 to 64 `<id>=<ssh-ed25519 base64>` words with unique ids and unique keys (checked again here,
+# as strictly as the agent checked the task). The character check comes first, so word splitting below can never glob.
+login_keys_valid() {
+  case "${NCS_LOGIN_KEYS:-}" in '' | *[!a-zA-Z0-9+/=\ -]*) return 1 ;; esac
+  lk_n=0
+  for lk_w in $NCS_LOGIN_KEYS; do
+    printf '%s\n' "$lk_w" | grep -Eq '^[a-z0-9][a-z0-9-]{0,39}=AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}$' || return 1
+    lk_n=$((lk_n + 1))
+  done
+  [ "$lk_n" -ge 1 ] && [ "$lk_n" -le 64 ] || return 1
+  [ "$(printf '%s\n' $NCS_LOGIN_KEYS | cut -d= -f1 | sort -u | wc -l | tr -d ' ')" = "$lk_n" ] \
+    && [ "$(printf '%s\n' $NCS_LOGIN_KEYS | cut -d= -f2 | sort -u | wc -l | tr -d ' ')" = "$lk_n" ]
+}
+# LOGIN_SYNC_AWK reads an authorized_keys file and the list (-v keys), and prints `<add> <remove> <adopt> <unmanaged>`; with -v out=<file>
+# it also writes the file as it should be. A marked line is exactly three fields: a key type, the base64, `nuit-cloud:<id>`. It holds no
+# dollar-brace, percent or doubled dollar, because systemd expands those in a transient unit's command line (a test checks).
+LOGIN_SYNC_AWK='
+function emit(line) { if (out != "") print line > out }
+BEGIN {
+  n = split(keys, ks, " ")
+  for (i = 1; i <= n; i++) { eq = index(ks[i], "="); id = substr(ks[i], 1, eq - 1); ids[i] = id; body[id] = substr(ks[i], eq + 1); byBody[body[id]] = id }
+  add = 0; rem = 0; adopt = 0; unmanaged = 0
+}
+NF == 3 && $1 ~ /^(ssh|ecdsa|sk)-/ && $3 ~ /^nuit-cloud:[a-z0-9][a-z0-9-]*$/ {
+  id = substr($3, 12)
+  if ((id in body) && $1 == "ssh-ed25519" && $2 == body[id] && !(id in have)) { have[id] = 1; emit($0) } else rem++
+  next
+}
+NF >= 2 && $1 == "ssh-ed25519" && ($2 in byBody) {
+  id = byBody[$2]; adopt++
+  if (!(id in have)) { have[id] = 1; emit("ssh-ed25519 " $2 " nuit-cloud:" id) }
+  next
+}
+{ if ($0 !~ /^[ \t]*(#|$)/) unmanaged++; emit($0) }
+END {
+  for (i = 1; i <= n; i++) if (!(ids[i] in have)) { add++; emit("ssh-ed25519 " body[ids[i]] " nuit-cloud:" ids[i]) }
+  if (out != "") close(out)
+  print add, rem, adopt, unmanaged
+}'
+login_counts() { # what keeping in step would do, changing nothing
+  lk_f="$(login_home)/.ssh/authorized_keys"; [ -f "$lk_f" ] || lk_f=/dev/null
+  awk -v keys="$NCS_LOGIN_KEYS" -v out= "$LOGIN_SYNC_AWK" "$lk_f"
+}
+f_ncs_login_ok() {
+  if [ -n "${NCS_LOGIN_KEYS+set}" ]; then
+    login_keys_valid || { [ "${MODE:-}" != check ] || echo "  the task's login keys are not usable (1 to 64 ssh-ed25519 keys, unique ids and keys)"; return 1; }
+    f_user_ok || return 1
+    lk_c="$(login_counts)" || return 1
+    set -- $lk_c
+    [ "$1" = 0 ] && [ "$2" = 0 ] && [ "$3" = 0 ] && return 0
+    [ "${MODE:-}" != check ] || echo "  the platform's keys are not in step: $1 to add, $2 to remove, $3 to adopt; $4 unmanaged line(s) left alone"
+    return 1
+  fi
+  [ -n "${NCS_PLATFORM_SSH_KEY:-}" ] && f_user_ok && login_key_ok
+}
 # The agent's service is sandboxed (ProtectHome=read-only), so the write is done by a transient systemd unit, which is not: it
 # inherits nothing from the agent's mount namespace. Without systemd (and in tests) it runs directly.
 LOGIN_WRITE='home="$1"; user="$2"; grp="$3"; key="$4"; dir="$home/.ssh"; file="$dir/authorized_keys"
@@ -1035,7 +1096,35 @@ if ! awk -v b="$body" "{ if ((\$1\" \"\$2)==b) f=1 } END { exit f?0:1 }" "$file"
 fi
 chmod 600 "$file" || exit 1
 chown "$user:$grp" "$dir" "$file" 2>/dev/null || [ -n "${ROOT:-}" ]'
+# LOGIN_SYNC keeps the registry's keys in step: the new file is written in the same directory (so the rename is atomic), given mode 600
+# and the account as owner, and only then renamed over the old one; on any failure the old file stays and the temporary one goes. It
+# prints the counts. Like LOGIN_SYNC_AWK it holds no dollar-brace, percent or doubled dollar (systemd would expand them).
+LOGIN_SYNC='home="$1"; user="$2"; grp="$3"; keys="$4"; prog="$5"; dir="$home/.ssh"; file="$dir/authorized_keys"
+[ ! -L "$dir" ] || { echo "  $dir is a symbolic link: left to a person" >&2; exit 1; }
+[ ! -d "$file" ] || { echo "  $file is a directory: left to a person" >&2; exit 1; }
+mkdir -p "$dir" || exit 1; chmod 700 "$dir" || exit 1
+chown "$user:$grp" "$dir" 2>/dev/null || [ -n "$ROOT" ] || exit 1
+src="$file"; [ -f "$file" ] || src=/dev/null
+tmp="$(mktemp "$dir/.authorized_keys.nuit-cloud.XXXXXX")" || exit 1
+if counts="$(awk -v keys="$keys" -v out="$tmp" "$prog" "$src")" && chmod 600 "$tmp" && { chown "$user:$grp" "$tmp" 2>/dev/null || [ -n "$ROOT" ]; } && mv -f "$tmp" "$file"; then
+  echo "$counts"
+else
+  rm -f "$tmp"; exit 1
+fi'
 f_ncs_login_do() {
+  if [ -n "${NCS_LOGIN_KEYS+set}" ]; then
+    login_keys_valid || { echo "  the task's login keys are not usable (1 to 64 ssh-ed25519 keys, unique ids and keys): nothing was changed" >&2; return 3; }
+    f_user_ok || { echo "  the account $NC_USER does not exist: create it first (adduser $NC_USER), then run this again" >&2; return 3; }
+    home="$(login_home)"; grp="$(id -gn "$NC_USER" 2>/dev/null || echo "$NC_USER")"
+    if [ -z "${ROOT:-}" ] && [ -d /run/systemd/system ] && command -v systemd-run >/dev/null 2>&1; then
+      lk_c="$(systemd-run --quiet --wait --collect --pipe /bin/sh -c "$LOGIN_SYNC" sh "$home" "$NC_USER" "$grp" "$NCS_LOGIN_KEYS" "$LOGIN_SYNC_AWK")" || return 1
+    else
+      lk_c="$(sh -c "$LOGIN_SYNC" sh "$home" "$NC_USER" "$grp" "$NCS_LOGIN_KEYS" "$LOGIN_SYNC_AWK")" || return 1
+    fi
+    set -- $lk_c
+    echo "  the platform's keys are in step for $NC_USER: $1 added, $2 removed, $3 adopted; $4 unmanaged line(s) left alone"
+    return 0
+  fi
   case "${NCS_PLATFORM_SSH_KEY:-}" in ssh-ed25519\ *) ;; *) echo "  the task carries no ssh-ed25519 public key" >&2; return 3 ;; esac
   case "$NCS_PLATFORM_SSH_KEY" in *'
 '*) echo "  the key must be a single line" >&2; return 3 ;; esac

@@ -21,18 +21,21 @@ import (
 
 // Report is the survey's result, sent to the platform as the task's findings.
 type Report struct {
-	CollectedAt string   `json:"collectedAt"`
-	Hostname    string   `json:"hostname"`
-	OS          OS       `json:"os"`
-	CPU         CPU      `json:"cpu"`
-	Memory      Memory   `json:"memory"`
-	Cgroups     Cgroups  `json:"cgroups"`
-	Disks       []Disk   `json:"disks"`
-	Network     Network  `json:"network"`
-	Time        Time     `json:"time"`
-	SSH         SSH      `json:"ssh"`
-	Power       Power    `json:"power"`
-	Problems    []string `json:"collectionProblems,omitempty"` // things the survey could not read, so a gap is not mistaken for a clean bill
+	CollectedAt string  `json:"collectedAt"`
+	Hostname    string  `json:"hostname"`
+	OS          OS      `json:"os"`
+	CPU         CPU     `json:"cpu"`
+	Memory      Memory  `json:"memory"`
+	Cgroups     Cgroups `json:"cgroups"`
+	Disks       []Disk  `json:"disks"`
+	Network     Network `json:"network"`
+	Time        Time    `json:"time"`
+	SSH         SSH     `json:"ssh"`
+	Power       Power   `json:"power"`
+	// AuthorizedKeys are the keys that can log in as the platform's login account (nuitcloud): fingerprints and the registry id of
+	// the lines the platform manages. null when the file could not be read (see collectionProblems), [] when there is none.
+	AuthorizedKeys []AuthorizedKey `json:"authorizedKeys"`
+	Problems       []string        `json:"collectionProblems,omitempty"` // things the survey could not read, so a gap is not mistaken for a clean bill
 }
 
 type OS struct {
@@ -241,6 +244,7 @@ func Collect(ctx context.Context, s Sources) Report {
 	r.Time = collectTime(ctx, s)
 	r.SSH = collectSSH(ctx, s, problem)
 	r.Power = collectPower(ctx, s)
+	r.AuthorizedKeys = collectAuthorizedKeys(s, problem)
 	return r
 }
 

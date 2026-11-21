@@ -200,12 +200,12 @@ func (r Runner) profile(ctx context.Context, task *taskverify.Task) client.Repor
 		// the platform must still be reachable with the wireless interfaces down before the saved network is removed
 		env = append(env, "NCS_PLATFORM_URL="+r.PlatformURL)
 	}
-	if raw, ok := task.Params["login"].(map[string]any); ok {
-		key, _ := raw["publicKey"].(string)
-		if !loginKey.MatchString(key) {
-			return client.Report{Status: "failed", ExitCode: &one, Output: "the task carries no usable ssh-ed25519 public key"}
+	if raw, ok := task.Params["login"]; ok {
+		loginEnv, err := loginEnvironment(raw)
+		if err != nil {
+			return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
 		}
-		env = append(env, "NCS_PLATFORM_SSH_KEY="+key)
+		env = append(env, loginEnv...)
 	}
 	if raw, ok := task.Params["dns"].(map[string]any); ok {
 		servers, err := dnsServers(raw)

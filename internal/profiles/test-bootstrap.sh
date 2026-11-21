@@ -515,6 +515,77 @@ touch "$STATE/nouser"; login_run >"$tmp/out" 2>&1 && bad "a missing account was 
 grep -q 'MANUAL  ncs_login' "$tmp/out" && grep -q 'does not exist' "$tmp/out" && ok "ncs_login: a missing account is left to a person" || { cat "$tmp/out"; bad "login no user"; }
 rm -f "$STATE/nouser"; env NCS_PLATFORM_SSH_KEY="ssh-rsa AAAA x" sh "$here/bootstrap.sh" nuit-cloud-login >"$tmp/out" 2>&1 && bad "a non-ed25519 key was accepted"
 grep -q 'MANUAL  ncs_login' "$tmp/out" && ok "ncs_login: only an ssh-ed25519 key is accepted" || bad "login key type"
+# 13b. ncs_login with the key registry (nuit-cloud/nuit-cloud#92): the marked lines are kept equal to the list, nothing else is touched
+for k in reg1 reg2 reg3 mine; do ssh-keygen -q -t ed25519 -N '' -C "$k@somewhere" -f "$tmp/$k"; done
+b64() { awk '{print $2}' "$tmp/$1.pub"; }
+R1="$(b64 reg1)" R2="$(b64 reg2)" R3="$(b64 reg3)" MINE="$(b64 mine)"
+reg_run() { env NCS_LOGIN_KEYS="$KEYS" sh "$here/bootstrap.sh" nuit-cloud-login ${1:+"$1"}; }
+reg_net() { rm -rf "$ROOT/home/nuitcloud"; mkdir -p "$ROOT/home/nuitcloud/.ssh"; chmod 755 "$ROOT/home/nuitcloud/.ssh"; : >"$CALLS"; }
+f="$ROOT/home/nuitcloud/.ssh/authorized_keys"
+reg_net
+{ echo '# my own notes'; echo "ssh-ed25519 $MINE mine@laptop"; echo "from=\"10.0.0.0/8\" ssh-ed25519 $R2 restricted"; echo "ssh-ed25519 $R1 platform-key-added-by-hand"
+  echo "ssh-ed25519 $R3 nuit-cloud:revoked-key"; echo "ssh-ed25519 $MINE nuit-cloud:old-id"; printf 'ssh-rsa AAAAB3Nza unrelated'; } >"$f"
+chmod 644 "$f"; ino="$(ls -i "$f" | awk '{print $1}')"; cp "$f" "$tmp/reg-before"
+KEYS="platform=$R1 ops-laptop=$R2"
+reg_run --check >"$tmp/out" 2>&1 && bad "a registry out of step passed the check"
+grep -q 'DRIFT   ncs_login' "$tmp/out" && grep -q '1 to add, 2 to remove, 1 to adopt; 3 unmanaged' "$tmp/out" && cmp -s "$f" "$tmp/reg-before" && [ ! -s "$CALLS" ] \
+  && ok "ncs_login registry: --check counts what to add, remove and adopt, and the unmanaged lines, and changes nothing" || { cat "$tmp/out"; bad "registry check"; }
+for s in "$R1" "$R2" "$R3" "$MINE"; do grep -qF -- "$s" "$tmp/out" && bad "registry check printed a key body"; done
+reg_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; cat "$f"; bad "registry apply"; }
+grep -q 'done    ncs_login' "$tmp/out" && grep -q '1 added, 2 removed, 1 adopted; 3 unmanaged' "$tmp/out" || { cat "$tmp/out"; bad "registry apply output"; }
+for s in "$R1" "$R2" "$R3" "$MINE"; do grep -qF -- "$s" "$tmp/out" && bad "registry apply printed a key body"; done
+expected="$tmp/reg-expected"
+{ echo '# my own notes'; echo "ssh-ed25519 $MINE mine@laptop"; echo "from=\"10.0.0.0/8\" ssh-ed25519 $R2 restricted"; echo "ssh-ed25519 $R1 nuit-cloud:platform"
+  echo 'ssh-rsa AAAAB3Nza unrelated'; echo "ssh-ed25519 $R2 nuit-cloud:ops-laptop"; } >"$expected"
+cmp -s "$f" "$expected" && ok "ncs_login registry: a listed key is added, revoked and stale marked lines are removed, a hand-added platform key is adopted in place, other lines kept as they were" \
+  || { diff "$expected" "$f"; bad "registry file"; }
+[ "$(ls -l "$f" | cut -c1-10)" = "-rw-------" ] && [ "$(ls -ld "$ROOT/home/nuitcloud/.ssh" | cut -c1-10)" = "drwx------" ] \
+  && [ "$(ls -i "$f" | awk '{print $1}')" != "$ino" ] && [ -z "$(ls -A "$ROOT/home/nuitcloud/.ssh" | grep -v '^authorized_keys$')" ] \
+  && grep -q "chown nuitcloud:nuitcloud $ROOT/home/nuitcloud/.ssh/.authorized_keys.nuit-cloud." "$CALLS" && grep -q "chown nuitcloud:nuitcloud $ROOT/home/nuitcloud/.ssh\$" "$CALLS" \
+  && ok "ncs_login registry: the file is replaced by rename (a new file, no temporary left), mode 600 in a 700 directory, owned by the account before it lands" || { ls -la "$ROOT/home/nuitcloud/.ssh"; cat "$CALLS"; bad "registry atomic write"; }
+: >"$CALLS"; reg_run >"$tmp/out" 2>&1 && reg_run --check >/dev/null 2>&1 && cmp -s "$f" "$expected" && grep -q 'ok      ncs_login' "$tmp/out" && [ ! -s "$CALLS" ] \
+  && ok "ncs_login registry: in step, a second run and the check change nothing" || { cat "$tmp/out"; bad "registry idempotent"; }
+# revoking: the key leaves the list, its marked line goes; the unmarked lines stay
+KEYS="platform=$R1"; reg_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "registry revoke"; }
+grep -q '0 added, 1 removed, 0 adopted' "$tmp/out" && ! grep -q "nuit-cloud:ops-laptop" "$f" && grep -q "restricted\$" "$f" && grep -q "mine@laptop\$" "$f" && grep -q "nuit-cloud:platform\$" "$f" \
+  && ok "ncs_login registry: a revoked key's marked line is removed, the rest stays" || { cat "$tmp/out"; cat "$f"; bad "registry revoke result"; }
+# a key that changes body under the same id is replaced, not kept beside the new one
+KEYS="platform=$R3"; reg_run >"$tmp/out" 2>&1 && [ "$(grep -c 'nuit-cloud:platform$' "$f")" = 1 ] && grep -qF "$R3 nuit-cloud:platform" "$f" && ! grep -qF "$R1" "$f" \
+  && ok "ncs_login registry: a key replaced under the same id leaves one marked line, the new one" || { cat "$tmp/out"; cat "$f"; bad "registry rekey"; }
+# no file and no directory yet: made with the right modes
+reg_net; rmdir "$ROOT/home/nuitcloud/.ssh"; KEYS="platform=$R1 ops-laptop=$R2"
+reg_run >"$tmp/out" 2>&1 && [ "$(cat "$f")" = "$(printf 'ssh-ed25519 %s nuit-cloud:platform\nssh-ed25519 %s nuit-cloud:ops-laptop' "$R1" "$R2")" ] && [ "$(ls -l "$f" | cut -c1-10)" = "-rw-------" ] \
+  && [ "$(ls -ld "$ROOT/home/nuitcloud/.ssh" | cut -c1-10)" = "drwx------" ] && grep -q '2 added, 0 removed, 0 adopted; 0 unmanaged' "$tmp/out" \
+  && ok "ncs_login registry: a machine with no keys file gets one, 600 in a 700 directory" || { cat "$tmp/out"; ls -la "$ROOT/home/nuitcloud/.ssh"; bad "registry fresh"; }
+# refusals: nothing is written
+reg_refuse() { # reg_refuse <description> <keys>
+  reg_net; printf 'ssh-ed25519 %s nuit-cloud:platform\nssh-ed25519 %s mine\n' "$R1" "$MINE" >"$f"; cp "$f" "$tmp/reg-before"
+  KEYS="$2"; reg_run >"$tmp/out" 2>&1 && bad "registry: $1 was accepted"
+  grep -q 'MANUAL  ncs_login' "$tmp/out" && cmp -s "$f" "$tmp/reg-before" && [ -z "$(ls -A "$ROOT/home/nuitcloud/.ssh" | grep -v '^authorized_keys$')" ] && ok "ncs_login registry: $1 is refused and nothing changes" || { cat "$tmp/out"; cat "$f"; bad "registry refusal: $1"; }
+}
+reg_refuse "an empty list" ""
+reg_refuse "a list of spaces" "   "
+reg_refuse "an upper-case id" "Platform=$R1"
+reg_refuse "an id starting with -" "-platform=$R1"
+reg_refuse "an id of 41 characters" "$(printf 'a%.0s' $(seq 41))=$R1"
+reg_refuse "a duplicate id" "platform=$R1 platform=$R2"
+reg_refuse "a duplicate key" "platform=$R1 other=$R1"
+reg_refuse "a key that is not ssh-ed25519" "platform=AAAAB3NzaC1yc2EAAAADAQABAAABAQC1234567890123456789012345678901234567890123"
+reg_refuse "a short key" "platform=AAAAC3NzaC1lZDI1NTE5AAAAI"
+reg_refuse "shell in the list" "platform=$R1;reboot"
+reg_refuse "a glob in the list" "platform=$R1 *"
+reg_refuse "a second line" "platform=$R1
+other=$R2"
+reg_refuse "65 keys" "$(for i in $(seq 65); do printf 'k%s=%s ' "$i" "$R1"; done)"
+# the hardening guard counts a marked line as the named key being present (it compares fingerprints, not comments)
+reg_net; printf 'ssh-ed25519 %s nuit-cloud:platform\n' "$R1" >"$f"; chmod 600 "$f"
+FPR1="$(ssh-keygen -lf "$tmp/reg1.pub" | awk '{print $2}')"
+mkdir -p "$ROOT/etc/ssh/sshd_config.d"; printf 'Include /etc/ssh/sshd_config.d/*.conf\nPort 22\n' >"$ROOT/etc/ssh/sshd_config"; rm -f "$ROOT/etc/ssh/sshd_config.d/00-nuit-cloud.conf" "$STATE/sshd-bad" "$STATE/sshd-bad-after" "$STATE/another-file-wins" "$STATE/pubkey-off"
+env NCS_SSH_REQUIRE_FINGERPRINTS="$FPR1" sh "$here/bootstrap.sh" nuit-cloud-ssh >"$tmp/out" 2>&1 || true
+grep -q 'done    ncs_ssh_harden' "$tmp/out" && ok "ncs_ssh_harden: a marked registry line satisfies the named key" || { cat "$tmp/out"; bad "harden with a marked line"; }
+# systemd expands dollar-brace, doubled dollars and percent specifiers in a transient unit's command line: the registry writer must carry none
+sh -c '. "$1"; printf "%s" "$LOGIN_SYNC$LOGIN_SYNC_AWK"' sh "$here/features.sh" >"$tmp/writer" 2>/dev/null || true
+[ -s "$tmp/writer" ] && ! grep -q '\${\|\$\$\|%' "$tmp/writer" && ok "ncs_login registry: the writer carries nothing systemd-run would expand" || bad "the registry writer would be expanded by systemd"
 export ROOT="$OLDROOT3"
 # 14. ncs_firewall: a drop-by-default input table, syntax-checked, with a timer armed before it is loaded and left armed for the platform
 stub nft 'echo "nft $*" >>"$CALLS"
