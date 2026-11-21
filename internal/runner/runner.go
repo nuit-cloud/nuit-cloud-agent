@@ -26,6 +26,7 @@ import (
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/ingress"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/lanscan"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/profiles"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/rootconsole"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/runtimeinstall"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/servicelog"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/sshconfirm"
@@ -93,6 +94,9 @@ type Runner struct {
 	// TenantAddresses moves a tenant address on the tenant VLAN onto or off this machine (tenant-address): its zero value works on the real
 	// machine (`ip`, /etc/network/interfaces.d, a packet socket for ARP); tests give it a scratch root and fakes.
 	TenantAddresses tenantaddress.Mover
+	// RootConsole sets or locks root's console password (root-console): its zero value works on the real machine (chpasswd, usermod,
+	// /etc/shadow); tests give it a scratch root and a stub.
+	RootConsole rootconsole.Console
 	// Restart is set when a task has changed the agent itself (an update), so the loop restarts it after reporting.
 	Restart *atomic.Bool
 	Now     func() time.Time
@@ -103,7 +107,7 @@ func (r Runner) RestartRequested() bool { return r.Restart != nil && r.Restart.L
 
 // Names is the catalog: what this agent can do.
 func (r Runner) Names() []string {
-	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke", "address-scan", "ssh-confirm", "firewall-confirm", "runtime-repair", "set-hostname", "connectivity-check", "service-log", "trust-key", "retire-key", "volume-export", "volume-import", "volume-remove", "tenant-address"}
+	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke", "address-scan", "ssh-confirm", "firewall-confirm", "runtime-repair", "set-hostname", "connectivity-check", "service-log", "trust-key", "retire-key", "volume-export", "volume-import", "volume-remove", "tenant-address", "root-console"}
 }
 
 // Run performs one task, bounded by its timeout, and says how it went. It never panics the agent: a task that blows up is a
@@ -160,6 +164,8 @@ func (r Runner) Run(ctx context.Context, task *taskverify.Task) (report client.R
 		return r.volume(ctx, task)
 	case "tenant-address":
 		return r.tenantAddress(ctx, task)
+	case "root-console":
+		return r.rootConsole(ctx, task)
 	}
 	return client.Report{Status: "failed", ExitCode: &one, Output: "unknown task " + task.Name}
 }
@@ -971,6 +977,29 @@ func (r Runner) tenantAddress(ctx context.Context, task *taskverify.Task) client
 	}
 	out += fmt.Sprintf("; announced %d times", res.Announcements)
 	return client.Report{Status: "done", ExitCode: &zero, Output: out, Result: res}
+}
+
+// rootConsole sets or locks root's console password (nuit-cloud/nuit-cloud#194). The params are checked again here (exactly {action: set,
+// hash} with a SHA-512 crypt or yescrypt hash, or exactly {action: lock}); anything else changes nothing. The hash is never in the report.
+// SSH is not touched: root still cannot log in over SSH (PermitRootLogin no).
+func (r Runner) rootConsole(ctx context.Context, task *taskverify.Task) client.Report {
+	one, zero := 1, 0
+	p, err := rootconsole.Parse(task.Params)
+	if err != nil {
+		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+	}
+	if p.Action == "lock" {
+		res, err := r.RootConsole.Lock(ctx)
+		if err != nil {
+			return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+		}
+		return client.Report{Status: "done", ExitCode: &zero, Output: "root's console password is locked", Result: res}
+	}
+	res, err := r.RootConsole.Set(ctx, p)
+	if err != nil {
+		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+	}
+	return client.Report{Status: "done", ExitCode: &zero, Output: "root's console password is set (" + res.Scheme + ")", Result: res}
 }
 
 // firewallConfirm completes the baseline firewall once the platform has tested from outside.

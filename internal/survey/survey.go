@@ -35,7 +35,10 @@ type Report struct {
 	// AuthorizedKeys are the keys that can log in as the platform's login account (nuitcloud): fingerprints and the registry id of
 	// the lines the platform manages. null when the file could not be read (see collectionProblems), [] when there is none.
 	AuthorizedKeys []AuthorizedKey `json:"authorizedKeys"`
-	Problems       []string        `json:"collectionProblems,omitempty"` // things the survey could not read, so a gap is not mistaken for a clean bill
+	// RootPassword is root's password state from /etc/shadow (nuit-cloud/nuit-cloud#194): "none" (empty), "locked" (starts with ! or *),
+	// "set" (anything else); null when it could not be read (see collectionProblems). The field itself is never reported.
+	RootPassword *string  `json:"rootPassword"`
+	Problems     []string `json:"collectionProblems,omitempty"` // things the survey could not read, so a gap is not mistaken for a clean bill
 }
 
 type OS struct {
@@ -245,6 +248,7 @@ func Collect(ctx context.Context, s Sources) Report {
 	r.SSH = collectSSH(ctx, s, problem)
 	r.Power = collectPower(ctx, s)
 	r.AuthorizedKeys = collectAuthorizedKeys(s, problem)
+	r.RootPassword = collectRootPassword(s, problem)
 	return r
 }
 
