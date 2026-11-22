@@ -14,11 +14,14 @@
 // it was. The ncs_vlan feature owns the interface and the node's own address (nuit-cloud/nuit-cloud#189): its check allows tenant lines it
 // was not given, and its apply keeps every tenant line already in the file, so it never undoes this task's work.
 //
-//   - release removes the address from the VLAN interface and its line from the file. It never releases the node's own address.
+//   - release removes the address from the VLAN interface and its line from the file. It never releases the node's own address. A primary
+//     address with secondaries in its network is removed only with promote_secondaries on (turned on when it is off), so the others stay.
 //   - take refuses an address that is on another interface of this machine, or that another machine on the VLAN still answers for (three
 //     RFC 5227 ARP probes, about a second apart); then adds it live and to the file, and announces it with three gratuitous ARPs so the
 //     router's ARP cache follows the address to this machine. Taking an address already here is not an error: the file line is made sure
-//     of and the address announced again.
+//     of and the address announced again. The prefix is the VLAN's: the stanza's, or the one the node's own address already has while
+//     the VLAN's network changes (nuit-cloud/nuit-cloud#197, /24 to /16); an address here with another prefix gets the task's before
+//     the old entry goes, and its file line the new prefix.
 //
 // The platform makes sure the service using the address is stopped before a release; the agent refuses what would be unsafe on its own
 // machine and on the wire.
@@ -156,7 +159,7 @@ type ARP interface {
 
 // Mover does the task against one machine.
 type Mover struct {
-	// Root is prefixed to /etc/network/interfaces.d (empty: the real root); tests use a scratch directory.
+	// Root is prefixed to /etc/network/interfaces.d and /proc/sys (empty: the real root); tests use a scratch directory.
 	Root string
 	// IP runs `ip` with these arguments (no shell) and returns its standard output; nil runs the real one.
 	IP func(ctx context.Context, args ...string) (string, error)
@@ -166,13 +169,15 @@ type Mover struct {
 	Sleep func(ctx context.Context, d time.Duration) error
 }
 
-// TakeResult is what a take reports.
+// TakeResult is what a take reports. PrefixChanged says the address was here with another prefix and now has the task's (the tenant
+// VLAN's network grew from /24 to /16, nuit-cloud/nuit-cloud#197).
 type TakeResult struct {
 	Action        string `json:"action"`
 	Address       string `json:"address"`
 	AlreadyHere   bool   `json:"alreadyHere"`
 	FileChanged   bool   `json:"fileChanged"`
 	Announcements int    `json:"announcements"`
+	PrefixChanged bool   `json:"prefixChanged,omitempty"`
 }
 
 // ReleaseResult is what a release reports.
@@ -280,6 +285,106 @@ func (i iface) has(a netip.Addr) (ifaceAddr, bool) {
 		}
 	}
 	return ifaceAddr{}, false
+}
+
+// entries are every IPv4 entry the interface has for a. One address can be on an interface with two prefixes at once, each its own entry
+// (checked on a real kernel, nuit-cloud/nuit-cloud#197): so it is while the tenant VLAN's network grows from /24 to /16.
+func (i iface) entries(a netip.Addr) []ifaceAddr {
+	var out []ifaceAddr
+	for _, x := range i.Addrs {
+		if x.Family != "inet" {
+			continue
+		}
+		if p, err := netip.ParseAddr(x.Local); err == nil && p == a {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+// hasEntry says whether the interface holds a with this prefix.
+func (i iface) hasEntry(a netip.Addr, prefix int) bool {
+	for _, e := range i.entries(a) {
+		if e.PrefixLen == prefix {
+			return true
+		}
+	}
+	return false
+}
+
+// hasSecondaries says whether the network of e (its address with its prefix) has secondary addresses on the interface other than a's own
+// entries: Linux removes them with their primary unless promote_secondaries is on.
+func (i iface) hasSecondaries(e ifaceAddr, a netip.Addr) bool {
+	p, err := netip.ParseAddr(e.Local)
+	if err != nil {
+		return false
+	}
+	block, err := p.Prefix(e.PrefixLen)
+	if err != nil {
+		return false
+	}
+	for _, x := range i.Addrs {
+		o, err := netip.ParseAddr(x.Local)
+		if err == nil && x.Family == "inet" && x.Secondary && o != a && x.PrefixLen == e.PrefixLen && block.Contains(o) {
+			return true
+		}
+	}
+	return false
+}
+
+// secondariesFirst is entries with the secondary ones first, so a primary is the last of them to go.
+func secondariesFirst(entries []ifaceAddr) []ifaceAddr {
+	var out []ifaceAddr
+	for _, e := range entries {
+		if e.Secondary {
+			out = append(out, e)
+		}
+	}
+	for _, e := range entries {
+		if !e.Secondary {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// promoteFile is where the kernel shows the interface's promote_secondaries, below root.
+func promoteFile(root, vif string) string {
+	if root == "" {
+		root = "/"
+	}
+	return filepath.Join(root, "proc", "sys", "net", "ipv4", "conf", vif, "promote_secondaries")
+}
+
+// promote makes sure that removing the primary address of a network on the interface promotes one of its secondaries instead of removing
+// them all (promote_secondaries; the ncs_vlan feature turns it on for the tenant VLAN too, nuit-cloud/nuit-cloud#197).
+func (m Mover) promote(vif string) error {
+	f := promoteFile(m.Root, vif)
+	b, err := os.ReadFile(f)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(b)) == "1" {
+		return nil
+	}
+	w, err := os.OpenFile(f, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	_, werr := w.Write([]byte("1\n"))
+	if cerr := w.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		return werr
+	}
+	if b, err = os.ReadFile(f); err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(b)) != "1" {
+		return errors.New("it is still off")
+	}
+	return nil
 }
 
 // vifName is the shape of an interface name the agent will write into the VLAN file: a kernel interface name (at most 15 characters,
@@ -434,13 +539,20 @@ func withoutAddress(content []byte, a netip.Addr) ([]byte, bool) {
 }
 
 // withAddress is the file with a line for a: after the last line that adds an address, or after the stanza's address line when there is
-// none. A file that already has a line for a is returned as it is.
+// none. A file that already has a line for a with this prefix is returned as it is; one whose line has another prefix gets this one in
+// that line, the rest of it left as it was (the network grew, nuit-cloud/nuit-cloud#197).
 func withAddress(content []byte, a netip.Addr, prefix int, vif string) ([]byte, bool, error) {
 	ls := lines(content)
 	at := -1
+	withPrefix := regexp.MustCompile(`ip addr add ` + regexp.QuoteMeta(a.String()) + `/([0-9]{1,2})`)
 	for i, l := range ls {
 		if addsAddress(l, a) {
-			return content, false, nil
+			mm := withPrefix.FindStringSubmatchIndex(l)
+			if mm == nil || l[mm[2]:mm[3]] == strconv.Itoa(prefix) {
+				return content, false, nil
+			}
+			ls[i] = l[:mm[2]] + strconv.Itoa(prefix) + l[mm[3]:]
+			return []byte(strings.Join(ls, "")), true, nil
 		}
 		if strings.Contains(l, "ip addr add ") {
 			at = i
@@ -535,23 +647,25 @@ func (m Mover) Release(ctx context.Context, p Params) (ReleaseResult, error) {
 		return ReleaseResult{}, fmt.Errorf("%s is this machine's own address on the VLAN; it is never released", a)
 	}
 	res := ReleaseResult{Action: "release", Address: a.String()}
-	live, present := mc.vif.has(a)
-	if present && !live.Secondary {
-		// Linux removes the secondary addresses of a network with its primary one: releasing this one would take the others with it.
-		block := netip.PrefixFrom(a, live.PrefixLen).Masked()
-		for _, x := range mc.vif.Addrs {
-			if o, err := netip.ParseAddr(x.Local); err == nil && x.Family == "inet" && x.Secondary && block.Contains(o) {
-				return ReleaseResult{}, fmt.Errorf("%s is the primary address of its network on %s; removing it would remove the other addresses with it", a, mc.vif.Name)
+	// every entry of the address goes (it may be there with two prefixes while the network grows, #197)
+	live := mc.vif.entries(a)
+	for _, e := range live {
+		if !e.Secondary && mc.vif.hasSecondaries(e, a) {
+			// Linux removes the secondary addresses of a network with its primary one unless promote_secondaries is on (a former primary,
+			// such as the node's old own address kept as a tenant address)
+			if err := m.promote(mc.vif.Name); err != nil {
+				return ReleaseResult{}, fmt.Errorf("%s is the primary address of its network on %s and promote_secondaries could not be turned on (%v); removing it would remove the other addresses with it", a, mc.vif.Name, err)
 			}
+			break
 		}
 	}
 	content, changed := withoutAddress(mc.content, a)
-	if present {
-		if _, err := m.ip(ctx, "addr", "del", fmt.Sprintf("%s/%d", a, live.PrefixLen), "dev", mc.vif.Name); err != nil {
-			return ReleaseResult{}, fmt.Errorf("could not remove %s from %s: %w", a, mc.vif.Name, err)
+	for _, e := range secondariesFirst(live) {
+		if _, err := m.ip(ctx, "addr", "del", fmt.Sprintf("%s/%d", a, e.PrefixLen), "dev", mc.vif.Name); err != nil {
+			return ReleaseResult{}, fmt.Errorf("could not remove %s/%d from %s: %w", a, e.PrefixLen, mc.vif.Name, err)
 		}
 	}
-	res.WasPresent = present
+	res.WasPresent = len(live) > 0
 	if changed {
 		if err := mc.write(content); err != nil {
 			return ReleaseResult{}, fmt.Errorf("removed %s from %s, but could not take it out of the VLAN configuration (it would come back at the next boot): %w", a, mc.vif.Name, err)
@@ -572,7 +686,9 @@ func (m Mover) Take(ctx context.Context, p Params) (TakeResult, error) {
 	if a == mc.node {
 		return TakeResult{}, fmt.Errorf("%s is this machine's own address on the VLAN, not a tenant address", a)
 	}
-	if mc.nodePrefix != 0 && p.Prefix != mc.nodePrefix {
+	// The task's prefix is the VLAN's: the stanza's, or, while the VLAN's network is changing (/24 to /16, #197), the one the node's own
+	// address already has on the interface. Anything else is a real mismatch.
+	if mc.nodePrefix != 0 && p.Prefix != mc.nodePrefix && !mc.vif.hasEntry(mc.node, p.Prefix) {
 		return TakeResult{}, fmt.Errorf("the prefix /%d is not the VLAN's on this machine (/%d)", p.Prefix, mc.nodePrefix)
 	}
 	for _, i := range mc.ifaces {
@@ -592,9 +708,35 @@ func (m Mover) Take(ctx context.Context, p Params) (TakeResult, error) {
 	if err != nil {
 		return TakeResult{}, err
 	}
-	_, here := mc.vif.has(a)
+	// An address here already with another prefix (the network grew, #197) gets the task's beside it first, and the old entry goes after:
+	// it is never missing. Removing an old entry that is the primary of its network needs promote_secondaries, or the network's other
+	// addresses would go with it; that is made sure of before anything changes.
+	entries := mc.vif.entries(a)
+	here := len(entries) > 0
+	var old []ifaceAddr
+	for _, e := range entries {
+		if e.PrefixLen != p.Prefix {
+			old = append(old, e)
+		}
+	}
+	atPrefix := len(entries) > len(old)
+	for _, e := range old {
+		if !e.Secondary && mc.vif.hasSecondaries(e, a) {
+			if err := m.promote(mc.vif.Name); err != nil {
+				return TakeResult{}, fmt.Errorf("%s is on %s with /%d as the primary address of its network, and promote_secondaries could not be turned on (%v); moving it to /%d would remove the other addresses with it", a, mc.vif.Name, e.PrefixLen, err, p.Prefix)
+			}
+			break
+		}
+	}
 	res := TakeResult{Action: "take", Address: a.String(), AlreadyHere: here}
 	arp := m.arp()
+	added := false
+	if here && !atPrefix {
+		if _, err := m.ip(ctx, "addr", "add", fmt.Sprintf("%s/%d", a, p.Prefix), "dev", mc.vif.Name); err != nil {
+			return TakeResult{}, fmt.Errorf("could not add %s/%d to %s: %w", a, p.Prefix, mc.vif.Name, err)
+		}
+		added = true
+	}
 	if !here {
 		for i := 0; i < Probes; i++ {
 			c, err := arp.Probe(ctx, link, a, interval)
@@ -611,10 +753,11 @@ func (m Mover) Take(ctx context.Context, p Params) (TakeResult, error) {
 		if _, err := m.ip(ctx, "addr", "add", fmt.Sprintf("%s/%d", a, p.Prefix), "dev", mc.vif.Name); err != nil {
 			return TakeResult{}, fmt.Errorf("could not add %s to %s: %w", a, mc.vif.Name, err)
 		}
+		added = true
 	}
 	if fileChange {
 		if err := mc.write(content); err != nil {
-			if !here {
+			if added {
 				// the task's own time may be what ran out: the address is still taken off again
 				undo, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 				defer cancel()
@@ -627,6 +770,12 @@ func (m Mover) Take(ctx context.Context, p Params) (TakeResult, error) {
 		}
 	}
 	res.FileChanged = fileChange
+	for _, e := range secondariesFirst(old) {
+		if _, err := m.ip(ctx, "addr", "del", fmt.Sprintf("%s/%d", a, e.PrefixLen), "dev", mc.vif.Name); err != nil {
+			return TakeResult{}, fmt.Errorf("%s is on %s with /%d, but its old /%d could not be removed (taking it again does): %w", a, mc.vif.Name, p.Prefix, e.PrefixLen, err)
+		}
+	}
+	res.PrefixChanged = len(old) > 0
 	for i := 0; i < Announcements; i++ {
 		if i > 0 {
 			if err := m.sleep(ctx, interval); err != nil {

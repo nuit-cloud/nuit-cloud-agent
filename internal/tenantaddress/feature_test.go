@@ -17,8 +17,8 @@ func renderByFeature(t *testing.T, tenants, existing string) string {
 	return renderByFeatureOn(t, "enp0s31f6", tenants, existing)
 }
 
-// renderByFeatureOn is renderByFeature with the VLAN on another parent interface.
-func renderByFeatureOn(t *testing.T, parent, tenants, existing string) string {
+// renderByFeatureOn is renderByFeature with the VLAN on another parent interface, and env overriding the slice.
+func renderByFeatureOn(t *testing.T, parent, tenants, existing string, env ...string) string {
 	t.Helper()
 	sh, err := exec.LookPath("sh")
 	if err != nil {
@@ -38,6 +38,7 @@ func renderByFeatureOn(t *testing.T, parent, tenants, existing string) string {
 	cmd := exec.Command(sh, "-eu", "-c", `. "$1"; vlan_render "$3" "$2"`, "render", features, prev, parent)
 	cmd.Env = append(os.Environ(), "NC_USER=nuit", "NCS_VLAN_ID=5", "NCS_VLAN_PREFIX=24", "NCS_VLAN_ADDRESS=10.20.0.2", "NCS_VLAN_GATEWAY=10.20.0.1",
 		"NCS_VLAN_TENANT_ADDRESSES="+tenants)
+	cmd.Env = append(cmd.Env, env...)
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("the feature did not render: %v", err)
@@ -156,5 +157,33 @@ func TestTakeAndReleaseWorkOnTheVLAN5FileTheFeatureWritesForAFifteenCharacterPar
 	}
 	if strings.Contains(read(t, file), "10.20.0.3/") || m.on("vlan5", "10.20.0.3") {
 		t.Errorf("after the release the file is\n%s", read(t, file))
+	}
+}
+
+// The tenant VLAN's network grows from /24 to /16 and the node gets an address of its own in 10.20.255.0/24 (nuit-cloud/nuit-cloud#197): the
+// feature rewrites the stanza with the new address and prefix and gives every tenant line kept the new prefix, the rest of each line as it
+// was. That is the file a take with prefix 16 then works on, and a take with the old prefix is refused.
+func TestTheFeatureMovesTheFileTo16AndTakeThenUses16(t *testing.T) {
+	got := renderByFeatureOn(t, "enp0s31f6", "10.20.0.3 10.20.0.30 10.20.0.4", agentFile, "NCS_VLAN_PREFIX=16", "NCS_VLAN_ADDRESS=10.20.255.2")
+	if got != agentFile16 {
+		t.Fatalf("the feature renders\n%s\nwant\n%s", got, agentFile16)
+	}
+	root, file := scratch(t, got)
+	m := newMachine16("10.20.0.3", "10.20.0.30", "10.20.0.4")
+	p := params("take", "10.20.0.7")
+	p.Prefix = 16
+	if _, err := mover(root, m, &fakeARP{}).Take(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(read(t, file), "    post-up ip addr add 10.20.0.7/16 dev enp0s31f6.5 2>/dev/null || true\n") || !m.onWith("enp0s31f6.5", "10.20.0.7", 16) {
+		t.Errorf("not taken with /16: %v\n%s", m.changes(), read(t, file))
+	}
+	before := read(t, file)
+	m.calls = nil
+	if _, err := mover(root, m, &fakeARP{}).Take(context.Background(), params("take", "10.20.0.8")); err == nil || !strings.Contains(err.Error(), "/24") {
+		t.Errorf("a take with the old prefix: %v", err)
+	}
+	if read(t, file) != before || len(m.changes()) != 0 {
+		t.Error("a refused take changed something")
 	}
 }

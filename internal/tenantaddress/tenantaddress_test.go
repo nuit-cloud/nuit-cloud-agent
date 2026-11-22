@@ -20,6 +20,7 @@ iface enp0s31f6.5 inet static
     address 10.20.0.2/24
     pre-up modprobe 8021q 2>/dev/null || true
     pre-up ip link show enp0s31f6.5 >/dev/null 2>&1 || ip link add link enp0s31f6 name enp0s31f6.5 type vlan id 5
+    pre-up sysctl -qw net.ipv4.conf.enp0s31f6/5.promote_secondaries=1 2>/dev/null || true
     post-up ip addr add 10.20.0.3/24 dev enp0s31f6.5 2>/dev/null || true
     post-up ip addr add 10.20.0.30/24 dev enp0s31f6.5 2>/dev/null || true
     post-up ip addr add 10.20.0.4/24 dev enp0s31f6.5 2>/dev/null || true
@@ -44,6 +45,10 @@ iface enp0s31f6.5 inet static
     pre-down ip route flush table 105 2>/dev/null || true
     post-down ip link del enp0s31f6.5 2>/dev/null || true
 `
+
+// agentFile16 is agentFile once the network grew to /16 and the node has 10.20.255.2 (nuit-cloud/nuit-cloud#197): the ncs_vlan feature
+// rewrites the address line and gives every tenant line the new prefix.
+var agentFile16 = strings.Replace(strings.ReplaceAll(agentFile, "/24 dev", "/16 dev"), "    address 10.20.0.2/24\n", "    address 10.20.255.2/16\n", 1)
 
 // handFile is what nuit-cloud-servers scripts/server-vlan5.sh writes: a comment before the tenant addresses and an extra pre-down line.
 const handFile = `# Managed by deploy/server-vlan5.sh (nuit-cloud). Remove with: sh server-vlan5.sh --remove
@@ -84,11 +89,20 @@ func vlan(id int) *linkInfo {
 	return l
 }
 
-// fakeMachine is a machine's interfaces as `ip` sees them, changed by the `ip addr add`/`del` it is asked to run.
+// fakeMachine is a machine's interfaces as `ip` sees them, changed by the `ip addr add`/`del` it is asked to run the way the kernel
+// changes them (checked on a real kernel, nuit-cloud/nuit-cloud#197): an address with another prefix is an entry of its own; the first
+// entry of a network (address and prefix) is its primary, the rest secondaries; removing a primary removes its secondaries with it unless
+// promote_secondaries (read from promote, a file, when set) is on, when the next one becomes the primary.
 type fakeMachine struct {
-	ifaces []iface
-	calls  []string
-	addErr error
+	ifaces  []iface
+	calls   []string
+	addErr  error
+	promote string
+}
+
+func sameNetwork(x ifaceAddr, p netip.Prefix) bool {
+	a, err := netip.ParseAddr(x.Local)
+	return err == nil && x.Family == "inet" && x.PrefixLen == p.Bits() && p.Masked().Contains(a)
 }
 
 func (f *fakeMachine) ip(_ context.Context, args ...string) (string, error) {
@@ -111,14 +125,41 @@ func (f *fakeMachine) ip(_ context.Context, args ...string) (string, error) {
 				if f.addErr != nil {
 					return "", f.addErr
 				}
-				f.ifaces[i].Addrs = append(f.ifaces[i].Addrs, ifaceAddr{Family: "inet", Local: pfx.Addr().String(), PrefixLen: pfx.Bits(), Secondary: true})
+				secondary := false
+				for _, x := range f.ifaces[i].Addrs {
+					if x.Local == pfx.Addr().String() && x.PrefixLen == pfx.Bits() {
+						return "", errors.New("RTNETLINK answers: File exists")
+					}
+					secondary = secondary || sameNetwork(x, pfx)
+				}
+				f.ifaces[i].Addrs = append(f.ifaces[i].Addrs, ifaceAddr{Family: "inet", Local: pfx.Addr().String(), PrefixLen: pfx.Bits(), Secondary: secondary})
 				return "", nil
 			case "del":
 				for j, a := range f.ifaces[i].Addrs {
-					if a.Local == pfx.Addr().String() {
-						f.ifaces[i].Addrs = append(f.ifaces[i].Addrs[:j], f.ifaces[i].Addrs[j+1:]...)
+					if a.Local != pfx.Addr().String() || a.PrefixLen != pfx.Bits() || a.Family != "inet" {
+						continue
+					}
+					f.ifaces[i].Addrs = append(f.ifaces[i].Addrs[:j:j], f.ifaces[i].Addrs[j+1:]...)
+					if a.Secondary {
 						return "", nil
 					}
+					b, _ := os.ReadFile(f.promote)
+					promote := f.promote != "" && strings.TrimSpace(string(b)) == "1"
+					var kept []ifaceAddr
+					promoted := false
+					for _, x := range f.ifaces[i].Addrs {
+						if x.Secondary && sameNetwork(x, pfx) {
+							if !promote {
+								continue
+							}
+							if !promoted {
+								x.Secondary, promoted = false, true
+							}
+						}
+						kept = append(kept, x)
+					}
+					f.ifaces[i].Addrs = kept
+					return "", nil
 				}
 				return "", errors.New("RTNETLINK answers: Cannot assign requested address")
 			}
@@ -162,6 +203,40 @@ func newMachine(tenants ...string) *fakeMachine {
 		{Index: 3, Name: "cni0", MAC: "aa:bb:cc:dd:ee:02", Addrs: []ifaceAddr{{Family: "inet", Local: "10.89.0.1", PrefixLen: 16}}},
 		vif,
 	}}
+}
+
+// newMachine16 is newMachine once the network grew to /16: the node's own 10.20.255.2/16 is the primary, the tenant addresses /16.
+func newMachine16(tenants ...string) *fakeMachine {
+	m := newMachine()
+	m.ifaces[3].Addrs = []ifaceAddr{{Family: "inet", Local: "10.20.255.2", PrefixLen: 16}}
+	for _, t := range tenants {
+		m.ifaces[3].Addrs = append(m.ifaces[3].Addrs, ifaceAddr{Family: "inet", Local: t, PrefixLen: 16, Secondary: true})
+	}
+	return m
+}
+
+// onWith says whether the interface holds addr with this prefix.
+func (f *fakeMachine) onWith(name, addr string, prefix int) bool {
+	for _, i := range f.ifaces {
+		if i.Name == name {
+			return i.hasEntry(netip.MustParseAddr(addr), prefix)
+		}
+	}
+	return false
+}
+
+// withPromote writes the VLAN interface's promote_secondaries below root as the kernel shows it, and has the fake read it.
+func withPromote(t *testing.T, root string, m *fakeMachine, value string) string {
+	t.Helper()
+	f := promoteFile(root, "enp0s31f6.5")
+	if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f, []byte(value+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m.promote = f
+	return f
 }
 
 // fakeARP records what was sent and answers probes with claim.
@@ -683,5 +758,110 @@ func TestTheProbeAndTheAnnouncementAreRFC5227Frames(t *testing.T) {
 	notARP[13] = 0x00
 	if _, ok := claimIn(notARP, mac, addr); ok {
 		t.Error("an IPv4 frame is a claim")
+	}
+}
+
+// While the network changes (nuit-cloud/nuit-cloud#197) the stanza may still say /24 when the node's own address is already live with /16:
+// a take with /16 is then the VLAN's prefix. With the node's address only at /24 it is a real mismatch, refused as before.
+func TestTakeAcceptsTheNewPrefixOnceTheNodesOwnAddressHasIt(t *testing.T) {
+	root, file := scratch(t, agentFile)
+	m := newMachine("10.20.0.3")
+	m.ifaces[3].Addrs = append(m.ifaces[3].Addrs, ifaceAddr{Family: "inet", Local: "10.20.0.2", PrefixLen: 16})
+	p := params("take", "10.20.0.7")
+	p.Prefix = 16
+	if _, err := mover(root, m, &fakeARP{}).Take(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	if !m.onWith("enp0s31f6.5", "10.20.0.7", 16) || !strings.Contains(read(t, file), "ip addr add 10.20.0.7/16 dev enp0s31f6.5") {
+		t.Errorf("%v\n%s", m.changes(), read(t, file))
+	}
+	p.Address, p.Prefix = netip.MustParseAddr("10.20.0.8"), 20
+	if _, err := mover(root, m, &fakeARP{}).Take(context.Background(), p); err == nil || !strings.Contains(err.Error(), "/20") {
+		t.Errorf("a prefix neither the stanza's nor the node's: %v", err)
+	}
+}
+
+// An address here already with the old prefix (/24) gets the task's (/16) beside it before the old entry goes, so it is never missing; its
+// file line gets the new prefix; no probe is sent (the address is this machine's), and it is announced again.
+func TestTakeOfAnAddressHereWithTheOldPrefixMovesItWithoutAGap(t *testing.T) {
+	content := strings.Replace(agentFile16, "10.20.0.30/16", "10.20.0.30/24", 1)
+	root, file := scratch(t, content)
+	m := newMachine16("10.20.0.3", "10.20.0.4")
+	m.ifaces[3].Addrs = append(m.ifaces[3].Addrs, ifaceAddr{Family: "inet", Local: "10.20.0.30", PrefixLen: 24})
+	a := &fakeARP{}
+	p := params("take", "10.20.0.30")
+	p.Prefix = 16
+	res, err := mover(root, m, a).Take(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res != (TakeResult{Action: "take", Address: "10.20.0.30", AlreadyHere: true, FileChanged: true, Announcements: 3, PrefixChanged: true}) {
+		t.Errorf("%+v", res)
+	}
+	if got := m.changes(); len(got) != 2 || got[0] != "addr add 10.20.0.30/16 dev enp0s31f6.5" || got[1] != "addr del 10.20.0.30/24 dev enp0s31f6.5" {
+		t.Errorf("ran %v (the new prefix must come before the old one goes)", got)
+	}
+	if read(t, file) != agentFile16 || !m.onWith("enp0s31f6.5", "10.20.0.30", 16) || m.onWith("enp0s31f6.5", "10.20.0.30", 24) || a.probes != 0 || len(a.announced) != 3 {
+		t.Errorf("file\n%s\nlive %+v, %d probes", read(t, file), m.ifaces[3].Addrs, a.probes)
+	}
+	// again: in place, so only announced
+	m.calls = nil
+	if res, err := mover(root, m, a).Take(context.Background(), p); err != nil || res.PrefixChanged || res.FileChanged || len(m.changes()) != 0 {
+		t.Errorf("%+v %v %v", res, err, m.changes())
+	}
+}
+
+// Moving an address that is the primary of its old network with secondaries in it needs promote_secondaries: without it (it cannot be
+// read or turned on) nothing changes; with it off it is turned on first, and the other addresses stay.
+func TestTakeMovesAFormerPrimaryOnlyWithPromoteSecondaries(t *testing.T) {
+	content := strings.Replace(strings.Replace(agentFile16, "10.20.0.30/16", "10.20.0.30/24", 1), "10.20.0.4/16", "10.20.0.4/24", 1)
+	setup := func() *fakeMachine {
+		m := newMachine16("10.20.0.3")
+		m.ifaces[3].Addrs = append(m.ifaces[3].Addrs, ifaceAddr{Family: "inet", Local: "10.20.0.30", PrefixLen: 24}, ifaceAddr{Family: "inet", Local: "10.20.0.4", PrefixLen: 24, Secondary: true})
+		return m
+	}
+	p := params("take", "10.20.0.30")
+	p.Prefix = 16
+	root, file := scratch(t, content)
+	m := setup()
+	if _, err := mover(root, m, &fakeARP{}).Take(context.Background(), p); err == nil || !strings.Contains(err.Error(), "promote_secondaries") {
+		t.Errorf("%v", err)
+	}
+	if read(t, file) != content || len(m.changes()) != 0 {
+		t.Error("something was changed")
+	}
+	pf := withPromote(t, root, m, "0")
+	if _, err := mover(root, m, &fakeARP{}).Take(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(pf); strings.TrimSpace(string(b)) != "1" {
+		t.Errorf("promote_secondaries is %q", b)
+	}
+	if !m.onWith("enp0s31f6.5", "10.20.0.30", 16) || m.onWith("enp0s31f6.5", "10.20.0.30", 24) || !m.onWith("enp0s31f6.5", "10.20.0.4", 24) {
+		t.Errorf("live %+v", m.ifaces[3].Addrs)
+	}
+}
+
+// A former primary (the node's old own address kept as a tenant address, the first /16 entry before the node's new address) is released
+// with promote_secondaries turned on, and every other address stays; an address there with two prefixes loses both.
+func TestReleaseOfAFormerPrimaryKeepsTheOthers(t *testing.T) {
+	content := strings.Replace(agentFile16, "10.20.0.30/16", "10.20.0.34/16", 1)
+	root, file := scratch(t, content)
+	m := newMachine()
+	m.ifaces[3].Addrs = []ifaceAddr{{Family: "inet", Local: "10.20.0.34", PrefixLen: 16}, {Family: "inet", Local: "10.20.255.2", PrefixLen: 16, Secondary: true},
+		{Family: "inet", Local: "10.20.0.3", PrefixLen: 16, Secondary: true}, {Family: "inet", Local: "10.20.0.34", PrefixLen: 24}}
+	pf := withPromote(t, root, m, "0")
+	res, err := mover(root, m, &fakeARP{}).Release(context.Background(), params("release", "10.20.0.34"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.WasPresent || !res.FileChanged || strings.Contains(read(t, file), "10.20.0.34") {
+		t.Errorf("%+v\n%s", res, read(t, file))
+	}
+	if got := strings.Join(m.changes(), "|"); got != "addr del 10.20.0.34/16 dev enp0s31f6.5|addr del 10.20.0.34/24 dev enp0s31f6.5" {
+		t.Errorf("ran %v", got)
+	}
+	if b, _ := os.ReadFile(pf); strings.TrimSpace(string(b)) != "1" || !m.on("enp0s31f6.5", "10.20.255.2") || !m.on("enp0s31f6.5", "10.20.0.3") || m.on("enp0s31f6.5", "10.20.0.34") {
+		t.Errorf("promote %q, live %+v", b, m.ifaces[3].Addrs)
 	}
 }

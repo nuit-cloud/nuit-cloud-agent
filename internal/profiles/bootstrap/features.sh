@@ -621,6 +621,8 @@ addr_lost() { # addr_lost <dir> <old address or empty> [<old gateway> <old inter
       printf '%s %s\n' "${kind%s}" "$line" >>"$ld/lost"
     done
   done
+  # what the change meant to take away (<dir>/meant: fixed strings, one per line; the tenant VLAN's renumbering, #197) is not a loss
+  if [ -s "$ld/meant" ]; then grep -vF -f "$ld/meant" "$ld/lost" >"$ld/lost.kept" || true; mv "$ld/lost.kept" "$ld/lost"; fi
   [ ! -s "$ld/lost" ]
 }
 # Put back what is missing: an address by "ip addr add", a route by "ip route replace". Rules are reported, not restored.
@@ -952,8 +954,13 @@ ROLLBACK
 # makes sure every tenant address it is given is there, and never removes a tenant line it finds (those belong to the task).
 # The VLAN is assumed to be carried to the port already, so a gateway that does not answer is a note, not a failure. What can hurt
 # is the change taking the machine's own connectivity with it, so as for the management address: a timer that undoes it is armed
-# first; nothing existing is touched (a new interface only); a snapshot proves no address or route was lost; and the platform must
-# still be reachable afterwards, or everything is undone.
+# first; a snapshot proves no address or route was lost; and the platform must still be reachable afterwards, or everything is undone.
+# A new machine gets a new interface (ifup). A VLAN in service (the interface is there with addresses) is never taken down: what is
+# missing is added as it runs, and since #197 its own address and its prefix can change as it runs too (10.20.0.34/24 to
+# 10.20.255.34/16, the tenant addresses keeping their addresses with the new prefix): the new own address first, so it is the network's
+# primary and the source of its connected route; each tenant address with the new prefix beside its old one, then the old one removed
+# (never missing); the old own address only after the platform was reached, unless it is given as a tenant address (the Ingress Service
+# keeps 10.20.0.34). Its rollback puts back the addresses and prefixes it had and removes only what the run added; it never runs ifdown.
 VLAN_TABLE="${VLAN_TABLE:-105}"
 VLAN_MARK="${VLAN_MARK:-0x5}"
 
@@ -1036,7 +1043,9 @@ vlan_mgmt_if() { printf '%s\n' "${A_IF:-}" | grep -Eq '^[a-zA-Z0-9._-]{1,15}$' &
 vlan_file() { printf '/etc/network/interfaces.d/nuit-cloud-vlan%s' "$NCS_VLAN_ID"; }
 
 # vlan_tenant_lines <vlan interface> [existing file] -> the tenant lines: every `ip addr add <a>/` line already in the file (not comments),
-# as it is, then one line for each given address the file does not have yet. One line per address (the first kept), in that order.
+# as it is, then one line for each given address the file does not have yet. One line per address (the first kept), in that order. A
+# line kept whose address is inside the VLAN's network gets the VLAN's prefix (the network may have grown, /24 to /16: #197); the rest
+# of the line stays as it was.
 vlan_tenant_lines() {
   _tv="$1"; _tf="${2:-}"; _seen=" "
   if [ -n "$_tf" ] && [ -f "$_tf" ]; then
@@ -1046,7 +1055,13 @@ vlan_tenant_lines() {
       _ta="$(printf '%s\n' "$_tl" | sed -n 's/.*ip addr add \([0-9][0-9.]*\)\/.*/\1/p')"
       [ -n "$_ta" ] || continue
       case "$_seen" in *" $_ta "*) continue;; esac
-      _seen="$_seen$_ta "; printf '%s\n' "$_tl"
+      _seen="$_seen$_ta "
+      if addr_is_ipv4 "$_ta" && vlan_in_net "$_ta"; then
+        _tre="$(printf '%s' "$_ta" | sed 's/\./\\./g')"
+        printf '%s\n' "$_tl" | sed "s#ip addr add $_tre/[0-9]*#ip addr add $_ta/$NCS_VLAN_PREFIX#"
+      else
+        printf '%s\n' "$_tl"
+      fi
     done <"$_tf"
   fi
   for _ta in ${NCS_VLAN_TENANT_ADDRESSES:-}; do
@@ -1071,6 +1086,7 @@ EOF
   cat <<EOF
     pre-up modprobe 8021q 2>/dev/null || true
     pre-up ip link show ${_vif} >/dev/null 2>&1 || ip link add link ${_if} name ${_vif} type vlan id ${NCS_VLAN_ID}
+    pre-up sysctl -qw net.ipv4.conf.${_vsys}.promote_secondaries=1 2>/dev/null || true
 EOF
   vlan_tenant_lines "$_vif" "${2:-}"
   cat <<EOF
@@ -1097,11 +1113,79 @@ EOF
 EOF
 }
 
+# vlan_in_net <address>: inside the VLAN's network (NCS_VLAN_ADDRESS/NCS_VLAN_PREFIX)
+vlan_in_net() { [ "$(addr_net_of "$1" "$NCS_VLAN_PREFIX")" = "$(addr_net_of "$NCS_VLAN_ADDRESS" "$NCS_VLAN_PREFIX")" ]; }
+# vlan_net_cidr <address> <prefix> -> the network the address is in, written a.b.c.d/<prefix> (as the kernel names its connected route)
+vlan_net_cidr() {
+  awk -v ip="$1" -v pl="$2" 'BEGIN {split(ip, o, "."); v = ((o[1] * 256 + o[2]) * 256 + o[3]) * 256 + o[4]; b = 2 ^ (32 - pl); v = int(v / b) * b
+    printf "%d.%d.%d.%d/%d\n", int(v / 16777216) % 256, int(v / 65536) % 256, int(v / 256) % 256, v % 256, pl}'
+}
+# vlan_live <interface> -> its IPv4 addresses as <address>/<prefix>, in the kernel's order (each network's primary before its secondaries)
+vlan_live() { ip -4 -o addr show dev "$1" 2>/dev/null | awk '$4 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/ {print $4}'; }
+# vlan_stanza_address <file> <interface> -> the address line of the interface's stanza (<address>/<prefix>), if there is one
+vlan_stanza_address() {
+  [ -f "$1" ] || return 0
+  awk -v i="$2" '$1 == "iface" {s = ($2 == i && $3 == "inet"); next} /^(auto|allow-[a-z]+|mapping|source)/ {s = 0} s && $1 == "address" {print $2; exit}' "$1"
+}
+# vlan_file_tenants <file> -> the addresses the file's tenant lines add (comments left out)
+vlan_file_tenants() {
+  [ -f "$1" ] || return 0
+  grep -v '^[[:space:]]*#' "$1" | sed -n 's/.*ip addr add \([0-9][0-9.]*\)\/.*/\1/p' | while read -r _fa; do addr_is_ipv4 "$_fa" && echo "$_fa"; done
+}
+# vlan_re <address> -> the address as an extended regular expression (its dots literal)
+vlan_re() { printf '%s' "$1" | sed 's/\./\\./g'; }
+# vlan_route_src <interface> -> the source of the connected route of the VLAN's network on the interface (empty when there is none)
+vlan_route_src() {
+  ip -4 route show 2>/dev/null | awk -v n="$(vlan_net_cidr "$NCS_VLAN_ADDRESS" "$NCS_VLAN_PREFIX")" -v v="$1" \
+    '$1 == n && $2 == "dev" && $3 == v {for (i = 4; i < NF; i++) if ($i == "src") {print $(i + 1); exit}}'
+}
+vlan_reverse() { awk '{l[NR] = $0} END {for (i = NR; i > 0; i--) print l[i]}'; }
+# vlan_table_ok <interface>: the tenant VLAN's own table sends by its gateway on the interface
+vlan_table_ok() {
+  ip -4 route show table "$VLAN_TABLE" 2>/dev/null | awk -v g="$NCS_VLAN_GATEWAY" -v v="$1" '$1 == "default" && $2 == "via" && $3 == g && $4 == "dev" && $5 == v {f = 1} END {exit !f}'
+}
+# vlan_drop_old_routes <interface> <file of <address>/<prefix> lines>: a connected route of a network those addresses were in, with their
+# prefix, that lingers once the interface has no address left in it (the kernel normally takes it away itself)
+vlan_drop_old_routes() {
+  while IFS=/ read -r _oa _oq; do
+    [ -n "$_oa" ] && [ "$_oq" != "$NCS_VLAN_PREFIX" ] || continue
+    _on="$(vlan_net_cidr "$_oa" "$_oq")"
+    _still=0
+    for _c in $(vlan_live "$1"); do [ "${_c#*/}" = "$_oq" ] && [ "$(vlan_net_cidr "${_c%/*}" "$_oq")" = "$_on" ] && _still=1; done
+    [ "$_still" = 0 ] || continue
+    if ip -4 route show 2>/dev/null | awk -v n="$_on" -v v="$1" '$1 == n && $2 == "dev" && $3 == v {f = 1} END {exit !f}'; then
+      ip route del "$_on" dev "$1" 2>/dev/null || true
+    fi
+  done <"$2"
+}
+# vlan_prove: the platform answers (or, with no platform address given, the management gateway)
+vlan_prove() {
+  if [ -n "${NCS_PLATFORM_URL:-}" ]; then
+    for _ in 1 2 3 4 5 6; do
+      curl -fsS --max-time 15 -o /dev/null "$NCS_PLATFORM_URL/api/agent/download/VERSION" 2>/dev/null && return 0
+      sleep 5
+    done
+    return 1
+  fi
+  ping -c 2 -W 3 "$A_GW" >/dev/null 2>&1
+}
+# vlan_intact <dir>: nothing the machine had is gone apart from what the change meant to replace (<dir>/meant); what is missing is put
+# back once and looked at again
+vlan_intact() {
+  addr_lost "$1" "" && return 0
+  addr_heal "$1"
+  addr_lost "$1" ""
+}
+
 vlan_inputs_ok() {
   printf '%s' "${NCS_VLAN_ID:-}" | grep -Eq '^[0-9]{1,4}$' || return 1
-  printf '%s' "${NCS_VLAN_PREFIX:-}" | grep -Eq '^[0-9]{1,2}$' || return 1
+  printf '%s' "${NCS_VLAN_PREFIX:-}" | grep -Eq '^[0-9]{1,2}$' && [ "$NCS_VLAN_PREFIX" -ge 16 ] && [ "$NCS_VLAN_PREFIX" -le 30 ] || return 1
   addr_is_ipv4 "${NCS_VLAN_ADDRESS:-}" && addr_is_ipv4 "${NCS_VLAN_GATEWAY:-}" || return 1
-  for a in ${NCS_VLAN_TENANT_ADDRESSES:-}; do addr_is_ipv4 "$a" || return 1; done
+  # one network: the gateway and every tenant address are in the node's own address's network, and none of them is another
+  [ "$NCS_VLAN_GATEWAY" != "$NCS_VLAN_ADDRESS" ] && vlan_in_net "$NCS_VLAN_GATEWAY" || return 1
+  for a in ${NCS_VLAN_TENANT_ADDRESSES:-}; do
+    addr_is_ipv4 "$a" && vlan_in_net "$a" && [ "$a" != "$NCS_VLAN_ADDRESS" ] && [ "$a" != "$NCS_VLAN_GATEWAY" ] || return 1
+  done
   return 0
 }
 
@@ -1113,10 +1197,19 @@ f_ncs_vlan_ok() {
   # sub-interface with the node's own address, and every given tenant address named in it. Other tenant lines are the tenant-address
   # task's and are allowed. A working VLAN made by hand is adopted as it is, never rewritten, once it also carries the pod rules.
   grep -Eq "^[[:space:]]*iface[[:space:]]+$_vif[[:space:]]+inet[[:space:]]+static" "$_file" 2>/dev/null || return 1
-  grep -Eq "^[[:space:]]*address[[:space:]]+$NCS_VLAN_ADDRESS/$NCS_VLAN_PREFIX([[:space:]]|$)" "$_file" || return 1
+  grep -Eq "^[[:space:]]*address[[:space:]]+$(vlan_re "$NCS_VLAN_ADDRESS")/$NCS_VLAN_PREFIX([[:space:]]|$)" "$_file" || return 1
+  # every tenant line inside the VLAN's network (the given ones, which must be there, and the task's) has the VLAN's prefix (#197)
   for a in ${NCS_VLAN_TENANT_ADDRESSES:-}; do grep -v '^[[:space:]]*#' "$_file" | grep -Fq "ip addr add $a/" || return 1; done
-  _have="$(ip -4 -o addr show dev "$_vif" 2>/dev/null | awk '{print $4}')"
-  for a in "$NCS_VLAN_ADDRESS" ${NCS_VLAN_TENANT_ADDRESSES:-}; do printf '%s\n' "$_have" | grep -qx "$a/$NCS_VLAN_PREFIX" || return 1; done
+  for a in $(vlan_file_tenants "$_file"); do
+    vlan_in_net "$a" || continue
+    grep -v '^[[:space:]]*#' "$_file" | grep -Eq "ip addr add $(vlan_re "$a")/$NCS_VLAN_PREFIX([[:space:]]|$)" || return 1
+  done
+  _have="$(vlan_live "$_vif")"
+  for a in "$NCS_VLAN_ADDRESS" ${NCS_VLAN_TENANT_ADDRESSES:-}; do printf '%s\n' "$_have" | grep -qxF "$a/$NCS_VLAN_PREFIX" || return 1; done
+  # nothing in the VLAN's network with another prefix (an address with the prefix the network had before, or the old own address),
+  # and the network's connected route is from the node's own address, not a tenant's
+  for c in $_have; do [ "${c#*/}" = "$NCS_VLAN_PREFIX" ] || ! vlan_in_net "${c%/*}" || return 1; done
+  [ "$(vlan_route_src "$_vif")" = "$NCS_VLAN_ADDRESS" ] || return 1
   # pod routing (nuit-cloud/nuit-cloud#197): every item in place now, for the management interface the machine has now, and in the
   # file so it comes back at boot (a management move after the VLAN was written is drift here)
   _mif="$(vlan_mgmt_if)" && [ "$_mif" != "$_vif" ] || return 1
@@ -1145,30 +1238,56 @@ f_ncs_vlan_do() {
   [ "$A_IF" != "$vif" ] || { echo "  the machine's default route is on $A_IF, which is the tenant VLAN's own interface: set this up by hand" >&2; return 3; }
   mif="$(vlan_mgmt_if)" || { echo "  odd interface name for the default route: set the VLAN up by hand" >&2; return 3; }
   vlan_name_free "$vif" "$A_PARENT" "$NCS_VLAN_ID" || { echo "  $vif exists already and is not VLAN $NCS_VLAN_ID on $A_PARENT: set the VLAN up by hand" >&2; return 3; }
+  # A VLAN interface that is there with addresses on it is in service (#197): it is never taken down and brought up again, which would
+  # drop its tenant addresses and the services on them. It is brought to what is wanted as it runs (the live path below).
+  link_was=0; ip link show dev "$vif" >/dev/null 2>&1 && link_was=1
+  live=0; [ "$link_was" = 1 ] && [ -n "$(vlan_live "$vif")" ] && live=1
   # ifup of a VLAN sub-interface first brings up its parent interface unless ifupdown already has it recorded as up; on a machine whose
   # parent was configured another way that would run its address configuration again. Found on a real kernel: only proceed if ifupdown
-  # itself holds the parent up.
-  command -v ifquery >/dev/null 2>&1 && ifquery --state "$A_PARENT" >/dev/null 2>&1 || {
-    echo "  $A_PARENT is not held up by ifupdown here (ifquery --state says it is not), and ifup of its VLAN would try to bring it up itself and could disturb its address: set the VLAN up by hand (nuit-cloud/nuit-cloud-servers scripts/server-vlan5.sh)" >&2
-    return 3
-  }
-  # the VLAN's own addresses must not already be somewhere else on this machine
+  # itself holds the parent up. (The live path runs no ifup.)
+  if [ "$live" = 0 ]; then
+    command -v ifquery >/dev/null 2>&1 && ifquery --state "$A_PARENT" >/dev/null 2>&1 || {
+      echo "  $A_PARENT is not held up by ifupdown here (ifquery --state says it is not), and ifup of its VLAN would try to bring it up itself and could disturb its address: set the VLAN up by hand (nuit-cloud/nuit-cloud-servers scripts/server-vlan5.sh)" >&2
+      return 3
+    }
+  fi
+  # the VLAN's own addresses must not already be somewhere else on this machine, with any prefix
   for a in "$NCS_VLAN_ADDRESS" ${NCS_VLAN_TENANT_ADDRESSES:-}; do
-    if ip -4 -o addr show 2>/dev/null | awk -v v="$vif" '$2 != v {print $4}' | grep -qx "$a/$NCS_VLAN_PREFIX"; then echo "  $a is already on another interface of this machine: nothing was changed" >&2; return 1; fi
+    if ip -4 -o addr show 2>/dev/null | awk -v v="$vif" -v a="$a" '$2 != v {split($4, x, "/"); if (x[1] == a) f = 1} END {exit !f}'; then echo "  $a is already on another interface of this machine: nothing was changed" >&2; return 1; fi
   done
 
   file="$(p "$(vlan_file)")"
-  # A VLAN already up with the node's own address (a machine in service) is not taken down and brought up again: that would drop its
-  # tenant addresses and the services on them. What is missing (the pod rules, a given tenant address) is added to it as it runs, and
-  # the file is rewritten for the next boot. Otherwise (a new machine) the file is written and the interface brought up with ifup.
-  live=0
-  ip -4 -o addr show dev "$vif" 2>/dev/null | awk '{print $4}' | grep -qx "$NCS_VLAN_ADDRESS/$NCS_VLAN_PREFIX" && live=1
+  vsys="$(printf '%s' "$vif" | tr . /)"   # sysctl writes a dot in an interface name as a slash
+  pfx="$NCS_VLAN_PREFIX"; own="$NCS_VLAN_ADDRESS"
   d="$(p "$ADDR_DIR")/vlan"; rm -rf "$d"; mkdir -p "$d"; chmod 700 "$d"
   addr_snapshot "$d"
+  vlan_live "$vif" >"$d/before.vif"
+  ip -4 route show table "$VLAN_TABLE" 2>/dev/null | awk '$1 == "default"' >"$d/before.table"
+  promote_was="$(cat "$(p "/proc/sys/net/ipv4/conf/$vif/promote_secondaries")" 2>/dev/null || true)"
+  printf '%s' "$promote_was" | grep -Eq '^[0-9]$' || promote_was=""
   existing=0; [ -f "$file" ] && { cp -p "$file" "$d/previous"; existing=1; }
-  : >"$d/added.rules"; : >"$d/added.addrs"
+  : >"$d/added.rules"; : >"$d/added.addrs"; : >"$d/meant"; : >"$d/reprefix"; : >"$d/stale"
+  # On a VLAN in service, what changes is worked out before anything does (#197). The addresses kept are the node's own, the given
+  # tenant addresses and the file's tenant lines (the tenant-address task's); one of them on the interface with another prefix is moved
+  # to the VLAN's prefix (reprefix). The old own address (the file's address line, else the interface's first address), unless it is
+  # kept as a tenant address, and anything else in the VLAN's network with another prefix, go once the change is proved (stale).
+  # Both lists run secondaries first, so a network's primary is the last of it to go.
+  old="$(vlan_stanza_address "$file" "$vif")"; [ -n "$old" ] || old="$(head -n 1 "$d/before.vif")"; old="${old%/*}"
+  addr_is_ipv4 "$old" || old=""
+  keep=" $own ${NCS_VLAN_TENANT_ADDRESSES:-} $(vlan_file_tenants "$file" | tr '\n' ' ') "
   if [ "$live" = 1 ]; then
-    undo_link="# the VLAN was up before: it stays up; only what this run added is taken away"
+    vlan_reverse <"$d/before.vif" | while IFS=/ read -r a q; do
+      case "$keep" in *" $a "*) [ "$q" = "$pfx" ] || ! vlan_in_net "$a" || echo "$a/$q" >>"$d/reprefix"; continue ;; esac
+      if [ "$a" = "$old" ] || { [ "$q" != "$pfx" ] && vlan_in_net "$a"; }; then echo "$a/$q" >>"$d/stale"; fi
+    done
+    # what the change means to take away is not counted as lost: those addresses, and the connected routes of their networks
+    cat "$d/reprefix" "$d/stale" | while IFS=/ read -r a q; do
+      echo "addr $vif $a/$q" >>"$d/meant"; echo "route $(vlan_net_cidr "$a" "$q") dev $vif " >>"$d/meant"
+    done
+    echo "route $(vlan_net_cidr "$own" "$pfx") dev $vif " >>"$d/meant"   # its source may become the node's own address
+  fi
+  if [ "$live" = 1 ]; then
+    undo_link="# the VLAN was up before: it stays up; only what this run added is taken away and what it removed put back"
   else
     undo_link="ifdown --force $vif 2>/dev/null"
   fi
@@ -1180,16 +1299,24 @@ PATH="\$PATH:/usr/local/sbin:/usr/sbin:/sbin"
 echo "nuit-cloud: undoing the tenant VLAN change"
 $undo_link
 if [ "$existing" = 1 ]; then cp -p "$d/previous" "$file"; else rm -f "$file"; fi
-[ "$live" = 1 ] || ip link del $vif 2>/dev/null
+[ "$live" = 1 ] || [ "$link_was" = 1 ] || ip link del $vif 2>/dev/null
+# a VLAN in service: the addresses it had come back first, each network's primary first, so no tenant address is ever missing
+if [ "$live" = 1 ]; then while read -r cidr; do ip addr add "\$cidr" dev $vif 2>/dev/null; done <"$d/before.vif"; fi
 # the routing items this run added (the ones that were there before stay)
 while read -r n; do
   case "\$n" in
 $undo_items
   esac
 done <"$d/added.rules"
-while read -r cidr; do ip addr del "\$cidr" dev $vif 2>/dev/null; done <"$d/added.addrs"
+# then what this run added goes, the last added first (secondaries before the primary they hang on)
+awk '{l[NR] = \$0} END {for (i = NR; i > 0; i--) print l[i]}' "$d/added.addrs" | while read -r cidr; do ip addr del "\$cidr" dev $vif 2>/dev/null; done
 if [ -f "$d/before.addrs" ]; then while read -r ifc cidr; do ip addr add "\$cidr" dev "\$ifc" 2>/dev/null; done <"$d/before.addrs"; fi
 if [ -f "$d/before.routes" ]; then while IFS= read -r line; do ip route replace \$line 2>/dev/null; done <"$d/before.routes"; fi
+if [ "$live" = 1 ]; then
+  if [ -s "$d/before.table" ]; then while IFS= read -r line; do ip route replace \$line table $VLAN_TABLE 2>/dev/null; done <"$d/before.table"
+  elif [ -f "$d/table.added" ]; then ip route del default table $VLAN_TABLE 2>/dev/null; fi
+  [ -z "$promote_was" ] || sysctl -qw net.ipv4.conf.$vsys.promote_secondaries=$promote_was >/dev/null 2>&1
+fi
 rm -f "$d/armed"
 exit 0
 ROLLBACK
@@ -1198,17 +1325,41 @@ ROLLBACK
   : >"$d/armed"
 
   mkdir -p "$(dirname "$file")"
-  # the tenant lines already there (the tenant-address task's, or a hand setup's) are kept; the given ones are added
+  # the tenant lines already there (the tenant-address task's, or a hand setup's) are kept, with the VLAN's prefix; the given ones are added
   if [ "$existing" = 1 ]; then vlan_render "$A_PARENT" "$d/previous" "$vif" "$mif" >"$file"; else vlan_render "$A_PARENT" "" "$vif" "$mif" >"$file"; fi
   [ -e "$(p /etc/modules-load.d/8021q.conf)" ] || { mkdir -p "$(p /etc/modules-load.d)"; echo 8021q >"$(p /etc/modules-load.d/8021q.conf)"; }   # load the VLAN module at boot
   systemctl restart systemd-modules-load.service >/dev/null 2>&1 || true   # the agent's own sandbox may not load modules; systemd can
   if [ "$live" = 1 ]; then
-    # as it runs: every given tenant address that is not on the interface yet (the file's post-up lines did not run: no ifup)
-    for a in ${NCS_VLAN_TENANT_ADDRESSES:-}; do
-      ip -4 -o addr show dev "$vif" 2>/dev/null | awk '{print $4}' | grep -qx "$a/$NCS_VLAN_PREFIX" && continue
-      if ! ip addr add "$a/$NCS_VLAN_PREFIX" dev "$vif"; then sh "$d/rollback.sh"; echo "  could not add $a to $vif, so the change was taken away" >&2; return 1; fi
-      echo "$a/$NCS_VLAN_PREFIX" >>"$d/added.addrs"
+    # As it runs (the file's lines did not run: no ifup). Checked on a real kernel (Linux 7.0, #197): one address can be on an interface
+    # with two prefixes at once (each is its own entry, with its own local route), so a tenant address gets its new prefix before its
+    # old one goes and is never missing; the first address of a network is its primary and the source of the network's connected
+    # route; and removing a primary removes its secondaries with it unless promote_secondaries is on.
+    sysctl -qw "net.ipv4.conf.$vsys.promote_secondaries=1" >/dev/null 2>&1 || true
+    # 1. the node's own address with the VLAN's prefix, first (the primary of the network), then every tenant address with it
+    for a in "$own" ${NCS_VLAN_TENANT_ADDRESSES:-} $(sed 's#/.*##' "$d/reprefix"); do
+      vlan_live "$vif" | grep -qxF "$a/$pfx" && continue
+      if ! ip addr add "$a/$pfx" dev "$vif"; then sh "$d/rollback.sh"; echo "  could not add $a/$pfx to $vif, so the change was taken away" >&2; return 1; fi
+      echo "$a/$pfx" >>"$d/added.addrs"
     done
+    # 2. the network's connected route is from the node's own address (a tenant address may have held the network first)
+    if [ "$(vlan_route_src "$vif")" != "$own" ]; then
+      if ! ip route replace "$(vlan_net_cidr "$own" "$pfx")" dev "$vif" proto kernel scope link src "$own"; then
+        sh "$d/rollback.sh"; echo "  could not make $own the source of the VLAN's connected route, so the change was taken away" >&2; return 1
+      fi
+    fi
+    # 3. the kept addresses' old prefixes go (each is on the interface with the VLAN's prefix already), secondaries first
+    while IFS= read -r c; do
+      vlan_live "$vif" | grep -qxF "$c" || continue
+      if ! ip addr del "$c" dev "$vif"; then sh "$d/rollback.sh"; echo "  could not remove $c from $vif, so the change was taken away" >&2; return 1; fi
+    done <"$d/reprefix"
+    vlan_drop_old_routes "$vif" "$d/reprefix"
+    # 4. the tenant VLAN's own table still sends by its gateway
+    if ! vlan_table_ok "$vif"; then
+      if ! ip route replace default via "$NCS_VLAN_GATEWAY" dev "$vif" table "$VLAN_TABLE"; then
+        sh "$d/rollback.sh"; echo "  could not route table $VLAN_TABLE by $NCS_VLAN_GATEWAY, so the change was taken away" >&2; return 1
+      fi
+      : >"$d/table.added"
+    fi
   elif ! ifup "$vif" >"$d/ifup.out" 2>&1; then
     sh "$d/rollback.sh"
     echo "  ifup $vif failed ($(tr '\n' ' ' <"$d/ifup.out" | cut -c1-200)), so the machine was put back" >&2
@@ -1222,37 +1373,47 @@ ROLLBACK
     return 1
   fi
 
-  # nothing that was there may be gone, and the platform must still be reachable
-  if ! addr_lost "$d" ""; then
-    addr_heal "$d"
-    if ! addr_lost "$d" ""; then
-      lost_list="$(tr '\n' ';' <"$d/lost")"
-      sh "$d/rollback.sh"
-      echo "  the change would have lost other network configuration ($lost_list), so the machine was put back" >&2
-      return 1
-    fi
+  # nothing that was there may be gone (apart from what was meant to go), and the platform must still be reachable
+  if ! vlan_intact "$d"; then
+    lost_list="$(tr '\n' ';' <"$d/lost")"
+    sh "$d/rollback.sh"
+    echo "  the change would have lost other network configuration ($lost_list), so the machine was put back" >&2
+    return 1
   fi
-  proved=0
-  if [ -n "${NCS_PLATFORM_URL:-}" ]; then
-    for _ in 1 2 3 4 5 6; do
-      if curl -fsS --max-time 15 -o /dev/null "$NCS_PLATFORM_URL/api/agent/download/VERSION" 2>/dev/null; then proved=1; break; fi
-      sleep 5
-    done
-  else
-    ping -c 2 -W 3 "$A_GW" >/dev/null 2>&1 && proved=1
-  fi
-  if [ "$proved" != 1 ]; then
+  if ! vlan_prove; then
     sh "$d/rollback.sh"
     echo "  the platform could not be reached after the change, so the machine was put back" >&2
     return 1
   fi
+  # 5. only now, with the platform reached: the old own address (unless it is kept as a tenant address) and what else in the VLAN's
+  #    network still has another prefix, secondaries first; then the platform must still be reached, or all of it comes back
+  if [ -s "$d/stale" ]; then
+    while IFS= read -r c; do
+      vlan_live "$vif" | grep -qxF "$c" || continue
+      if ! ip addr del "$c" dev "$vif"; then sh "$d/rollback.sh"; echo "  could not remove $c from $vif, so the change was taken away" >&2; return 1; fi
+    done <"$d/stale"
+    vlan_drop_old_routes "$vif" "$d/stale"
+    if ! vlan_intact "$d"; then
+      lost_list="$(tr '\n' ';' <"$d/lost")"
+      sh "$d/rollback.sh"
+      echo "  removing the old addresses would have lost other network configuration ($lost_list), so the machine was put back" >&2
+      return 1
+    fi
+    if ! vlan_prove; then
+      sh "$d/rollback.sh"
+      echo "  the platform could not be reached once the old addresses were removed, so the machine was put back" >&2
+      return 1
+    fi
+  fi
   systemctl stop nuit-cloud-vlan-rollback.timer >/dev/null 2>&1 || true
   rm -f "$d/armed"
-  [ "$live" = 0 ] || echo "  $vif was up already and was left up; added as it runs: $(wc -l <"$d/added.rules" | tr -d ' ') pod routing item(s), $(wc -l <"$d/added.addrs" | tr -d ' ') tenant address(es)"
+  if [ "$live" = 1 ]; then
+    echo "  $vif was up already and was left up; added as it runs: $(wc -l <"$d/added.rules" | tr -d ' ') pod routing item(s), $(wc -l <"$d/added.addrs" | tr -d ' ') address(es) with /$pfx; moved to /$pfx: $(wc -l <"$d/reprefix" | tr -d ' '); removed: $( [ -s "$d/stale" ] && tr '\n' ' ' <"$d/stale" | sed 's/ $//' || echo nothing)"
+  fi
   if ping -c 2 -W 2 -I "$vif" "$NCS_VLAN_GATEWAY" >/dev/null 2>&1; then
-    echo "  $vif carries $NCS_VLAN_ADDRESS and the tenant block; the VLAN gateway $NCS_VLAN_GATEWAY answers"
+    echo "  $vif carries $NCS_VLAN_ADDRESS/$pfx and the tenant addresses; the VLAN gateway $NCS_VLAN_GATEWAY answers"
   else
-    echo "  $vif carries $NCS_VLAN_ADDRESS and the tenant block. Note: the VLAN gateway $NCS_VLAN_GATEWAY did not answer yet; the VLAN is assumed to reach this port, so this is left in place"
+    echo "  $vif carries $NCS_VLAN_ADDRESS/$pfx and the tenant addresses. Note: the VLAN gateway $NCS_VLAN_GATEWAY did not answer yet; the VLAN is assumed to reach this port, so this is left in place"
   fi
 }
 

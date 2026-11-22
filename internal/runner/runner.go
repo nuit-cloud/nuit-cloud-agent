@@ -642,6 +642,13 @@ func managementEnvironment(raw map[string]any, platformURL string) ([]string, er
 	return append(env, "NCS_MANAGEMENT_VLAN="+strconv.Itoa(id), "NCS_MANAGEMENT_PREFIX="+strconv.Itoa(prefix), "NCS_MANAGEMENT_GATEWAY="+gw), nil
 }
 
+// lastOf is the last (broadcast) address of an IPv4 prefix.
+func lastOf(p netip.Prefix) netip.Addr {
+	b := p.Masked().Addr().As4()
+	v := (uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])) | (uint32(1)<<(32-p.Bits()) - 1)
+	return netip.AddrFrom4([4]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)})
+}
+
 // vlanEnvironment turns the signed VLAN slice into what the profile scripts read, after checking every part is what it should be.
 func vlanEnvironment(raw map[string]any, platformURL string) ([]string, error) {
 	number := func(k string, lo, hi float64) (string, error) {
@@ -694,6 +701,45 @@ func vlanEnvironment(raw map[string]any, platformURL string) ([]string, error) {
 			return nil, fmt.Errorf("a tenant address: %w", err)
 		}
 		tenants = append(tenants, a)
+	}
+	// One network (nuit-cloud/nuit-cloud#197, where it grows to /16 and the node's own address moves to 10.20.255.x): the gateway and
+	// every tenant address are inside the node's address/prefix, none is the network or broadcast address, and the node's own address is
+	// neither the gateway nor a tenant address (the scripts add the tenant addresses beside it and take away what they replace).
+	pl, _ := strconv.Atoi(prefix)
+	own, err := netip.ParseAddr(addr)
+	if err != nil || !own.Is4() {
+		return nil, fmt.Errorf("the VLAN address %q is not an IPv4 address", addr)
+	}
+	block := netip.PrefixFrom(own, pl).Masked()
+	inside := func(what, s string) error {
+		a, err := netip.ParseAddr(s)
+		if err != nil || !a.Is4() {
+			return fmt.Errorf("%s %q is not an IPv4 address", what, s)
+		}
+		if !block.Contains(a) {
+			return fmt.Errorf("%s %s is not in the VLAN's network %s", what, s, block)
+		}
+		if a == block.Addr() || a == lastOf(block) {
+			return fmt.Errorf("%s %s is the network or broadcast address of %s", what, s, block)
+		}
+		return nil
+	}
+	if err := inside("the VLAN address", addr); err != nil {
+		return nil, err
+	}
+	if err := inside("the VLAN gateway", gateway); err != nil {
+		return nil, err
+	}
+	if gateway == addr {
+		return nil, errors.New("the VLAN address is the gateway's")
+	}
+	for _, a := range tenants {
+		if err := inside("the tenant address", a); err != nil {
+			return nil, err
+		}
+		if a == addr || a == gateway {
+			return nil, fmt.Errorf("the tenant address %s is the VLAN's own address or its gateway", a)
+		}
 	}
 	return []string{"NCS_VLAN_ID=" + id, "NCS_VLAN_PREFIX=" + prefix, "NCS_VLAN_ADDRESS=" + addr, "NCS_VLAN_GATEWAY=" + gateway, "NCS_VLAN_TENANT_ADDRESSES=" + strings.Join(tenants, " "), "NCS_PLATFORM_URL=" + platformURL}, nil
 }
@@ -1034,6 +1080,9 @@ func (r Runner) tenantAddress(ctx context.Context, task *taskverify.Task) client
 	out := "took " + res.Address
 	if res.AlreadyHere {
 		out = res.Address + " was already on this machine"
+	}
+	if res.PrefixChanged {
+		out += fmt.Sprintf("; moved to /%d", p.Prefix)
 	}
 	if res.FileChanged {
 		out += "; added to the VLAN configuration"

@@ -469,6 +469,15 @@ func TestTheVLANSliceReachesTheScriptsAsEnvironmentAndBadPartsAreRefused(t *test
 		"spaced tenant":   func(m map[string]any) { m["tenantAddresses"] = []any{"10.20.0.19 10.20.0.20"} },
 		"tenant not list": func(m map[string]any) { m["tenantAddresses"] = "10.20.0.19" },
 		"null tenants":    func(m map[string]any) { m["tenantAddresses"] = nil },
+		// one network (nuit-cloud/nuit-cloud#197)
+		"gateway outside":        func(m map[string]any) { m["gateway"] = "10.21.0.1" },
+		"gateway is own":         func(m map[string]any) { m["gateway"] = "10.20.0.18" },
+		"tenant outside":         func(m map[string]any) { m["tenantAddresses"] = []any{"10.20.1.19"} },
+		"tenant is own":          func(m map[string]any) { m["tenantAddresses"] = []any{"10.20.0.19", "10.20.0.18"} },
+		"tenant is gateway":      func(m map[string]any) { m["tenantAddresses"] = []any{"10.20.0.1"} },
+		"tenant is broadcast":    func(m map[string]any) { m["tenantAddresses"] = []any{"10.20.0.255"} },
+		"own is network address": func(m map[string]any) { m["address"] = "10.20.0.0" },
+		"own outside at /16":     func(m map[string]any) { m["address"] = "10.21.255.18"; m["prefix"] = float64(16) },
 		"too many tenants": func(m map[string]any) {
 			l := make([]any, 33)
 			for i := range l {
@@ -484,6 +493,19 @@ func TestTheVLANSliceReachesTheScriptsAsEnvironmentAndBadPartsAreRefused(t *test
 		if rep := withProfiles(f2).Run(context.Background(), task); rep.Status != "failed" || len(f2.calls) != 0 {
 			t.Errorf("%s: %+v calls=%v", name, rep, f2.calls)
 		}
+	}
+}
+
+// The tenant VLAN renumbered (nuit-cloud/nuit-cloud#197): the network is /16, the node's own address is in 10.20.255.0/24, and the
+// Ingress Service machine carries 10.20.0.34 (its old own address) as one of its tenant addresses.
+func TestTheRenumberedVLANSliceReachesTheScripts(t *testing.T) {
+	v := map[string]any{"id": float64(5), "address": "10.20.255.34", "prefix": float64(16), "gateway": "10.20.0.1", "tenantAddresses": []any{"10.20.0.34", "10.20.0.3"}}
+	f := &fakeProfiles{res: profiles.Result{Features: []profiles.Feature{{Name: "ncs_vlan", Status: "applied"}}}}
+	r := withProfiles(f)
+	r.PlatformURL = "https://agent.example"
+	task := &taskverify.Task{Name: "profile-apply", TimeoutSeconds: 30, Params: map[string]any{"profile": "nuit-cloud-vlan", "vlan": v}}
+	if rep := r.Run(context.Background(), task); rep.Status != "done" || strings.Join(f.env, "|") != "NCS_VLAN_ID=5|NCS_VLAN_PREFIX=16|NCS_VLAN_ADDRESS=10.20.255.34|NCS_VLAN_GATEWAY=10.20.0.1|NCS_VLAN_TENANT_ADDRESSES=10.20.0.34 10.20.0.3|NCS_PLATFORM_URL=https://agent.example" {
+		t.Errorf("%+v env=%v", rep, f.env)
 	}
 }
 

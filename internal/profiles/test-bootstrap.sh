@@ -242,6 +242,7 @@ mk_net() { # mk_net <current address> : a Debian with ifupdown whose $NETIF (eth
   # the kernel's own list of VLAN interfaces (what the features read to find a VLAN's interface and its parent, whatever its name)
   printf 'VLAN Dev name\t | VLAN ID\nName-Type: VLAN_NAME_TYPE_RAW_PLUS_VID_NO_PAD\n%s | 5 | %s\n' "$_mt" "$_mn" >"$ROOT/proc/net/vlan/config"
   rm -f "$STATE/active-NetworkManager" "$STATE/arping-dupe" "$STATE/curl-fail" "$STATE/lose-vlan" "$STATE/stubborn" "$STATE/gw-silent"; : >"$CALLS"
+  rm -f "$STATE/model" "$STATE/ip-t105" "$STATE/watch" "$STATE/gaps" "$STATE/curl-fail-after"
 }
 stub ip 'case "$*" in
   "-4 route show default") cat "$STATE/ip-route";;
@@ -265,14 +266,78 @@ stub ping 'echo "ping $*" >>"$CALLS"; [ ! -e "$STATE/gw-silent" ]'
 stub ifup 'echo "ifup $*" >>"$CALLS"'
 stub systemd-run 'echo "systemd-run $*" >>"$CALLS"'
 stub arping 'echo "arping $*" >>"$CALLS"; [ ! -e "$STATE/arping-dupe" ]'
-stub sysctl 'echo "sysctl $*" >>"$CALLS"'
+# sysctl: promote_secondaries is kept where the kernel shows it, $ROOT/proc/sys/net/ipv4/conf/<interface>/promote_secondaries
+stub sysctl 'echo "sysctl $*" >>"$CALLS"
+for a in "$@"; do case "$a" in net.ipv4.conf.*.promote_secondaries=*)
+  [ ! -e "$STATE/no-promote" ] || exit 1
+  k="${a%%=*}"; dv="${k#net.ipv4.conf.}"; dv="$(echo "${dv%.promote_secondaries}" | tr / .)"
+  mkdir -p "$ROOT/proc/sys/net/ipv4/conf/$dv"; echo "${a#*=}" >"$ROOT/proc/sys/net/ipv4/conf/$dv/promote_secondaries";; esac; done'
 stub sleep 'true'
 stub curl '[ ! -e "$STATE/curl-fail" ] && echo "curl $*" >>"$CALLS"'
 # policy rules are kept in $STATE/ip-rules the way "ip -4 rule show" prints them; a rule on ocisaas0 before the bridge exists shows
 # "[detached]", as on a real kernel (checked with iproute2 6.15)
 mv "$tmp/bin/ip" "$tmp/bin/ip-base"
+# The tenant VLAN's tests (section 10 on, with $STATE/model) use a small model of how the kernel keeps IPv4 addresses, checked on a real
+# kernel (Linux 7.0, #197): one address may be on an interface with two prefixes at once, each its own entry; the first entry of a
+# network (address and prefix) is its primary and the source of the network's connected route; removing a primary removes the network's
+# secondaries with it unless promote_secondaries is on, when the next one becomes primary (and the route's source, if it was the
+# primary's); the connected route goes with the network's last entry. With $STATE/watch (addresses), every change checks that each of
+# them is still on the machine, with some prefix, and writes to $STATE/gaps when one is not.
+cat >"$tmp/bin/netmodel" <<'NETMODEL'
+#!/bin/sh
+A="$STATE/ip-addrs"; R="$STATE/ip-routes"; T="$STATE/ip-t105"; touch "$R" "$T"
+net() { awk -v ip="${1%/*}" -v pl="${1#*/}" 'BEGIN {split(ip, o, "."); v = ((o[1] * 256 + o[2]) * 256 + o[3]) * 256 + o[4]; b = 2 ^ (32 - pl); v = int(v / b) * b
+  printf "%d.%d.%d.%d/%d\n", int(v / 16777216) % 256, int(v / 65536) % 256, int(v / 256) % 256, v % 256, pl}'; }
+in_net() { while read -r d c; do [ "$d" = "$1" ] && [ "$(net "$c")" = "$2" ] && echo "$c"; done <"$A"; }
+promote_on() { [ "$(cat "$ROOT/proc/sys/net/ipv4/conf/$1/promote_secondaries" 2>/dev/null)" = 1 ]; }
+without() { awk -v k="$1" '$0 != k' "$2" >"$2.new"; mv "$2.new" "$2"; }
+drop_route() { awk -v n="$1" -v d="$2" '!($1 == n && $2 == "dev" && $3 == d)' "$R" >"$R.new"; mv "$R.new" "$R"; }
+set_route() { drop_route "$1" "$2"; echo "$1 dev $2 proto kernel scope link src $3" >>"$R"; }
+route_src() { awk -v n="$1" -v d="$2" '$1 == n && $3 == d {for (i = 4; i < NF; i++) if ($i == "src") print $(i + 1)}' "$R"; }
+op="$1"; shift
+case "$op" in
+  add) c="$1"; dev="$2"; n="$(net "$c")"
+    grep -Fqx "$dev $c" "$A" && { echo "RTNETLINK answers: File exists" >&2; exit 2; }
+    echo "$dev $c" >>"$A"
+    [ -n "$(route_src "$n" "$dev")" ] || set_route "$n" "$dev" "${c%/*}" ;;
+  del) c="$1"; dev="$2"; n="$(net "$c")"
+    grep -Fqx "$dev $c" "$A" || { echo "RTNETLINK answers: Cannot assign requested address" >&2; exit 2; }
+    if [ "$(in_net "$dev" "$n" | head -n 1)" = "$c" ] && ! promote_on "$dev"; then
+      for s in $(in_net "$dev" "$n"); do without "$dev $s" "$A"; done
+    else
+      without "$dev $c" "$A"
+    fi
+    next="$(in_net "$dev" "$n" | head -n 1)"
+    if [ -z "$next" ]; then drop_route "$n" "$dev"; elif [ "$(route_src "$n" "$dev")" = "${c%/*}" ]; then set_route "$n" "$dev" "${next%/*}"; fi ;;
+  route-replace)
+    case " $* " in
+      *" table 105 "*) l="$(echo "$*" | sed 's/ table 105//')"; awk -v d="$1" '$1 != d' "$T" >"$T.new"; echo "$l" >>"$T.new"; mv "$T.new" "$T" ;;
+      *) drop_route "$1" "$3"; echo "$*" >>"$R" ;;
+    esac ;;
+  route-del)
+    case " $* " in *" table 105 "*) awk -v d="$1" '$1 != d' "$T" >"$T.new"; mv "$T.new" "$T" ;; *) drop_route "$1" "$3" ;; esac ;;
+esac
+if [ -f "$STATE/watch" ]; then
+  for w in $(cat "$STATE/watch"); do awk -v w="$w" '{split($2, x, "/"); if (x[1] == w) f = 1} END {exit !f}' "$A" || echo "$w missing after $op $*" >>"$STATE/gaps"; done
+fi
+NETMODEL
+chmod +x "$tmp/bin/netmodel"
 cat >"$tmp/bin/ip" <<'IPSTUB'
 #!/bin/sh
+case "$*" in
+  "-4 route show table 105") cat "$STATE/ip-t105" 2>/dev/null; exit 0 ;;
+esac
+if [ -e "$STATE/model" ]; then
+  case "$1 ${2:-}" in
+    "addr add"|"addr del") echo "ip $*" >>"$CALLS"; exec netmodel "$2" "$3" "$5" ;;
+    "route del") echo "ip $*" >>"$CALLS"; shift 2; exec netmodel route-del "$@" ;;
+    "route replace") case "$*" in
+        "route replace default "*" table "*) echo "ip $*" >>"$CALLS"; shift 2; exec netmodel route-replace "$@" ;;
+        "route replace default "*) ;;
+        "route replace "*" dev "*) echo "ip $*" >>"$CALLS"; shift 2; exec netmodel route-replace "$@" ;;
+      esac ;;
+  esac
+fi
 case "$1 ${2:-}" in
   "rule add")
     echo "ip $*" >>"$CALLS"; shift 2; r="$*"; pr="${r##* priority }"; sel="${r% priority *}"
@@ -531,14 +596,27 @@ pi_run >"$tmp/out" 2>&1 && bad "a vlan30 that is not a VLAN was taken"
 grep -q 'MANUAL  ncs_address' "$tmp/out" && grep -q 'vlan30 exists already' "$tmp/out" && [ ! -s "$CALLS" ] && ok "ncs_address (VLAN): a vlan30 on another parent, or one that is not a VLAN, is left to a person and nothing changes" || { cat "$tmp/out"; cat "$CALLS"; bad "pi vlan30 not a VLAN"; }
 
 # 10. ncs_vlan: the tenant VLAN slice goes on the machine as a sub-interface, additive and undone if the platform is lost
-stub ifup 'echo "ifup $*" >>"$CALLS"; [ -e "$STATE/ifup-fail" ] && { echo "ifup: boom" >&2; exit 1; }
-case "$1" in -*) ;; *) for a in 10.20.0.18 10.20.0.19 10.20.0.20 10.20.0.21; do echo "$1 $a/24" >>"$STATE/ip-addrs"; done
-  printf "%s\\n" "-i $1 -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x5" "! -i $1 -m connmark --mark 0x5 -j CONNMARK --restore-mark" >>"$STATE/iptables";; esac'
+# ifup brings the interface up as its file says: the address line, then each tenant line, table 105 by the gateway, the 0x5 marks
+cat >"$tmp/bin/ifup" <<'IFUP'
+#!/bin/sh
+echo "ifup $*" >>"$CALLS"; [ -e "$STATE/ifup-fail" ] && { echo "ifup: boom" >&2; exit 1; }
+case "$1" in -*) exit 0 ;; esac
+f="$ROOT/etc/network/interfaces.d/nuit-cloud-vlan5"
+grep -q 'promote_secondaries=1' "$f" && { mkdir -p "$ROOT/proc/sys/net/ipv4/conf/$1"; echo 1 >"$ROOT/proc/sys/net/ipv4/conf/$1/promote_secondaries"; }
+for c in $(awk '$1 == "address" {print $2}' "$f") $(grep -v '^[[:space:]]*#' "$f" | sed -n 's/.*ip addr add \([0-9.]*\/[0-9]*\) .*/\1/p'); do netmodel add "$c" "$1" 2>/dev/null; done
+sed -n 's/.*post-up ip route replace \(default via [0-9.]* dev [^ ]*\) table 105.*/\1/p' "$f" >"$STATE/ip-t105"
+printf "%s\n" "-i $1 -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x5" "! -i $1 -m connmark --mark 0x5 -j CONNMARK --restore-mark" >>"$STATE/iptables"
+IFUP
+chmod +x "$tmp/bin/ifup"
 stub ifdown 'echo "ifdown $*" >>"$CALLS"; grep -v "^$2 " "$STATE/ip-addrs" >"$STATE/ip-addrs.new"; mv "$STATE/ip-addrs.new" "$STATE/ip-addrs"'
 stub ping 'echo "ping $*" >>"$CALLS"; [ ! -e "$STATE/gw-silent" ]'
 stub ifquery '[ ! -e "$STATE/no-ifstate" ]'
 vlan_run() { env NCS_VLAN_ID=5 NCS_VLAN_PREFIX=24 NCS_VLAN_ADDRESS=10.20.0.18 NCS_VLAN_GATEWAY=10.20.0.1 NCS_VLAN_TENANT_ADDRESSES="${TENANTS-10.20.0.19 10.20.0.20 10.20.0.21}" NCS_PLATFORM_URL=https://agent.example sh "$here/bootstrap.sh" nuit-cloud-vlan ${1:+"$1"}; }
-vlan_net() { mk_net 10.10.10.170; sed -i.bak "/^${TVIF:-${NETIF:-eth0}.5} /d" "$STATE/ip-addrs"; rm -f "$STATE/ifup-fail" "$STATE/gw-silent" "$STATE/no-ifstate"; : >"$CALLS"; rm -f "$ROOT/etc/network/interfaces.d/nuit-cloud-vlan5" "$ROOT/etc/modules-load.d/8021q.conf"; }
+vlan_net() {
+  mk_net 10.10.10.170; _tv="${TVIF:-${NETIF:-eth0}.5}"; sed -i.bak "/^$_tv /d" "$STATE/ip-addrs"; sed -i.bak "/ dev $_tv /d" "$STATE/ip-routes"
+  rm -f "$STATE/ifup-fail" "$STATE/gw-silent" "$STATE/no-ifstate"; : >"$CALLS"; rm -f "$ROOT/etc/network/interfaces.d/nuit-cloud-vlan5" "$ROOT/etc/modules-load.d/8021q.conf"
+  touch "$STATE/model"; : >"$STATE/ip-t105"; mkdir -p "$ROOT/proc/sys/net/ipv4/conf/$_tv"; echo 0 >"$ROOT/proc/sys/net/ipv4/conf/$_tv/promote_secondaries"
+}
 
 vlan_net
 vlan_run --check >"$tmp/out" 2>&1 && bad "a machine without the VLAN passed the check"
@@ -622,8 +700,8 @@ vlan_run >"$tmp/out" 2>&1 && grep -qx 'iptables -t mangle -A PREROUTING -i eth0.
   && grep -q 'PREROUTING -i eth0.31 -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x31' "$f" && ! grep -q 'PREROUTING -i eth0 -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x31' "$f" \
   && [ "$(route_of eth0.31)" = main ] && [ "$(route_of pod)" = 105 ] && vlan_run --check >/dev/null 2>&1 \
   && ok "ncs_vlan: after a management move onto eth0.31 the mark follows it there, as it runs" || { cat "$tmp/out"; cat "$CALLS"; bad "vlan mark follows the management move"; }
-mk_net 10.10.10.170; cp "$tmp/vlan5.full" "$f"; cp "$tmp/rules.full" "$STATE/ip-rules"; cp "$tmp/ipt.full" "$STATE/iptables"; : >"$CALLS"
-echo "eth0.5 10.20.0.18/24" >>"$STATE/ip-addrs"; echo "eth0.5 10.20.0.21/24" >>"$STATE/ip-addrs"
+vlan_net; cp "$tmp/vlan5.full" "$f"; cp "$tmp/rules.full" "$STATE/ip-rules"; cp "$tmp/ipt.full" "$STATE/iptables"; : >"$CALLS"
+for a in 18 19 20 21; do netmodel add "10.20.0.$a/24" eth0.5; done; echo 'default via 10.20.0.1 dev eth0.5' >"$STATE/ip-t105"
 # a given tenant address missing from an up VLAN is added as it runs, not by ifup
 old_agent; cp "$tmp/rules.full" "$STATE/ip-rules"; cp "$tmp/ipt.full" "$STATE/iptables"; sed -i.bak '/^eth0.5 10.20.0.21\/24$/d' "$STATE/ip-addrs"
 vlan_run >"$tmp/out" 2>&1 && grep -qx 'ip addr add 10.20.0.21/24 dev eth0.5' "$CALLS" && ! grep -q '^ifup' "$CALLS" && grep -qx 'eth0.5 10.20.0.21/24' "$STATE/ip-addrs" && vlan_run --check >/dev/null 2>&1 \
@@ -764,6 +842,122 @@ vlan_net; printf 'default via 10.10.10.1 dev eth0.31;reboot\n' >"$STATE/ip-route
 vlan_run >"$tmp/out" 2>&1 && bad "a hostile management interface name was used"
 grep -q 'MANUAL  ncs_vlan' "$tmp/out" && ! grep -q 'reboot' "$CALLS" && ! grep -q 'iptables' "$CALLS" && [ ! -e "$f" ] \
   && ok "ncs_vlan: a hostile management interface name is left to a person and reaches nothing" || { cat "$tmp/out"; cat "$CALLS"; bad "vlan hostile management interface"; }
+
+# 10c. renumbering a tenant VLAN in service (nuit-cloud/nuit-cloud#197): the machine's own address moves to 10.20.255.x and the network
+#      grows from /24 to /16, as it runs: no ifdown, no ifup, no tenant address ever missing, the old own address gone only once the
+#      platform was reached, the Ingress Service's 10.20.0.34 kept as a tenant address; a rollback never takes the VLAN down
+vlan16() { env NCS_VLAN_ID=5 NCS_VLAN_PREFIX="${PFX:-16}" NCS_VLAN_ADDRESS="${OWN:-10.20.255.18}" NCS_VLAN_GATEWAY=10.20.0.1 NCS_VLAN_TENANT_ADDRESSES="${TENANTS-10.20.0.19 10.20.0.20 10.20.0.21}" NCS_PLATFORM_URL=https://agent.example sh "$here/bootstrap.sh" nuit-cloud-vlan ${1:+"$1"}; }
+# in_service <interface> [own address] [tenant addresses]: a VLAN an agent before #197 set up, at /24, with a tenant address the
+# tenant-address task added (10.20.0.40, a line in the file and live) and the pod routing
+in_service() {
+  (TVIF="$1"; vlan_net)
+  (TENANTS="${3-10.20.0.19 10.20.0.20 10.20.0.21}"; OWN="${2:-10.20.0.18}"; PFX=24; vlan16) >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "in-service setup on $1"; }
+  # (an agent before #197 wrote no promote_secondaries line, and the machine has it off)
+  sed -i.bak '/promote_secondaries/d' "$f"; echo 0 >"$ROOT/proc/sys/net/ipv4/conf/$1/promote_secondaries"
+  awk -v v="$1" '/ip addr add / {last = NR} {line[NR] = $0} END {for (i = 1; i <= NR; i++) {print line[i]; if (i == last) printf "    post-up ip addr add 10.20.0.40/24 dev %s 2>/dev/null || true\n", v}}' "$f" >"$f.new"; mv "$f.new" "$f"
+  netmodel add 10.20.0.40/24 "$1"; : >"$CALLS"; rm -f "$STATE/gaps"
+  cp "$f" "$tmp/svc.file"; sort "$STATE/ip-addrs" >"$tmp/svc.addrs"; sort "$STATE/ip-routes" >"$tmp/svc.routes"
+}
+vif_addrs() { awk -v v="$1" '$1 == v {print $2}' "$STATE/ip-addrs" | sort | tr '\n' ' '; }
+line_of() { grep -n -- "$1" "$CALLS" | head -n 1 | cut -d: -f1; }
+for V in eth0.5 vlan5; do
+  in_service "$V"
+  [ "$(vif_addrs "$V")" = "10.20.0.18/24 10.20.0.19/24 10.20.0.20/24 10.20.0.21/24 10.20.0.40/24 " ] && grep -qx "10.20.0.0/24 dev $V proto kernel scope link src 10.20.0.18" "$STATE/ip-routes" || { cat "$STATE/ip-addrs" "$STATE/ip-routes"; bad "the in-service fixture on $V"; }
+  vlan16 --check >"$tmp/out" 2>&1 && bad "a VLAN with the old own address and prefix passed the check ($V)"
+  grep -q 'DRIFT   ncs_vlan' "$tmp/out" && [ ! -s "$CALLS" ] || { cat "$tmp/out"; bad "renumber check ($V)"; }
+  echo "10.20.0.19 10.20.0.20 10.20.0.21 10.20.0.40" >"$STATE/watch"
+  vlan16 >"$tmp/out" 2>&1 || { cat "$tmp/out"; cat "$CALLS"; bad "renumbering a VLAN in service ($V)"; }
+  grep -q 'done    ncs_vlan' "$tmp/out" && ! grep -q '^ifup\|^ifdown\|ip link' "$CALLS" \
+    && [ "$(vif_addrs "$V")" = "10.20.0.19/16 10.20.0.20/16 10.20.0.21/16 10.20.0.40/16 10.20.255.18/16 " ] \
+    && grep -qx "10.20.0.0/16 dev $V proto kernel scope link src 10.20.255.18" "$STATE/ip-routes" && ! grep -q "^10.20.0.0/24 dev $V " "$STATE/ip-routes" \
+    && grep -qx "default via 10.20.0.1 dev $V" "$STATE/ip-t105" && [ ! -s "$STATE/gaps" ] \
+    && ok "ncs_vlan ($V): a VLAN in service moves to its new own address and /16 as it runs, with no ifdown or ifup, the connected route from the new own address and table 105 by the gateway" \
+    || { cat "$tmp/out"; cat "$CALLS"; cat "$STATE/ip-addrs" "$STATE/ip-routes" "$STATE/gaps" 2>/dev/null; bad "renumber live ($V)"; }
+  grep -qx '    address 10.20.255.18/16' "$f" && [ "$(grep -o 'ip addr add [0-9.]*/[0-9]*' "$f" | awk '{print $4}' | tr '\n' ' ')" = "10.20.0.19/16 10.20.0.20/16 10.20.0.21/16 10.20.0.40/16 " ] \
+    && grep -q "pre-up sysctl -qw net.ipv4.conf.$(echo "$V" | tr . /).promote_secondaries=1" "$f" \
+    && ok "ncs_vlan ($V): the file says the new own address and /16 for the next boot, and the tenant-address task's line has the new prefix too" || { cat "$f"; bad "renumber file ($V)"; }
+  add_own="$(line_of "^ip addr add 10.20.255.18/16 dev $V\$")"; add_t="$(line_of "^ip addr add 10.20.0.19/16 dev $V\$")"; del_t="$(line_of "^ip addr del 10.20.0.19/24 dev $V\$")"
+  proof="$(line_of '^curl ')"; del_own="$(line_of "^ip addr del 10.20.0.18/24 dev $V\$")"
+  [ -n "$add_own" ] && [ -n "$del_own" ] && [ "$add_own" -lt "$add_t" ] && [ "$add_t" -lt "$del_t" ] && [ "$del_t" -lt "$proof" ] && [ "$proof" -lt "$del_own" ] \
+    && grep -q "sysctl -qw net.ipv4.conf.$(echo "$V" | tr . /).promote_secondaries=1" "$CALLS" \
+    && ok "ncs_vlan ($V): the order: the new own address first, each tenant address with /16 before its /24 goes (never missing), the old own address only after the platform answered" \
+    || { cat "$CALLS"; bad "renumber order ($V)"; }
+  [ "$(route_of pod)" = 105 ] && [ "$(route_of eth0)" = main ] && [ "$(route_of "$V")" = 105 ] && ok "ncs_vlan ($V): pods still leave by table 105, replies on the management interface by the main table" || bad "renumber pod routing ($V)"
+  : >"$CALLS"; vlan16 >"$tmp/out" 2>&1 && vlan16 --check >/dev/null 2>&1 && [ ! -s "$CALLS" ] && ok "ncs_vlan ($V): after the renumbering --check is clean and a second run changes nothing" || { cat "$tmp/out"; cat "$CALLS"; bad "renumber idempotent ($V)"; }
+done
+
+# the Ingress Service machine: its old own address 10.20.0.34 stays, now a tenant address with /16; it is never missing
+in_service eth0.5 10.20.0.34 "10.20.0.3"
+echo "10.20.0.34 10.20.0.3 10.20.0.40" >"$STATE/watch"
+(OWN=10.20.255.34; TENANTS="10.20.0.34 10.20.0.3"; vlan16) >"$tmp/out" 2>&1 || { cat "$tmp/out"; cat "$CALLS"; bad "renumbering the ingress machine"; }
+grep -q 'done    ncs_vlan' "$tmp/out" && [ "$(vif_addrs eth0.5)" = "10.20.0.3/16 10.20.0.34/16 10.20.0.40/16 10.20.255.34/16 " ] && [ ! -s "$STATE/gaps" ] \
+  && grep -qx '10.20.0.0/16 dev eth0.5 proto kernel scope link src 10.20.255.34' "$STATE/ip-routes" && ! grep -q '^10.20.0.0/24 ' "$STATE/ip-routes" \
+  && grep -qx '    address 10.20.255.34/16' "$f" && grep -q 'post-up ip addr add 10.20.0.34/16 dev eth0.5' "$f" && ! grep -q '/24' "$f" \
+  && ! grep -q '^ip addr del 10.20.0.34/16' "$CALLS" && [ "$(line_of '^ip addr add 10.20.0.34/16')" -lt "$(line_of '^ip addr del 10.20.0.34/24')" ] \
+  && (OWN=10.20.255.34; TENANTS="10.20.0.34 10.20.0.3"; vlan16 --check >/dev/null 2>&1) \
+  && ok "ncs_vlan: on the Ingress Service machine the old own address 10.20.0.34 is kept as a tenant address, moved to /16 without ever being missing" \
+  || { cat "$tmp/out"; cat "$CALLS"; cat "$STATE/ip-addrs" "$STATE/ip-routes" "$STATE/gaps" "$f" 2>/dev/null; bad "renumber ingress"; }
+
+# only the prefix changes (the own address stays): the own address and every tenant address move to /16 as they run
+in_service eth0.5; echo "10.20.0.18 10.20.0.19 10.20.0.20 10.20.0.21 10.20.0.40" >"$STATE/watch"
+(OWN=10.20.0.18; vlan16 --check >/dev/null 2>&1) && bad "a prefix change alone passed the check"
+(OWN=10.20.0.18; vlan16) >"$tmp/out" 2>&1 && [ "$(vif_addrs eth0.5)" = "10.20.0.18/16 10.20.0.19/16 10.20.0.20/16 10.20.0.21/16 10.20.0.40/16 " ] && [ ! -s "$STATE/gaps" ] \
+  && grep -qx '10.20.0.0/16 dev eth0.5 proto kernel scope link src 10.20.0.18' "$STATE/ip-routes" && ! grep -q '^ifup\|^ifdown' "$CALLS" && (OWN=10.20.0.18; vlan16 --check >/dev/null 2>&1) \
+  && ok "ncs_vlan: a prefix change alone (/24 to /16) moves the own address and the tenant addresses as they run, none ever missing" || { cat "$tmp/out"; cat "$CALLS"; cat "$STATE/ip-addrs" "$STATE/gaps" 2>/dev/null; bad "prefix change only"; }
+
+# promote_secondaries cannot be turned on: the order alone keeps every tenant address (a network's secondaries go before its primary)
+in_service eth0.5; touch "$STATE/no-promote"; echo "10.20.0.19 10.20.0.20 10.20.0.21 10.20.0.40" >"$STATE/watch"
+vlan16 >"$tmp/out" 2>&1 && [ "$(vif_addrs eth0.5)" = "10.20.0.19/16 10.20.0.20/16 10.20.0.21/16 10.20.0.40/16 10.20.255.18/16 " ] && [ ! -s "$STATE/gaps" ] \
+  && ok "ncs_vlan: with promote_secondaries off, no tenant address is lost either: secondaries go before their primary" || { cat "$tmp/out"; cat "$CALLS"; cat "$STATE/ip-addrs" "$STATE/gaps" 2>/dev/null; bad "renumber without promote"; }
+rm -f "$STATE/no-promote"
+
+# the platform cannot be reached after the change: everything comes back as it was, the VLAN never taken down, no tenant address missing
+in_service eth0.5; touch "$STATE/curl-fail"; echo "10.20.0.19 10.20.0.20 10.20.0.21 10.20.0.40" >"$STATE/watch"
+vlan16 >"$tmp/out" 2>&1 && bad "an unproved renumbering was kept"
+grep -q 'FAILED  ncs_vlan' "$tmp/out" && grep -q 'platform could not be reached after the change' "$tmp/out" && cmp -s "$f" "$tmp/svc.file" \
+  && [ "$(sort "$STATE/ip-addrs")" = "$(cat "$tmp/svc.addrs")" ] && [ "$(sort "$STATE/ip-routes")" = "$(cat "$tmp/svc.routes")" ] && [ ! -s "$STATE/gaps" ] \
+  && ! grep -q '^ifup\|^ifdown\|ip link del' "$CALLS" && [ "$(cat "$ROOT/proc/sys/net/ipv4/conf/eth0.5/promote_secondaries")" = 0 ] && ! grep -q '^ip addr del 10.20.0.18/24' "$CALLS" \
+  && grep -qx 'default via 10.20.0.1 dev eth0.5' "$STATE/ip-t105" \
+  && ok "ncs_vlan: a renumbering that cannot be proved is undone as it runs: the old addresses and prefixes, routes, file and promote_secondaries come back, the old own address was never removed, no ifdown" \
+  || { cat "$tmp/out"; cat "$CALLS"; diff "$tmp/svc.file" "$f"; sort "$STATE/ip-addrs" | diff "$tmp/svc.addrs" -; sort "$STATE/ip-routes" | diff "$tmp/svc.routes" -; cat "$STATE/gaps" 2>/dev/null; bad "renumber rollback"; }
+rm -f "$STATE/curl-fail"
+# the platform answers until the old own address goes, then not: it comes back with everything else
+stub curl 'n="$(cat "$STATE/curl-ok" 2>/dev/null || echo 99)"; [ "$n" -gt 0 ] || exit 22; echo $((n - 1)) >"$STATE/curl-ok"; echo "curl $*" >>"$CALLS"'
+in_service eth0.5; echo 1 >"$STATE/curl-ok"; echo "10.20.0.19 10.20.0.20 10.20.0.21 10.20.0.40" >"$STATE/watch"
+vlan16 >"$tmp/out" 2>&1 && bad "a renumbering that lost the platform with the old own address was kept"
+grep -q 'once the old addresses were removed' "$tmp/out" && grep -q '^ip addr del 10.20.0.18/24' "$CALLS" && cmp -s "$f" "$tmp/svc.file" \
+  && [ "$(sort "$STATE/ip-addrs")" = "$(cat "$tmp/svc.addrs")" ] && grep -qx '10.20.0.0/24 dev eth0.5 proto kernel scope link src 10.20.0.18' "$STATE/ip-routes" && ! grep -q '^10.20.0.0/16' "$STATE/ip-routes" \
+  && [ ! -s "$STATE/gaps" ] && ! grep -q '^ifup\|^ifdown\|ip link del' "$CALLS" \
+  && ok "ncs_vlan: when the platform is lost once the old own address is removed, it all comes back: the old own address as the primary again, the /24 addresses and route" \
+  || { cat "$tmp/out"; cat "$CALLS"; sort "$STATE/ip-addrs" | diff "$tmp/svc.addrs" -; cat "$STATE/ip-routes" "$STATE/gaps" 2>/dev/null; bad "renumber rollback after the old address"; }
+rm -f "$STATE/curl-ok"; stub curl '[ ! -e "$STATE/curl-fail" ] && echo "curl $*" >>"$CALLS"'
+
+# drift on a renumbered VLAN: an old prefix left in the file or live, the old own address left live, a tenant as the route's source
+in_service eth0.5; vlan16 >/dev/null 2>&1 && vlan16 --check >/dev/null 2>&1 || bad "renumbered fixture"
+cp "$f" "$tmp/r.file"; cp "$STATE/ip-addrs" "$tmp/r.addrs"; cp "$STATE/ip-routes" "$tmp/r.routes"
+back() { cp "$tmp/r.file" "$f"; cp "$tmp/r.addrs" "$STATE/ip-addrs"; cp "$tmp/r.routes" "$STATE/ip-routes"; : >"$CALLS"; }
+back; sed -i.bak 's#10.20.0.40/16#10.20.0.40/24#' "$f"; vlan16 --check >/dev/null 2>&1 && bad "a tenant line with the old prefix passed the check"
+vlan16 >/dev/null 2>&1 && grep -q 'ip addr add 10.20.0.40/16 dev' "$f" && vlan16 --check >/dev/null 2>&1 || bad "a tenant line with the old prefix was not put right"
+back; sed -i.bak 's#10.20.0.20/16#10.20.0.20/24#' "$f"; vlan16 --check >/dev/null 2>&1 && bad "a given tenant line with the old prefix passed the check"
+back; netmodel add 10.20.0.19/24 eth0.5; vlan16 --check >/dev/null 2>&1 && bad "a tenant address also live with the old prefix passed the check"
+vlan16 >/dev/null 2>&1 && [ "$(vif_addrs eth0.5)" = "10.20.0.19/16 10.20.0.20/16 10.20.0.21/16 10.20.0.40/16 10.20.255.18/16 " ] && vlan16 --check >/dev/null 2>&1 || { cat "$STATE/ip-addrs"; bad "an old prefix left live was not taken away"; }
+back; netmodel add 10.20.0.18/24 eth0.5; vlan16 --check >/dev/null 2>&1 && bad "the old own address left live passed the check"
+vlan16 >/dev/null 2>&1 && ! grep -q '10.20.0.18/' "$STATE/ip-addrs" && vlan16 --check >/dev/null 2>&1 || { cat "$STATE/ip-addrs"; bad "the old own address left live was not taken away"; }
+back; sed -i.bak 's#^10.20.0.0/16 dev eth0.5 proto kernel scope link src .*#10.20.0.0/16 dev eth0.5 proto kernel scope link src 10.20.0.19#' "$STATE/ip-routes"; vlan16 --check >/dev/null 2>&1 && bad "a tenant address as the connected route's source passed the check"
+vlan16 >/dev/null 2>&1 && grep -qx 'ip route replace 10.20.0.0/16 dev eth0.5 proto kernel scope link src 10.20.255.18' "$CALLS" && grep -qx '10.20.0.0/16 dev eth0.5 proto kernel scope link src 10.20.255.18' "$STATE/ip-routes" && vlan16 --check >/dev/null 2>&1 \
+  || { cat "$CALLS" "$STATE/ip-routes"; bad "the connected route's source was not put right"; }
+back; (OWN=10.20.255.19; vlan16 --check >/dev/null 2>&1) && bad "another own address passed the check"
+back; (PFX=17; vlan16 --check >/dev/null 2>&1) && bad "another prefix passed the check"
+ok "ncs_vlan: drift is an old prefix in the file or live, the old own address live, a tenant address as the route's source, another own address or prefix; an apply puts each right"
+
+# what does not fit one network is refused before anything changes: a tenant address or the gateway outside it, the own address as a tenant
+in_service eth0.5
+for bad_slice in "TENANTS=10.21.0.3" "TENANTS=10.20.255.18" "OWN=10.21.255.18" "PFX=31" "PFX=8"; do
+  (export "$bad_slice"; vlan16) >"$tmp/out" 2>&1 && bad "the slice $bad_slice was accepted"
+  grep -q 'MANUAL  ncs_vlan' "$tmp/out" && [ ! -s "$CALLS" ] && cmp -s "$f" "$tmp/svc.file" || { cat "$tmp/out"; bad "the slice $bad_slice changed something"; }
+done
+ok "ncs_vlan: a slice that is not one network (a tenant address or gateway outside it, the own address also a tenant, a prefix outside 16-30) changes nothing"
+rm -f "$STATE/watch" "$STATE/gaps"
 
 # 11. ncs_ssh_harden: passwords and root login off only when a key the platform names can still get in, with a timer until confirmed
 ssh-keygen -q -t ed25519 -N '' -C test-admin -f "$tmp/adminkey" && FP="$(ssh-keygen -lf "$tmp/adminkey.pub" | awk '{print $2}')"
