@@ -341,7 +341,7 @@ fi
 case "$1 ${2:-}" in
   "rule add")
     echo "ip $*" >>"$CALLS"; shift 2; r="$*"; pr="${r##* priority }"; sel="${r% priority *}"
-    grep -Fqx ocisaas0 "$STATE/ip-links" || sel="$(printf '%s\n' "$sel" | sed 's/^iif ocisaas0 /iif ocisaas0 [detached] /')"
+    grep -Fqx ocisaas0 "$STATE/ip-links" || sel="$(printf '%s\n' "$sel" | sed 's/iif ocisaas0 /iif ocisaas0 [detached] /')"
     printf '%s:\tfrom all %s\n' "$pr" "$sel" >>"$STATE/ip-rules" ;;
   "rule del")
     echo "ip $*" >>"$CALLS"; shift 2; r="$*"; sel="${r% priority *}"
@@ -365,7 +365,7 @@ case "$op" in
 esac
 IPTSTUB
 chmod +x "$tmp/bin/iptables"
-# the pod routing items (nuit-cloud/nuit-cloud#197) in place: the three policy rules and the two mangle rules
+# the pod routing items (nuit-cloud/nuit-cloud#197) in place: the four policy rules and the two mangle rules
 routing_items() { echo $(( $(grep -c 'iif ocisaas0\|fwmark 0x31' "$STATE/ip-rules" || true) + $(grep -c '0x31' "$STATE/iptables" 2>/dev/null || true) )); }
 pod_rules() { grep -c 'iif ocisaas0' "$STATE/ip-rules" || true; }
 # pod_persist <management interface>: the items as a hand-made VLAN file would carry them; pod_live <management interface>: in place
@@ -373,20 +373,25 @@ pod_persist() {
   printf '    post-up iptables -t mangle -A PREROUTING -i %s -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x31\n' "$1"
   printf '    post-up iptables -t mangle -A PREROUTING -i ocisaas0 -m connmark --mark 0x31 -j CONNMARK --restore-mark\n'
   printf '    post-up ip rule add fwmark 0x31 lookup main priority 1030\n'
-  printf '    post-up ip rule add iif ocisaas0 lookup main suppress_prefixlength 0 priority 1040 2>/dev/null || true\n'
+  printf '    post-up ip rule add to 10.89.0.0/16 iif ocisaas0 lookup main priority 1040 2>/dev/null || true\n'
+  printf '    post-up ip rule add to 10.20.0.0/24 iif ocisaas0 lookup main priority 1041 2>/dev/null || true\n'
   printf '    post-up ip rule add iif ocisaas0 lookup 105 priority 1045 2>/dev/null || true\n'
 }
 pod_live() {
-  printf '1030:\tfrom all fwmark 0x31 lookup main\n1040:\tfrom all iif ocisaas0 [detached] lookup main suppress_prefixlength 0\n1045:\tfrom all iif ocisaas0 [detached] lookup 105\n' >>"$STATE/ip-rules"
+  printf '1030:\tfrom all fwmark 0x31 lookup main\n1040:\tfrom all to 10.89.0.0/16 iif ocisaas0 [detached] lookup main\n1041:\tfrom all to 10.20.0.0/24 iif ocisaas0 [detached] lookup main\n1045:\tfrom all iif ocisaas0 [detached] lookup 105\n' >>"$STATE/ip-rules"
   printf '%s\n' "-i $1 -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x31" "-i ocisaas0 -m connmark --mark 0x31 -j CONNMARK --restore-mark" >>"$STATE/iptables"
 }
-# route_of <interface a connection arrived on | pod>: the routing table a packet coming from a pod on ocisaas0, to an address outside
-# every connected subnet, is routed by: a reply to a connection that arrived on that interface (after DNAT to the pod), or, for "pod",
-# traffic the pod started. A small model of the kernel over the stubs' state: the connection's CONNMARK (set-mark rules, on its first
-# packet), the packet mark (restore-mark rules, on the packet from ocisaas0), then the policy rules by priority (local and default
-# never hold such an address; the main table with suppress_prefixlength 0 is passed over, its only route for it being the default).
+# route_of <interface a connection arrived on | pod> [destination]: the routing table a packet coming from a pod on ocisaas0 is routed
+# by: a reply to a connection that arrived on that interface (after DNAT to the pod), or, for "pod", traffic the pod started. With no
+# destination it goes to an address outside every connected network; a destination given is one inside a connected network (the
+# management VLAN's, the tenant VLAN's, the pods' own). A small model of the kernel over the stubs' state: the connection's CONNMARK
+# (set-mark rules, on its first packet), the packet mark (restore-mark rules, on the packet from ocisaas0), then the policy rules by
+# priority (local and default never hold such an address; a "to" rule matches only a destination inside its network; the main table
+# with suppress_prefixlength 0 is passed over for an address outside every connected network, and used for one inside).
 route_of() {
-  awk -v arr="$1" -v ipt="$STATE/iptables" '
+  awk -v arr="$1" -v dst="${2:-}" -v ipt="$STATE/iptables" '
+    function num(a,  o) { split(a, o, "."); return ((o[1] * 256 + o[2]) * 256 + o[3]) * 256 + o[4] }
+    function inside(a, net,  b) { b = 2 ^ (32 - substr(net, index(net, "/") + 1)); return int(num(a) / b) == int(num(substr(net, 1, index(net, "/") - 1)) / b) }
     FILENAME == ipt { T[++nt] = $0; next }
     { l = $0; sub(/ \[detached\]/, "", l); pr = substr(l, 1, index(l, ":") - 1) + 0; R[pr] = substr(l, index(l, ":") + 1); P[++np] = pr }
     END {
@@ -397,11 +402,12 @@ route_of() {
         for (j = 1; j <= n; j++) if (w[j] == "--mark") m = w[j + 1]
         if (T[i] ~ /--restore-mark/ && cm != "" && m == cm && ((!neg && ifc == "ocisaas0") || (neg && ifc != "ocisaas0"))) fw = cm }
       for (i = 1; i <= np; i++) for (j = i + 1; j <= np; j++) if (P[j] < P[i]) { t = P[i]; P[i] = P[j]; P[j] = t }
-      for (i = 1; i <= np; i++) { k = split(R[P[i]], w, " "); iif = ""; fm = ""; tb = ""; sup = 0
-        for (j = 1; j <= k; j++) { if (w[j] == "iif") iif = w[j + 1]; if (w[j] == "fwmark") fm = w[j + 1]; if (w[j] == "lookup") tb = w[j + 1]; if (w[j] == "suppress_prefixlength") sup = 1 }
+      for (i = 1; i <= np; i++) { k = split(R[P[i]], w, " "); iif = ""; fm = ""; tb = ""; sup = 0; to = ""
+        for (j = 1; j <= k; j++) { if (w[j] == "iif") iif = w[j + 1]; if (w[j] == "fwmark") fm = w[j + 1]; if (w[j] == "lookup") tb = w[j + 1]; if (w[j] == "suppress_prefixlength") sup = 1; if (w[j] == "to") to = w[j + 1] }
         if (iif != "" && iif != "ocisaas0") continue
         if (fm != "" && fm != fw) continue
-        if (tb == "local" || tb == "default" || (tb == "main" && sup)) continue
+        if (to != "" && (dst == "" || !inside(dst, to))) continue
+        if (tb == "local" || tb == "default" || (tb == "main" && sup && dst == "")) continue
         print tb; exit }
       print "main"
     }' "$STATE/iptables" "$STATE/ip-rules"
@@ -627,25 +633,31 @@ grep -q 'done    ncs_vlan' "$tmp/out" && grep -q '^iface eth0.5 inet static$' "$
   && grep -q 'ip rule add fwmark 0x5 lookup 105' "$f" && grep -q 'ip route replace default via 10.20.0.1 dev eth0.5 table 105' "$f" && grep -qx '8021q' "$ROOT/etc/modules-load.d/8021q.conf" \
   && grep -q 'systemd-run.*nuit-cloud-vlan-rollback' "$CALLS" && grep -q 'ifup eth0.5' "$CALLS" && grep -q 'systemctl stop nuit-cloud-vlan-rollback.timer' "$CALLS" && grep -qx 'eth0 10.10.10.170/24' "$STATE/ip-addrs" && grep -qx 'eth0.5 10.20.0.19/24' "$STATE/ip-addrs" \
   && grep -q 'VLAN gateway 10.20.0.1 answers' "$tmp/out" && ok "ncs_vlan: the sub-interface is written like server-vlan5.sh, brought up, the machine's own address untouched, the timer cancelled" || { cat "$tmp/out"; cat "$f"; cat "$CALLS"; bad "vlan apply result"; }
-# pod routing (nuit-cloud/nuit-cloud#197): traffic pods start goes by the tenant VLAN (rules 1040, 1045), replies to connections that
+# pod routing (nuit-cloud/nuit-cloud#197): pods reach their own range and the tenant VLAN directly (1040, 1041) and nothing else of the
+# main table; everything else they start goes by the tenant VLAN (1045); replies to connections that
 # arrived on the management interface go back by the main table (mark 0x31, rule 1030), replies to ones that arrived on the tenant VLAN
 # by the tenant VLAN (mark 0x5); in the file for boot, and in place now even though ocisaas0 does not exist yet (the runtime may come later)
 grep -qxF "    post-up iptables -t mangle -C PREROUTING -i eth0 -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x31 2>/dev/null || iptables -t mangle -A PREROUTING -i eth0 -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x31" "$f" \
   && grep -qxF "    post-up iptables -t mangle -C PREROUTING -i ocisaas0 -m connmark --mark 0x31 -j CONNMARK --restore-mark 2>/dev/null || iptables -t mangle -A PREROUTING -i ocisaas0 -m connmark --mark 0x31 -j CONNMARK --restore-mark" "$f" \
   && grep -qxF "    post-up ip -4 rule show | grep -Ewq 'fwmark 0x31 lookup main' || ip rule add fwmark 0x31 lookup main priority 1030" "$f" \
-  && grep -qxF "    post-up ip -4 rule show | grep -Ewq 'iif ocisaas0 ([[]detached[]] )?lookup main suppress_prefixlength 0' || ip rule add iif ocisaas0 lookup main suppress_prefixlength 0 priority 1040" "$f" \
+  && grep -qxF "    post-up ip -4 rule show | grep -Ewq 'to 10\.89\.0\.0/16 iif ocisaas0 ([[]detached[]] )?lookup main' || ip rule add to 10.89.0.0/16 iif ocisaas0 lookup main priority 1040" "$f" \
+  && grep -qxF "    post-up ip -4 rule show | grep -Ewq 'to 10\.20\.0\.0/24 iif ocisaas0 ([[]detached[]] )?lookup main' || ip rule add to 10.20.0.0/24 iif ocisaas0 lookup main priority 1041" "$f" \
   && grep -qxF "    post-up ip -4 rule show | grep -Ewq 'iif ocisaas0 ([[]detached[]] )?lookup 105' || ip rule add iif ocisaas0 lookup 105 priority 1045" "$f" \
-  && grep -qx '    pre-down ip rule del iif ocisaas0 lookup 105 2>/dev/null || true' "$f" && grep -qx '    pre-down ip rule del iif ocisaas0 lookup main suppress_prefixlength 0 2>/dev/null || true' "$f" \
+  && grep -qx '    pre-down ip rule del iif ocisaas0 lookup 105 2>/dev/null || true' "$f" && grep -qx '    pre-down ip rule del to 10.89.0.0/16 iif ocisaas0 lookup main 2>/dev/null || true' "$f" \
+  && grep -qx '    pre-down ip rule del to 10.20.0.0/24 iif ocisaas0 lookup main 2>/dev/null || true' "$f" && ! grep -q suppress_prefixlength "$f" \
   && grep -qx '    pre-down ip rule del fwmark 0x31 lookup main 2>/dev/null || true' "$f" \
   && grep -qx '    pre-down iptables -t mangle -D PREROUTING -i eth0 -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x31 2>/dev/null || true' "$f" \
   && grep -qx '    pre-down iptables -t mangle -D PREROUTING -i ocisaas0 -m connmark --mark 0x31 -j CONNMARK --restore-mark 2>/dev/null || true' "$f" \
-  && grep -qxF "$(printf '1040:\tfrom all iif ocisaas0 [detached] lookup main suppress_prefixlength 0')" "$STATE/ip-rules" && grep -qxF "$(printf '1045:\tfrom all iif ocisaas0 [detached] lookup 105')" "$STATE/ip-rules" \
-  && grep -qxF "$(printf '1030:\tfrom all fwmark 0x31 lookup main')" "$STATE/ip-rules" && [ "$(routing_items)" = 5 ] \
-  && ok "ncs_vlan: the pod routing rules (1030 with mark 0x31 on eth0, 1040, 1045) are in the file and in place, before the bridge exists" || { cat "$f"; cat "$STATE/ip-rules" "$STATE/iptables"; bad "vlan pod rules"; }
+  && grep -qxF "$(printf '1040:\tfrom all to 10.89.0.0/16 iif ocisaas0 [detached] lookup main')" "$STATE/ip-rules" \
+  && grep -qxF "$(printf '1041:\tfrom all to 10.20.0.0/24 iif ocisaas0 [detached] lookup main')" "$STATE/ip-rules" && ! grep -q suppress_prefixlength "$STATE/ip-rules" && grep -qxF "$(printf '1045:\tfrom all iif ocisaas0 [detached] lookup 105')" "$STATE/ip-rules" \
+  && grep -qxF "$(printf '1030:\tfrom all fwmark 0x31 lookup main')" "$STATE/ip-rules" && [ "$(routing_items)" = 6 ] \
+  && ok "ncs_vlan: the pod routing rules (1030 with mark 0x31 on eth0, 1040 to the pods' range, 1041 to the tenant VLAN, 1045) are in the file and in place, before the bridge exists" || { cat "$f"; cat "$STATE/ip-rules" "$STATE/iptables"; bad "vlan pod rules"; }
 [ "$(route_of eth0)" = main ] && ok "ncs_vlan: a reply from a pod to a connection that arrived on the management interface goes back by the main table" || bad "management reply by $(route_of eth0)"
 [ "$(route_of eth0.5)" = 105 ] && ok "ncs_vlan: a reply from a pod to a connection that arrived on the tenant VLAN still goes by table 105 (mark 0x5)" || bad "tenant VLAN reply by $(route_of eth0.5)"
 [ "$(route_of pod)" = 105 ] && ok "ncs_vlan: traffic a pod starts goes by table 105, the tenant VLAN gateway" || bad "pod traffic by $(route_of pod)"
-: >"$CALLS"; vlan_run >"$tmp/out" 2>&1 && vlan_run --check >/dev/null 2>&1 && [ ! -s "$CALLS" ] && [ "$(routing_items)" = 5 ] && ok "ncs_vlan: a second run is a no-op and --check is clean" || { cat "$tmp/out"; cat "$CALLS"; bad "vlan idempotent"; }
+[ "$(route_of pod 10.89.0.9)" = main ] && [ "$(route_of pod 10.20.0.50)" = main ] && ok "ncs_vlan: pods reach their own range and the tenant VLAN directly, by the main table" || bad "pod to its own range by $(route_of pod 10.89.0.9), to the tenant VLAN by $(route_of pod 10.20.0.50)"
+[ "$(route_of pod 10.10.10.11)" = 105 ] && ok "ncs_vlan: a pod never reaches the management network directly (another machine's management address goes by the tenant VLAN gateway)" || bad "a pod reaches the management network by $(route_of pod 10.10.10.11)"
+: >"$CALLS"; vlan_run >"$tmp/out" 2>&1 && vlan_run --check >/dev/null 2>&1 && [ ! -s "$CALLS" ] && [ "$(routing_items)" = 6 ] && ok "ncs_vlan: a second run is a no-op and --check is clean" || { cat "$tmp/out"; cat "$CALLS"; bad "vlan idempotent"; }
 # a machine in service (#197): the VLAN is up with its tenant addresses, and the file and the kernel lack the routing items (an older agent)
 cp "$f" "$tmp/vlan5.full"; cp "$STATE/ip-rules" "$tmp/rules.full"; cp "$STATE/iptables" "$tmp/ipt.full"
 old_agent() { cp "$tmp/vlan5.full" "$f"; sed -i.bak '/iif ocisaas0/d;/0x31/d' "$f" "$STATE/ip-rules" "$STATE/iptables"; : >"$CALLS"; rm -f "$STATE/curl-fail"; }
@@ -653,11 +665,11 @@ old_agent
 [ "$(route_of pod)" = main ] && [ "$(route_of eth0.5)" = 105 ] || bad "the older agent's routing is not what #197 found"
 vlan_run --check >"$tmp/out" 2>&1 && bad "a VLAN without the pod routing passed the check"
 grep -q 'DRIFT   ncs_vlan' "$tmp/out" && [ ! -s "$CALLS" ] && ok "ncs_vlan: a VLAN without the pod routing (an older agent: pods leave by the management network) is drift, and the check changes nothing" || { cat "$tmp/out"; cat "$CALLS"; bad "vlan check pod rules"; }
-for item in 'lookup 105 priority 1045' 'suppress_prefixlength 0 priority 1040' 'lookup main priority 1030' 'set-mark 0x31' 'restore-mark$'; do
+for item in 'lookup 105 priority 1045' 'lookup main priority 1040' 'lookup main priority 1041' 'lookup main priority 1030' 'set-mark 0x31' 'restore-mark$'; do
   cp "$tmp/vlan5.full" "$f"; cp "$tmp/rules.full" "$STATE/ip-rules"; cp "$tmp/ipt.full" "$STATE/iptables"; sed -i.bak "/$item/d" "$f"
   vlan_run --check >/dev/null 2>&1 && bad "the item '$item' missing from the file passed the check"
 done
-for item in 'lookup 105$' 'suppress_prefixlength' 'fwmark 0x31'; do
+for item in 'lookup 105$' 'to 10.89.0.0' 'to 10.20.0.0' 'fwmark 0x31'; do
   cp "$tmp/vlan5.full" "$f"; cp "$tmp/rules.full" "$STATE/ip-rules"; cp "$tmp/ipt.full" "$STATE/iptables"; sed -i.bak "/$item/d" "$STATE/ip-rules"
   vlan_run --check >/dev/null 2>&1 && bad "the rule '$item' missing from the kernel passed the check"
 done
@@ -669,16 +681,17 @@ ok "ncs_vlan: any routing item missing, in place or in the file, is drift"
 old_agent; before_addrs="$(sort "$STATE/ip-addrs")"
 vlan_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; cat "$CALLS"; bad "vlan apply on an up VLAN"; }
 grep -q 'done    ncs_vlan' "$tmp/out" && ! grep -q '^ifup\|^ifdown\|ip link' "$CALLS" && [ "$(sort "$STATE/ip-addrs")" = "$before_addrs" ] \
-  && grep -qx 'ip rule add iif ocisaas0 lookup main suppress_prefixlength 0 priority 1040' "$CALLS" && grep -qx 'ip rule add iif ocisaas0 lookup 105 priority 1045' "$CALLS" \
+  && grep -qx 'ip rule add to 10.89.0.0/16 iif ocisaas0 lookup main priority 1040' "$CALLS" && grep -qx 'ip rule add to 10.20.0.0/24 iif ocisaas0 lookup main priority 1041' "$CALLS" \
+  && grep -qx 'ip rule add iif ocisaas0 lookup 105 priority 1045' "$CALLS" \
   && grep -qx 'ip rule add fwmark 0x31 lookup main priority 1030' "$CALLS" && grep -qx 'iptables -t mangle -A PREROUTING -i eth0 -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x31' "$CALLS" \
   && grep -qx 'iptables -t mangle -A PREROUTING -i ocisaas0 -m connmark --mark 0x31 -j CONNMARK --restore-mark' "$CALLS" \
-  && cmp -s "$f" "$tmp/vlan5.full" && grep -q 'systemctl stop nuit-cloud-vlan-rollback.timer' "$CALLS" && grep -q 'eth0.5 was up already and was left up; added as it runs: 5 pod routing item' "$tmp/out" && vlan_run --check >/dev/null 2>&1 \
+  && cmp -s "$f" "$tmp/vlan5.full" && grep -q 'systemctl stop nuit-cloud-vlan-rollback.timer' "$CALLS" && grep -q 'eth0.5 was up already and was left up; added as it runs: 6 pod routing item' "$tmp/out" && vlan_run --check >/dev/null 2>&1 \
   && [ "$(route_of eth0)" = main ] && [ "$(route_of eth0.5)" = 105 ] && [ "$(route_of pod)" = 105 ] \
   && ok "ncs_vlan: on a VLAN that is up, the routing items are added as it runs and the file rewritten, with no ifdown or ifup and every address kept" || { cat "$tmp/out"; cat "$CALLS"; diff "$tmp/vlan5.full" "$f"; bad "vlan live pod rules"; }
-: >"$CALLS"; vlan_run >/dev/null 2>&1 && [ ! -s "$CALLS" ] && [ "$(routing_items)" = 5 ] && ok "ncs_vlan: run again, nothing is added twice" || { cat "$CALLS"; cat "$STATE/ip-rules" "$STATE/iptables"; bad "vlan live idempotent"; }
+: >"$CALLS"; vlan_run >/dev/null 2>&1 && [ ! -s "$CALLS" ] && [ "$(routing_items)" = 6 ] && ok "ncs_vlan: run again, nothing is added twice" || { cat "$CALLS"; cat "$STATE/ip-rules" "$STATE/iptables"; bad "vlan live idempotent"; }
 # the rules there already under other priorities (made by hand) are found by what they select, not added again
-old_agent; printf '900:\tfrom all iif ocisaas0 lookup main suppress_prefixlength 0\n1200:\tfrom all iif ocisaas0 lookup 105\n800:\tfrom all fwmark 0x31 lookup main\n' >>"$STATE/ip-rules"; cp "$tmp/ipt.full" "$STATE/iptables"
-vlan_run >"$tmp/out" 2>&1 && ! grep -q 'ip rule add\|iptables -t mangle -A' "$CALLS" && [ "$(routing_items)" = 5 ] && grep -q 'added as it runs: 0 pod routing item' "$tmp/out" && vlan_run --check >/dev/null 2>&1 \
+old_agent; printf '900:\tfrom all to 10.89.0.0/16 iif ocisaas0 lookup main\n901:\tfrom all to 10.20.0.0/24 iif ocisaas0 lookup main\n1200:\tfrom all iif ocisaas0 lookup 105\n800:\tfrom all fwmark 0x31 lookup main\n' >>"$STATE/ip-rules"; cp "$tmp/ipt.full" "$STATE/iptables"
+vlan_run >"$tmp/out" 2>&1 && ! grep -q 'ip rule add\|iptables -t mangle -A' "$CALLS" && [ "$(routing_items)" = 6 ] && grep -q 'added as it runs: 0 pod routing item' "$tmp/out" && vlan_run --check >/dev/null 2>&1 \
   && ok "ncs_vlan: routing rules there already under other priorities are not doubled" || { cat "$tmp/out"; cat "$CALLS"; cat "$STATE/ip-rules"; bad "vlan pod rules other priorities"; }
 # the change cannot be proved: the items it added go, the file comes back, and the VLAN stays up as it was
 old_agent; cp "$f" "$tmp/vlan5.old"; touch "$STATE/curl-fail"
@@ -691,6 +704,60 @@ grep -q 'FAILED  ncs_vlan' "$tmp/out" && [ "$(routing_items)" = 0 ] && grep -qx 
 old_agent; printf '1045:\tfrom all iif ocisaas0 lookup 105\n' >>"$STATE/ip-rules"; echo "-i ocisaas0 -m connmark --mark 0x31 -j CONNMARK --restore-mark" >>"$STATE/iptables"; touch "$STATE/curl-fail"
 vlan_run >/dev/null 2>&1 && bad "an unproved pod routing change was kept"
 [ "$(routing_items)" = 2 ] && grep -q 'iif ocisaas0 lookup 105' "$STATE/ip-rules" && grep -q 'restore-mark' "$STATE/iptables" && ok "ncs_vlan: a rollback keeps routing items that were there before" || { cat "$STATE/ip-rules" "$STATE/iptables"; bad "vlan rollback keeps old rule"; }
+# a machine an agent applied before 22 Nov 2026 (nuit-cloud/nuit-cloud#197): rule 1040 was "iif ocisaas0 lookup main suppress_prefixlength 0",
+# which gave pods every specific route of the main table, the management network's connected route among them
+OLD_SEL='iif ocisaas0 lookup main suppress_prefixlength 0'
+old_fix() {
+  cp "$tmp/vlan5.full" "$f"; cp "$tmp/rules.full" "$STATE/ip-rules"; cp "$tmp/ipt.full" "$STATE/iptables"; rm -f "$STATE/curl-fail"
+  awk -v o="$OLD_SEL" '/to 10\.20\.0\.0\/24 iif ocisaas0/ {next}
+    /post-up .*to 10\.89\.0\.0\/16 iif ocisaas0/ {print "    post-up ip -4 rule show | grep -Ewq '\''iif ocisaas0 ([[]detached[]] )?lookup main suppress_prefixlength 0'\'' || ip rule add " o " priority 1040"; next}
+    /pre-down .*to 10\.89\.0\.0\/16 iif ocisaas0/ {print "    pre-down ip rule del " o " 2>/dev/null || true"; next} {print}' "$f" >"$f.new"; mv "$f.new" "$f"
+  sed -i.bak '/iif ocisaas0 .*lookup main/d' "$STATE/ip-rules"; printf '1040:\tfrom all %s\n' "$(echo "$OLD_SEL" | sed 's/iif ocisaas0 /iif ocisaas0 [detached] /')" >>"$STATE/ip-rules"
+  : >"$CALLS"
+}
+old_fix; cp "$f" "$tmp/vlan5.oldfix"; cp "$STATE/ip-rules" "$tmp/rules.oldfix"
+[ "$(route_of pod 10.10.10.11)" = main ] && [ "$(grep -c 'iif ocisaas0' "$f")" -ge 2 ] || { cat "$f" "$STATE/ip-rules"; bad "the pre-fix fixture is not what #197 found (a pod reaches the management network by $(route_of pod 10.10.10.11))"; }
+vlan_run --check >"$tmp/out" 2>&1 && bad "a machine with the old suppress_prefixlength rule passed the check"
+grep -q 'DRIFT   ncs_vlan' "$tmp/out" && [ ! -s "$CALLS" ] && ok "ncs_vlan: the old rule (pods use every route of the main table) is drift, and the check changes nothing" || { cat "$tmp/out"; cat "$CALLS"; bad "vlan check old rule"; }
+# only the kernel, or only the file, still has the old form: drift too
+cp "$tmp/vlan5.full" "$f"; vlan_run --check >/dev/null 2>&1 && bad "the old rule in place (with the new file) passed the check"
+cp "$tmp/rules.full" "$STATE/ip-rules"; printf '1040:\tfrom all %s\n' "$OLD_SEL" >>"$STATE/ip-rules"; vlan_run --check >/dev/null 2>&1 && bad "the old rule in place beside the new ones passed the check"
+cp "$tmp/vlan5.oldfix" "$f"; cp "$tmp/rules.full" "$STATE/ip-rules"; vlan_run --check >/dev/null 2>&1 && bad "the old rule in the file (the new ones in place) passed the check"
+cp "$tmp/vlan5.full" "$f"; printf '    post-up ip rule add %s priority 1040 2>/dev/null || true\n' "$OLD_SEL" >>"$f"; vlan_run --check >/dev/null 2>&1 && bad "the old rule added to the file beside the new ones passed the check"
+cp "$tmp/vlan5.full" "$f"; cp "$tmp/rules.full" "$STATE/ip-rules"; printf '1041:\tfrom all to 10.20.0.0/16 iif ocisaas0 lookup main\n' >>"$STATE/ip-rules"; vlan_run --check >/dev/null 2>&1 && bad "a pod rule to another tenant VLAN network passed the check"
+ok "ncs_vlan: the old rule in place or in the file, or a pod rule to a network that is not the tenant VLAN's, is drift"
+# apply over it: the new rules first, then the old one goes; the file is rewritten; pods no longer reach the management network
+old_fix; vlan_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; cat "$CALLS"; bad "vlan apply over the old rule"; }
+add_p1="$(grep -nx 'ip rule add to 10.89.0.0/16 iif ocisaas0 lookup main priority 1040' "$CALLS" | cut -d: -f1)"
+add_pv="$(grep -nx 'ip rule add to 10.20.0.0/24 iif ocisaas0 lookup main priority 1041' "$CALLS" | cut -d: -f1)"
+del_old="$(grep -nx "ip rule del $OLD_SEL priority 1040" "$CALLS" | cut -d: -f1)"
+grep -q 'done    ncs_vlan' "$tmp/out" && [ -n "$add_p1" ] && [ -n "$add_pv" ] && [ -n "$del_old" ] && [ "$add_p1" -lt "$del_old" ] && [ "$add_pv" -lt "$del_old" ] \
+  && ! grep -q suppress_prefixlength "$STATE/ip-rules" && ! grep -v '^[[:space:]]*#' "$f" | grep -q suppress_prefixlength && cmp -s "$f" "$tmp/vlan5.full" \
+  && grep -qxF "$(printf '1040:\tfrom all to 10.89.0.0/16 iif ocisaas0 [detached] lookup main')" "$STATE/ip-rules" && grep -qxF "$(printf '1041:\tfrom all to 10.20.0.0/24 iif ocisaas0 [detached] lookup main')" "$STATE/ip-rules" \
+  && grep -q 'stale pod rules removed: 1' "$tmp/out" && ! grep -q '^ifup\|^ifdown\|ip link' "$CALLS" && vlan_run --check >/dev/null 2>&1 \
+  && [ "$(route_of pod 10.10.10.11)" = 105 ] && [ "$(route_of pod 10.20.0.50)" = main ] && [ "$(route_of pod 10.89.0.9)" = main ] && [ "$(route_of pod)" = 105 ] && [ "$(route_of eth0)" = main ] \
+  && ok "ncs_vlan: an apply over the old rule adds 1040 (pods' range) and 1041 (tenant VLAN) first, then removes the old rule, rewrites the file, and pods no longer reach the management network" \
+  || { cat "$tmp/out"; cat "$CALLS"; cat "$STATE/ip-rules"; diff "$tmp/vlan5.full" "$f"; bad "vlan apply over the old rule"; }
+: >"$CALLS"; vlan_run >/dev/null 2>&1 && [ ! -s "$CALLS" ] && [ "$(routing_items)" = 6 ] && ok "ncs_vlan: run again after the migration, nothing changes" || { cat "$CALLS"; cat "$STATE/ip-rules"; bad "vlan migration idempotent"; }
+# the old rule under another priority (made by hand) goes too
+old_fix; sed -i.bak 's/^1040:\(.*suppress_prefixlength.*\)$/900:\1/' "$STATE/ip-rules"
+vlan_run >"$tmp/out" 2>&1 && grep -qx "ip rule del $OLD_SEL priority 900" "$CALLS" && ! grep -q suppress_prefixlength "$STATE/ip-rules" && vlan_run --check >/dev/null 2>&1 \
+  && ok "ncs_vlan: the old rule under another priority is found by what it selects and removed" || { cat "$tmp/out"; cat "$CALLS"; cat "$STATE/ip-rules"; bad "vlan old rule other priority"; }
+# the migration cannot be proved: the old rule comes back, the new ones go, the file is the old one; pods are never without a route
+old_fix; touch "$STATE/curl-fail"
+vlan_run >"$tmp/out" 2>&1 && bad "an unproved migration was kept"
+readd="$(grep -nx "ip rule add $OLD_SEL priority 1040" "$CALLS" | cut -d: -f1)"; del_p1="$(grep -nx 'ip rule del to 10.89.0.0/16 iif ocisaas0 lookup main priority 1040' "$CALLS" | cut -d: -f1)"
+grep -q 'FAILED  ncs_vlan' "$tmp/out" && cmp -s "$f" "$tmp/vlan5.oldfix" && [ -n "$readd" ] && [ -n "$del_p1" ] && [ "$readd" -lt "$del_p1" ] \
+  && [ "$(grep -c "iif ocisaas0 .*lookup main suppress_prefixlength 0" "$STATE/ip-rules")" = 1 ] && ! grep -q 'to 10\.89\.0\.0/16\|to 10\.20\.0\.0/24' "$STATE/ip-rules" \
+  && grep -q 'iif ocisaas0 .*lookup 105' "$STATE/ip-rules" && ! grep -q '^ifup\|^ifdown\|ip link' "$CALLS" \
+  && ok "ncs_vlan: a migration that cannot be proved puts the old rule back before taking the new ones away, and the old file with it" || { cat "$tmp/out"; cat "$CALLS"; cat "$STATE/ip-rules"; diff "$tmp/vlan5.oldfix" "$f"; bad "vlan migration rollback"; }
+rm -f "$STATE/curl-fail"
+# a hostile rule from ocisaas0 to the main table that cannot be read as plain words is never passed to a command: drift, and the apply fails
+cp "$tmp/vlan5.full" "$f"; cp "$tmp/rules.full" "$STATE/ip-rules"; cp "$tmp/ipt.full" "$STATE/iptables"
+printf '1039:\tfrom all iif ocisaas0 lookup main $(touch /tmp/nuit-pwned-rule)\n' >>"$STATE/ip-rules"; : >"$CALLS"
+vlan_run --check >/dev/null 2>&1 && bad "an unreadable pod rule to the main table passed the check"
+vlan_run >"$tmp/out" 2>&1 && bad "an unreadable pod rule to the main table was accepted"
+grep -q 'FAILED  ncs_vlan' "$tmp/out" && ! grep -q 'pwned' "$CALLS" && [ ! -e /tmp/nuit-pwned-rule ] && ok "ncs_vlan: a pod rule to the main table that is not plain words is drift, never reaches a command, and fails the apply" || { cat "$tmp/out"; cat "$CALLS"; bad "vlan hostile rule"; }
 # the management address moved onto VLAN 31 after the tenant VLAN was written: the mark must follow it to eth0.31
 cp "$tmp/vlan5.full" "$f"; cp "$tmp/rules.full" "$STATE/ip-rules"; cp "$tmp/ipt.full" "$STATE/iptables"; rm -f "$STATE/curl-fail"
 sed -i.bak 's/^eth0 10.10.10.170\/24$/eth0.31 10.31.0.18\/24/' "$STATE/ip-addrs"; printf 'default via 10.31.0.1 dev eth0.31\n' >"$STATE/ip-route"; echo eth0.31 >>"$STATE/ip-links"; : >"$CALLS"
@@ -808,7 +875,8 @@ pi_vlan_net
 vlan_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "the tenant VLAN on a 15-character parent"; }
 grep -q 'done    ncs_vlan' "$tmp/out" && grep -qx 'auto vlan5' "$f" && grep -qx 'iface vlan5 inet static' "$f" && grep -qx "    vlan-raw-device $PI" "$f" && grep -q "ip link add link $PI name vlan5 type vlan id 5" "$f" \
   && grep -q 'post-up ip addr add 10.20.0.20/24 dev vlan5' "$f" && grep -q 'net.ipv4.conf.vlan5.rp_filter=2' "$f" && grep -q 'post-down ip link del vlan5' "$f" && ! grep -q "$PI\\.5" "$f" \
-  && grep -q '|| ip rule add iif ocisaas0 lookup main suppress_prefixlength 0 priority 1040$' "$f" && grep -q '|| ip rule add iif ocisaas0 lookup 105 priority 1045$' "$f" && [ "$(routing_items)" = 5 ] \
+  && grep -q '|| ip rule add to 10.89.0.0/16 iif ocisaas0 lookup main priority 1040$' "$f" && grep -q '|| ip rule add to 10.20.0.0/24 iif ocisaas0 lookup main priority 1041$' "$f" \
+  && grep -q '|| ip rule add iif ocisaas0 lookup 105 priority 1045$' "$f" && [ "$(routing_items)" = 6 ] \
   && grep -q "iptables -t mangle -A PREROUTING -i $PI -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x31\$" "$f" && [ "$(route_of "$PI")" = main ] && [ "$(route_of vlan5)" = 105 ] && [ "$(route_of pod)" = 105 ] \
   && grep -q 'ifup vlan5' "$CALLS" && grep -qx 'vlan5 10.20.0.19/24' "$STATE/ip-addrs" && grep -qx "$PI 10.10.10.170/24" "$STATE/ip-addrs" && vlan_run --check >/dev/null 2>&1 \
   && ok "ncs_vlan: on a 15-character parent the tenant VLAN is vlan5 (vlan-raw-device $PI), brought up, and then passes the check" || { cat "$tmp/out"; cat "$f"; cat "$CALLS"; bad "pi tenant vlan"; }
@@ -883,6 +951,10 @@ for V in eth0.5 vlan5; do
     && ok "ncs_vlan ($V): the order: the new own address first, each tenant address with /16 before its /24 goes (never missing), the old own address only after the platform answered" \
     || { cat "$CALLS"; bad "renumber order ($V)"; }
   [ "$(route_of pod)" = 105 ] && [ "$(route_of eth0)" = main ] && [ "$(route_of "$V")" = 105 ] && ok "ncs_vlan ($V): pods still leave by table 105, replies on the management interface by the main table" || bad "renumber pod routing ($V)"
+  grep -qxF "$(printf '1041:\tfrom all to 10.20.0.0/16 iif ocisaas0 [detached] lookup main')" "$STATE/ip-rules" && ! grep -q 'to 10\.20\.0\.0/24' "$STATE/ip-rules" \
+    && grep -qx 'ip rule del to 10.20.0.0/24 iif ocisaas0 lookup main priority 1041' "$CALLS" && grep -q '|| ip rule add to 10.20.0.0/16 iif ocisaas0 lookup main priority 1041$' "$f" && ! grep -q 'to 10\.20\.0\.0/24' "$f" \
+    && [ "$(route_of pod 10.20.200.9)" = main ] && [ "$(grep -c 'iif ocisaas0' "$STATE/ip-rules")" = 3 ] \
+    && ok "ncs_vlan ($V): the pods' tenant VLAN rule follows the network to 10.20.0.0/16, the /24 one removed, in place and in the file" || { cat "$CALLS"; cat "$STATE/ip-rules"; bad "renumber pod subnet rule ($V)"; }
   : >"$CALLS"; vlan16 >"$tmp/out" 2>&1 && vlan16 --check >/dev/null 2>&1 && [ ! -s "$CALLS" ] && ok "ncs_vlan ($V): after the renumbering --check is clean and a second run changes nothing" || { cat "$tmp/out"; cat "$CALLS"; bad "renumber idempotent ($V)"; }
 done
 
@@ -918,6 +990,7 @@ grep -q 'FAILED  ncs_vlan' "$tmp/out" && grep -q 'platform could not be reached 
   && [ "$(sort "$STATE/ip-addrs")" = "$(cat "$tmp/svc.addrs")" ] && [ "$(sort "$STATE/ip-routes")" = "$(cat "$tmp/svc.routes")" ] && [ ! -s "$STATE/gaps" ] \
   && ! grep -q '^ifup\|^ifdown\|ip link del' "$CALLS" && [ "$(cat "$ROOT/proc/sys/net/ipv4/conf/eth0.5/promote_secondaries")" = 0 ] && ! grep -q '^ip addr del 10.20.0.18/24' "$CALLS" \
   && grep -qx 'default via 10.20.0.1 dev eth0.5' "$STATE/ip-t105" \
+  && grep -q 'to 10\.20\.0\.0/24 iif ocisaas0' "$STATE/ip-rules" && ! grep -q 'to 10\.20\.0\.0/16' "$STATE/ip-rules" \
   && ok "ncs_vlan: a renumbering that cannot be proved is undone as it runs: the old addresses and prefixes, routes, file and promote_secondaries come back, the old own address was never removed, no ifdown" \
   || { cat "$tmp/out"; cat "$CALLS"; diff "$tmp/svc.file" "$f"; sort "$STATE/ip-addrs" | diff "$tmp/svc.addrs" -; sort "$STATE/ip-routes" | diff "$tmp/svc.routes" -; cat "$STATE/gaps" 2>/dev/null; bad "renumber rollback"; }
 rm -f "$STATE/curl-fail"

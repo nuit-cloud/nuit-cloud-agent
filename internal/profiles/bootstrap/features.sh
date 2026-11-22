@@ -971,31 +971,61 @@ VLAN_MARK="${VLAN_MARK:-0x5}"
 #         interface: the management VLAN's after a move, else the parent) go back the way they came, by the main table. The platform
 #         reaches pool services at the machine's management address and a host port, from outside the management subnet. The mark is
 #         set on the connection when it arrives there (CONNMARK) and put back on the packets that come back from ocisaas0.
-#   1040  iif ocisaas0 lookup main suppress_prefixlength 0: pods use the main table's specific routes (their own bridge, the tenant
-#         VLAN's connected route), never its default.
-#   1045  iif ocisaas0 lookup 105: everything else from pods goes by the tenant VLAN gateway. A connection that arrived on the tenant
-#         VLAN carries 0x5 and goes there too (1045, and 1050 for traffic that is not from a pod), as before.
+#   1040  to 10.89.0.0/16 iif ocisaas0 lookup main: pods reach their own range (the bridge) directly.
+#   1041  to <the tenant VLAN's network> iif ocisaas0 lookup main: pods reach the tenant VLAN directly (its connected route). The
+#         network is the one of NCS_VLAN_ADDRESS/NCS_VLAN_PREFIX, so it follows a renumbering (/24 to /16).
+#   1045  iif ocisaas0 lookup 105: everything else from pods goes by the tenant VLAN gateway, never out of the management interface.
+#         A connection that arrived on the tenant VLAN carries 0x5 and goes there too (1045, and 1050 for traffic that is not from a
+#         pod), as before.
+# Pods reach only their own range and the tenant VLAN directly. Before 22 Nov 2026 rule 1040 was "iif ocisaas0 lookup main
+# suppress_prefixlength 0", which gave pods every specific route in the main table, the management VLAN's connected route among them:
+# a tenant pod reached other machines' management addresses directly, masqueraded as this machine's own (nuit-cloud/nuit-cloud#197).
+# Any other "iif ocisaas0 ... lookup main" rule (that one, or a tenant VLAN network this machine no longer has) is stale: the check
+# reports it as drift and an apply removes it, after the rules above are in place, and its rollback puts it back.
 # A rule on an interface that does not exist yet is accepted by the kernel (shown as "[detached]") and takes effect when the bridge
 # appears, so the order the VLAN and the runtime are installed in does not matter, and on a machine without the runtime the rules
 # match nothing. Rules are found by what they select, whatever their priority.
 VLAN_POD_IF=ocisaas0
 VLAN_MGMT_MARK=0x31
-# the items, in the order they are added: m2 m3 (the mangle rules), m1 p1 p2 (the policy rules)
-VLAN_ROUTE_ITEMS="m2 m3 m1 p1 p2"
-vlan_rule_sel() { # vlan_rule_sel <m1|p1|p2> -> the policy rule's selector
+# the pods' own address range (Nuit Container Service), shared with the firewall (FW_POD_RANGE)
+POD_RANGE="10.89.0.0/16"
+# the items, in the order they are added: m2 m3 (the mangle rules), m1 p1 pv p2 (the policy rules)
+VLAN_ROUTE_ITEMS="m2 m3 m1 p1 pv p2"
+# the tenant VLAN's network (NCS_VLAN_ADDRESS/NCS_VLAN_PREFIX, checked by vlan_inputs_ok before any rule is made)
+vlan_pod_net() { vlan_net_cidr "$NCS_VLAN_ADDRESS" "$NCS_VLAN_PREFIX"; }
+vlan_rule_sel() { # vlan_rule_sel <m1|p1|pv|p2> -> the policy rule's selector (in the order "ip rule show" prints it)
   case "$1" in
     m1) echo "fwmark $VLAN_MGMT_MARK lookup main" ;;
-    p1) echo "iif $VLAN_POD_IF lookup main suppress_prefixlength 0" ;;
+    p1) echo "to $POD_RANGE iif $VLAN_POD_IF lookup main" ;;
+    pv) echo "to $(vlan_pod_net) iif $VLAN_POD_IF lookup main" ;;
     p2) echo "iif $VLAN_POD_IF lookup $VLAN_TABLE" ;;
   esac
 }
-vlan_rule_prio() { case "$1" in m1) echo 1030 ;; p1) echo 1040 ;; p2) echo 1045 ;; esac; }
-vlan_rule_re() { # vlan_rule_re <m1|p1|p2> -> a grep -Ew pattern for the rule in "ip -4 rule show" (attached or not)
+vlan_rule_prio() { case "$1" in m1) echo 1030 ;; p1) echo 1040 ;; pv) echo 1041 ;; p2) echo 1045 ;; esac; }
+vlan_rule_re() { # vlan_rule_re <m1|p1|pv|p2> -> a grep -Ew pattern for the rule in "ip -4 rule show" (attached or not)
   case "$1" in
     m1) echo "fwmark $VLAN_MGMT_MARK lookup main" ;;
-    p1) echo "iif $VLAN_POD_IF ([[]detached[]] )?lookup main suppress_prefixlength 0" ;;
+    p1) echo "to $(vlan_re "$POD_RANGE") iif $VLAN_POD_IF ([[]detached[]] )?lookup main" ;;
+    pv) echo "to $(vlan_re "$(vlan_pod_net)") iif $VLAN_POD_IF ([[]detached[]] )?lookup main" ;;
     p2) echo "iif $VLAN_POD_IF ([[]detached[]] )?lookup $VLAN_TABLE" ;;
   esac
+}
+# vlan_pod_stale -> each stale pod rule in place, as "<selector> priority <n>" (what "ip rule del" and "ip rule add" take): any rule
+# from ocisaas0 to the main table other than exactly p1 and pv (the old "suppress_prefixlength 0" one, a tenant VLAN network the machine
+# had before a renumbering). Only plain words are given back: such a rule with anything else in it is given as "?", which the check
+# counts as drift and an apply refuses to touch (it fails, and is put back). With "shown", each is given as "ip -4 rule show" prints it,
+# without its priority (as the snapshot holds it: what the change means to take away is not counted as lost).
+vlan_pod_stale() { # vlan_pod_stale [shown]
+  ip -4 rule show 2>/dev/null | awk -v shown="${1:-}" -v i="$VLAN_POD_IF" -v k1="from all to $POD_RANGE iif $VLAN_POD_IF lookup main" \
+    -v k2="from all to $(vlan_pod_net) iif $VLAN_POD_IF lookup main" '
+    $1 ~ /^[0-9]+:$/ {
+      pr = substr($1, 1, length($1) - 1); out = ""; iif = ""; tb = ""; odd = 0; raw = $0; sub(/^[0-9]+:[ \t]*/, "", raw)
+      for (j = 2; j <= NF; j++) { if ($j == "[detached]") continue; if ($j !~ /^[A-Za-z0-9._\/:-]+$/) odd = 1
+        if ($j == "iif") iif = $(j + 1); if ($j == "lookup") tb = $(j + 1); out = out (out == "" ? "" : " ") $j }
+      if (iif != i || tb != "main" || out == k1 || out == k2) next
+      if (shown != "") { print raw; next }
+      if (odd) { print "?"; next }
+      sub(/^from all /, "", out); print out " priority " pr }'
 }
 vlan_ipt_spec() { # vlan_ipt_spec <m2|m3> <management interface> -> the mangle PREROUTING rule
   case "$1" in
@@ -1035,6 +1065,17 @@ vlan_route_ensure() { # vlan_route_ensure <management interface> [file]
     vlan_item_has "$_ri" "$1" && continue
     vlan_item_add "$_ri" "$1" || return 1
     [ -z "${2:-}" ] || echo "$_ri" >>"$2"
+  done
+}
+# Remove each stale pod rule (vlan_pod_stale). The ones removed are listed in <file>, if given, for the rollback to put back.
+# shellcheck disable=SC2086 # the rule's words are split on purpose (plain words only, see vlan_pod_stale)
+vlan_route_prune() { # vlan_route_prune [file] [file of what is meant to go]
+  [ -z "${2:-}" ] || vlan_pod_stale shown | sed 's/^/rule /' >>"$2"
+  vlan_pod_stale | while IFS= read -r _rs; do
+    [ -n "$_rs" ] || continue
+    [ "$_rs" != "?" ] || { echo "  a rule from $VLAN_POD_IF to the main table could not be read: remove it by hand" >&2; return 1; }
+    ip rule del $_rs || return 1
+    [ -z "${1:-}" ] || printf '%s\n' "$_rs" >>"$1"
   done
 }
 # The management interface as the routing items name it: the default route's device, when it is a name that may go into a file.
@@ -1099,8 +1140,10 @@ EOF
     post-up iptables -t mangle -C PREROUTING $(vlan_ipt_spec m3 "$_mif") 2>/dev/null || iptables -t mangle -A PREROUTING $(vlan_ipt_spec m3 "$_mif")
     post-up ip -4 rule show | grep -Ewq '$(vlan_rule_re m1)' || ip rule add $(vlan_rule_sel m1) priority $(vlan_rule_prio m1)
     post-up ip -4 rule show | grep -Ewq '$(vlan_rule_re p1)' || ip rule add $(vlan_rule_sel p1) priority $(vlan_rule_prio p1)
+    post-up ip -4 rule show | grep -Ewq '$(vlan_rule_re pv)' || ip rule add $(vlan_rule_sel pv) priority $(vlan_rule_prio pv)
     post-up ip -4 rule show | grep -Ewq '$(vlan_rule_re p2)' || ip rule add $(vlan_rule_sel p2) priority $(vlan_rule_prio p2)
     pre-down ip rule del $(vlan_rule_sel p2) 2>/dev/null || true
+    pre-down ip rule del $(vlan_rule_sel pv) 2>/dev/null || true
     pre-down ip rule del $(vlan_rule_sel p1) 2>/dev/null || true
     pre-down ip rule del $(vlan_rule_sel m1) 2>/dev/null || true
     pre-down iptables -t mangle -D PREROUTING $(vlan_ipt_spec m3 "$_mif") 2>/dev/null || true
@@ -1217,6 +1260,9 @@ f_ncs_vlan_ok() {
   for _ri in $VLAN_ROUTE_ITEMS; do
     vlan_item_has "$_ri" "$_mif" && vlan_item_persisted "$_ri" "$_mif" "$_file" || return 1
   done
+  # no stale pod rule in place (the old "suppress_prefixlength 0" one, an old tenant VLAN network), and none in the file for boot
+  [ -z "$(vlan_pod_stale)" ] || return 1
+  ! grep -v '^[[:space:]]*#' "$_file" | grep -E "ip rule add .*iif $VLAN_POD_IF .*lookup main" | grep -vFq -e "ip rule add $(vlan_rule_sel p1) " -e "ip rule add $(vlan_rule_sel pv) " || return 1
   return 0
 }
 
@@ -1266,7 +1312,7 @@ f_ncs_vlan_do() {
   promote_was="$(cat "$(p "/proc/sys/net/ipv4/conf/$vif/promote_secondaries")" 2>/dev/null || true)"
   printf '%s' "$promote_was" | grep -Eq '^[0-9]$' || promote_was=""
   existing=0; [ -f "$file" ] && { cp -p "$file" "$d/previous"; existing=1; }
-  : >"$d/added.rules"; : >"$d/added.addrs"; : >"$d/meant"; : >"$d/reprefix"; : >"$d/stale"
+  : >"$d/added.rules"; : >"$d/removed.rules"; : >"$d/added.addrs"; : >"$d/meant"; : >"$d/reprefix"; : >"$d/stale"
   # On a VLAN in service, what changes is worked out before anything does (#197). The addresses kept are the node's own, the given
   # tenant addresses and the file's tenant lines (the tenant-address task's); one of them on the interface with another prefix is moved
   # to the VLAN's prefix (reprefix). The old own address (the file's address line, else the interface's first address), unless it is
@@ -1302,7 +1348,9 @@ if [ "$existing" = 1 ]; then cp -p "$d/previous" "$file"; else rm -f "$file"; fi
 [ "$live" = 1 ] || [ "$link_was" = 1 ] || ip link del $vif 2>/dev/null
 # a VLAN in service: the addresses it had come back first, each network's primary first, so no tenant address is ever missing
 if [ "$live" = 1 ]; then while read -r cidr; do ip addr add "\$cidr" dev $vif 2>/dev/null; done <"$d/before.vif"; fi
-# the routing items this run added (the ones that were there before stay)
+# the stale pod rules this run removed come back first (so pods are never left with less than they had), then the routing items
+# this run added go (the ones that were there before stay)
+set -f; while IFS= read -r spec; do ip rule add \$spec 2>/dev/null; done <"$d/removed.rules"; set +f
 while read -r n; do
   case "\$n" in
 $undo_items
@@ -1372,6 +1420,13 @@ ROLLBACK
     echo "  could not add the pod routing rules (iif $VLAN_POD_IF, mark $VLAN_MGMT_MARK on $mif), so the machine was put back" >&2
     return 1
   fi
+  # then the stale pod rules go (the old "suppress_prefixlength 0" rule that let pods use every route of the main table, a tenant VLAN
+  # network from before a renumbering): the new rules are in place first, so pods are never without a route
+  if ! vlan_route_prune "$d/removed.rules" "$d/meant"; then
+    sh "$d/rollback.sh"
+    echo "  could not remove the stale pod routing rules (iif $VLAN_POD_IF lookup main), so the machine was put back" >&2
+    return 1
+  fi
 
   # nothing that was there may be gone (apart from what was meant to go), and the platform must still be reachable
   if ! vlan_intact "$d"; then
@@ -1408,7 +1463,7 @@ ROLLBACK
   systemctl stop nuit-cloud-vlan-rollback.timer >/dev/null 2>&1 || true
   rm -f "$d/armed"
   if [ "$live" = 1 ]; then
-    echo "  $vif was up already and was left up; added as it runs: $(wc -l <"$d/added.rules" | tr -d ' ') pod routing item(s), $(wc -l <"$d/added.addrs" | tr -d ' ') address(es) with /$pfx; moved to /$pfx: $(wc -l <"$d/reprefix" | tr -d ' '); removed: $( [ -s "$d/stale" ] && tr '\n' ' ' <"$d/stale" | sed 's/ $//' || echo nothing)"
+    echo "  $vif was up already and was left up; added as it runs: $(wc -l <"$d/added.rules" | tr -d ' ') pod routing item(s) (stale pod rules removed: $(wc -l <"$d/removed.rules" | tr -d ' ')), $(wc -l <"$d/added.addrs" | tr -d ' ') address(es) with /$pfx; moved to /$pfx: $(wc -l <"$d/reprefix" | tr -d ' '); removed: $( [ -s "$d/stale" ] && tr '\n' ' ' <"$d/stale" | sed 's/ $//' || echo nothing)"
   fi
   if ping -c 2 -W 2 -I "$vif" "$NCS_VLAN_GATEWAY" >/dev/null 2>&1; then
     echo "  $vif carries $NCS_VLAN_ADDRESS/$pfx and the tenant addresses; the VLAN gateway $NCS_VLAN_GATEWAY answers"
@@ -1718,7 +1773,7 @@ fw_words() { printf '%s' "$1" | tr ',' ' '; }
 fw_ports() { fw_words "${NCS_FIREWALL_TCP:-}" | tr -s ' ' '\n' | grep -v '^$' | sort -n -u | tr '\n' ' '; }
 fw_ssh_from() { v="$(fw_words "${NCS_FIREWALL_SSH_FROM:-}")"; [ -n "$v" ] || v="$FW_DEFAULT_SSH_FROM"; printf '%s' "$v" | tr -s ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' '; }
 FW_BRIDGES='{ "ocisaas0", "cni0", "docker0", "br-*" }'
-FW_POD_RANGE="10.89.0.0/16"
+FW_POD_RANGE="$POD_RANGE"
 FW_PRIVATE="10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16"
 fw_list() { fw_words "$1" | tr -s ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' '; }
 fw_ipv4_ok() { printf '%s' "$1" | grep -Eq '^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$'; }

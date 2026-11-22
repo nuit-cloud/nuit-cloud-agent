@@ -32,10 +32,12 @@ iface enp0s31f6.5 inet static
     post-up iptables -t mangle -C PREROUTING -i enp0s31f6 -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x31 2>/dev/null || iptables -t mangle -A PREROUTING -i enp0s31f6 -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x31
     post-up iptables -t mangle -C PREROUTING -i ocisaas0 -m connmark --mark 0x31 -j CONNMARK --restore-mark 2>/dev/null || iptables -t mangle -A PREROUTING -i ocisaas0 -m connmark --mark 0x31 -j CONNMARK --restore-mark
     post-up ip -4 rule show | grep -Ewq 'fwmark 0x31 lookup main' || ip rule add fwmark 0x31 lookup main priority 1030
-    post-up ip -4 rule show | grep -Ewq 'iif ocisaas0 ([[]detached[]] )?lookup main suppress_prefixlength 0' || ip rule add iif ocisaas0 lookup main suppress_prefixlength 0 priority 1040
+    post-up ip -4 rule show | grep -Ewq 'to 10\.89\.0\.0/16 iif ocisaas0 ([[]detached[]] )?lookup main' || ip rule add to 10.89.0.0/16 iif ocisaas0 lookup main priority 1040
+    post-up ip -4 rule show | grep -Ewq 'to 10\.20\.0\.0/24 iif ocisaas0 ([[]detached[]] )?lookup main' || ip rule add to 10.20.0.0/24 iif ocisaas0 lookup main priority 1041
     post-up ip -4 rule show | grep -Ewq 'iif ocisaas0 ([[]detached[]] )?lookup 105' || ip rule add iif ocisaas0 lookup 105 priority 1045
     pre-down ip rule del iif ocisaas0 lookup 105 2>/dev/null || true
-    pre-down ip rule del iif ocisaas0 lookup main suppress_prefixlength 0 2>/dev/null || true
+    pre-down ip rule del to 10.20.0.0/24 iif ocisaas0 lookup main 2>/dev/null || true
+    pre-down ip rule del to 10.89.0.0/16 iif ocisaas0 lookup main 2>/dev/null || true
     pre-down ip rule del fwmark 0x31 lookup main 2>/dev/null || true
     pre-down iptables -t mangle -D PREROUTING -i ocisaas0 -m connmark --mark 0x31 -j CONNMARK --restore-mark 2>/dev/null || true
     pre-down iptables -t mangle -D PREROUTING -i enp0s31f6 -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x31 2>/dev/null || true
@@ -47,8 +49,9 @@ iface enp0s31f6.5 inet static
 `
 
 // agentFile16 is agentFile once the network grew to /16 and the node has 10.20.255.2 (nuit-cloud/nuit-cloud#197): the ncs_vlan feature
-// rewrites the address line and gives every tenant line the new prefix.
-var agentFile16 = strings.Replace(strings.ReplaceAll(agentFile, "/24 dev", "/16 dev"), "    address 10.20.0.2/24\n", "    address 10.20.255.2/16\n", 1)
+// rewrites the address line, gives every tenant line the new prefix, and moves the pods' tenant VLAN rule to the /16 network.
+var agentFile16 = strings.ReplaceAll(strings.ReplaceAll(strings.Replace(strings.ReplaceAll(agentFile, "/24 dev", "/16 dev"), "    address 10.20.0.2/24\n", "    address 10.20.255.2/16\n", 1),
+	"to 10.20.0.0/24 iif", "to 10.20.0.0/16 iif"), `to 10\.20\.0\.0/24 iif`, `to 10\.20\.0\.0/16 iif`)
 
 // handFile is what nuit-cloud-servers scripts/server-vlan5.sh writes: a comment before the tenant addresses and an extra pre-down line.
 const handFile = `# Managed by deploy/server-vlan5.sh (nuit-cloud). Remove with: sh server-vlan5.sh --remove
