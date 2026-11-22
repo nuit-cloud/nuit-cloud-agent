@@ -231,13 +231,16 @@ grep -q 'MANUAL  ncs_volumes' "$tmp/out" && [ ! -s "$ROOT/etc/fstab" ] && ok "nc
 
 # 9. ncs_address: the platform's allocated management address becomes the machine's static one, and is undone if it cannot be proved
 OLDROOT="$ROOT"; export ROOT="$tmp/root-addr"; rm -rf "$ROOT"
-mk_net() { # mk_net <current address> : a Debian with ifupdown whose eth0 got <current> from DHCP
-  rm -rf "$ROOT"; mkdir -p "$ROOT/etc/network/interfaces.d" "$ROOT/var/lib"
+mk_net() { # mk_net <current address> : a Debian with ifupdown whose $NETIF (eth0) got <current> from DHCP, with the tenant VLAN on $TVIF (<NETIF>.5)
+  _mn="${NETIF:-eth0}"; _mt="${TVIF:-$_mn.5}"
+  rm -rf "$ROOT"; mkdir -p "$ROOT/etc/network/interfaces.d" "$ROOT/var/lib" "$ROOT/proc/net/vlan"
   printf 'source /etc/network/interfaces.d/*\n' >"$ROOT/etc/network/interfaces"
-  printf 'auto lo\niface lo inet loopback\nauto eth0\niface eth0 inet dhcp\n    hwaddress ether 02:00:00:00:00:01\n\n# a second interface that must stay\niface eth1 inet static\n    address 192.168.9.2/24\n' >"$ROOT/etc/network/interfaces.d/eth0"
-  printf 'eth0 %s/24\neth0.5 10.20.0.2/24\neth0.5 10.20.0.3/24\n' "$1" >"$STATE/ip-addrs"; printf 'default via 10.10.10.1 dev eth0\n' >"$STATE/ip-route"
-  printf '10.10.10.0/24 dev eth0 proto kernel scope link src %s\n10.20.0.0/24 dev eth0.5 proto kernel scope link src 10.20.0.2\n' "$1" >"$STATE/ip-routes"; printf '0:\tfrom all lookup local\n100:\tfrom all fwmark 0x5 lookup 105\n' >"$STATE/ip-rules"
-  printf 'lo\neth0\neth1\neth0.5\n' >"$STATE/ip-links"
+  printf 'auto lo\niface lo inet loopback\nauto %s\niface %s inet dhcp\n    hwaddress ether 02:00:00:00:00:01\n\n# a second interface that must stay\niface eth1 inet static\n    address 192.168.9.2/24\n' "$_mn" "$_mn" >"$ROOT/etc/network/interfaces.d/$_mn"
+  printf '%s %s/24\n%s 10.20.0.2/24\n%s 10.20.0.3/24\n' "$_mn" "$1" "$_mt" "$_mt" >"$STATE/ip-addrs"; printf 'default via 10.10.10.1 dev %s\n' "$_mn" >"$STATE/ip-route"
+  printf '10.10.10.0/24 dev %s proto kernel scope link src %s\n10.20.0.0/24 dev %s proto kernel scope link src 10.20.0.2\n' "$_mn" "$1" "$_mt" >"$STATE/ip-routes"; printf '0:\tfrom all lookup local\n100:\tfrom all fwmark 0x5 lookup 105\n' >"$STATE/ip-rules"
+  printf 'lo\n%s\neth1\n%s\n' "$_mn" "$_mt" >"$STATE/ip-links"
+  # the kernel's own list of VLAN interfaces (what the features read to find a VLAN's interface and its parent, whatever its name)
+  printf 'VLAN Dev name\t | VLAN ID\nName-Type: VLAN_NAME_TYPE_RAW_PLUS_VID_NO_PAD\n%s | 5 | %s\n' "$_mt" "$_mn" >"$ROOT/proc/net/vlan/config"
   rm -f "$STATE/active-NetworkManager" "$STATE/arping-dupe" "$STATE/curl-fail" "$STATE/lose-vlan" "$STATE/stubborn" "$STATE/gw-silent"; : >"$CALLS"
 }
 stub ip 'case "$*" in
@@ -252,9 +255,10 @@ stub ip 'case "$*" in
   "route replace default "*) echo "ip $*" >>"$CALLS"; r="$*"; echo "${r#route replace }" >"$STATE/ip-route";;
   "route replace "*) echo "ip $*" >>"$CALLS";;
   "link show dev "*) grep -Fqx "$4" "$STATE/ip-links";;
-  "link add "*) echo "ip $*" >>"$CALLS"; echo "$6" >>"$STATE/ip-links";;
+  "link add "*) echo "ip $*" >>"$CALLS"; echo "$6" >>"$STATE/ip-links"; [ ! -d "$ROOT/proc/net/vlan" ] || echo "$6 | ${10} | $4" >>"$ROOT/proc/net/vlan/config";;
   "link del dev "*) echo "ip $*" >>"$CALLS"; grep -Fvx "$4" "$STATE/ip-links" >"$STATE/ip-links.new"; mv "$STATE/ip-links.new" "$STATE/ip-links"
-    grep -v "^$4 " "$STATE/ip-addrs" >"$STATE/ip-addrs.new"; mv "$STATE/ip-addrs.new" "$STATE/ip-addrs";;
+    grep -v "^$4 " "$STATE/ip-addrs" >"$STATE/ip-addrs.new"; mv "$STATE/ip-addrs.new" "$STATE/ip-addrs"
+    if [ -f "$ROOT/proc/net/vlan/config" ]; then grep -v "^$4 " "$ROOT/proc/net/vlan/config" >"$STATE/vlan-config.new"; mv "$STATE/vlan-config.new" "$ROOT/proc/net/vlan/config"; fi;;
   *) echo "ip $*" >>"$CALLS";;
 esac'
 stub ping 'echo "ping $*" >>"$CALLS"; [ ! -e "$STATE/gw-silent" ]'
@@ -409,15 +413,57 @@ for hostile in "MVLAN=0" "MVLAN=4095" "MVLAN=31;reboot" "MVLAN=031" "MPFX=8" "MP
   (export "$hostile"; mvlan_run --check) >/dev/null 2>&1 && bad "hostile $hostile passed the check"
 done; ok "ncs_address (VLAN): a bad VLAN id, prefix, gateway or address changes nothing and never passes the check"
 
+# 9c. a parent whose name is already 15 characters, the kernel's limit (a Raspberry Pi's enx<mac>; cps-pi-hnu7, nuit-cloud/nuit-cloud#197):
+#     <parent>.30 would not fit, so the VLAN interface is vlan30, tied to its parent by vlan-raw-device; a parent with room keeps <parent>.<id>
+PI=enxb827ebdbcb96
+ifname() { sh -c '. "$1"; vlan_ifname "$2" "$3"' ifname "$here/features.sh" "$1" "$2"; }
+[ "$(ifname eth0 31)" = eth0.31 ] && [ "$(ifname enp0s31f6 5)" = enp0s31f6.5 ] && [ "$(ifname enp0s31f6 4094)" = enp0s31f6.4094 ] && [ "$(ifname enxb827ebdbcb 5)" = enxb827ebdbcb.5 ] \
+  && [ "$(ifname enxb827ebdbcb 31)" = vlan31 ] && [ "$(ifname "$PI" 30)" = vlan30 ] && [ "$(ifname "$PI" 5)" = vlan5 ] && [ "$(ifname 'a;b' 5)" = vlan5 ] \
+  && ok "VLAN names: <parent>.<id> whenever it fits in 15 characters (eth0.31, enxb827ebdbcb.5), vlan<id> when it does not (vlan31, vlan30)" || bad "vlan_ifname"
+pi_net() { (NETIF=$PI; TVIF=vlan5; mk_net "$1"); }
+pi_run() { (MADDR=10.30.0.11; MVLAN=30; MGW=10.30.0.1; mvlan_run ${1:+"$1"}); }
+pi_net 10.10.10.170
+pi_run --check >"$tmp/out" 2>&1 && bad "a Pi still on the old network passed the VLAN check"
+pi_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; cat "$CALLS"; bad "the management VLAN move on a 15-character parent"; }
+grep -q 'done    ncs_address' "$tmp/out" && grep -q "ip link add link $PI name vlan30 type vlan id 30" "$CALLS" && grep -q 'ip addr add 10.30.0.11/24 dev vlan30' "$CALLS" \
+  && grep -q 'ip route replace default via 10.30.0.1 dev vlan30' "$CALLS" && grep -q 'ping .*-I vlan30 10.30.0.1' "$CALLS" && grep -q "ip addr del 10.10.10.170/24 dev $PI" "$CALLS" && ! grep -q "$PI\\.30" "$CALLS" \
+  && [ "$(cat "$STATE/ip-route")" = "default via 10.30.0.1 dev vlan30" ] && grep -qx 'vlan30 10.30.0.11/24' "$STATE/ip-addrs" && grep -qx 'vlan5 10.20.0.3/24' "$STATE/ip-addrs" \
+  && grep -qx "iface $PI inet manual" "$sf" && grep -qx 'auto vlan30' "$sf" && grep -qx 'iface vlan30 inet static' "$sf" && grep -qx '    address 10.30.0.11/24' "$sf" && grep -qx "    vlan-raw-device $PI" "$sf" \
+  && grep -q "pre-up ip link show vlan30 >/dev/null 2>&1 || ip link add link $PI name vlan30 type vlan id 30" "$sf" && grep -q 'post-down ip link del vlan30' "$sf" && ! grep -q "$PI\\.30" "$sf" \
+  && grep -q "^# nuit-cloud: iface $PI inet dhcp\$" "$ROOT/etc/network/interfaces.d/$PI" \
+  && ok "ncs_address (VLAN): on a 15-character parent the address moves onto vlan30 (vlan-raw-device $PI) with the default route, not onto an impossible $PI.30" || { cat "$tmp/out"; cat "$CALLS"; cat "$sf"; bad "pi mvlan apply"; }
+: >"$CALLS"; pi_run >"$tmp/out" 2>&1 && pi_run --check >/dev/null 2>&1 && [ ! -s "$CALLS" ] && ok "ncs_address (VLAN): a machine moved onto vlan30 is recognised as done: a second run is a no-op and --check is clean" || { cat "$tmp/out"; cat "$CALLS"; bad "pi mvlan idempotent"; }
+mv "$ROOT/proc/net/vlan/config" "$tmp/vlan-config"
+pi_run --check >/dev/null 2>&1 && ok "ncs_address (VLAN): without the kernel's VLAN list, vlan30's parent is read from its vlan-raw-device line and the check still passes" || bad "pi mvlan check from ifupdown"
+mv "$tmp/vlan-config" "$ROOT/proc/net/vlan/config"
+lower() { sh -c 'p() { printf "%s%s\n" "$ROOT" "$1"; }; . "$1"; addr_lower "$2"' lower "$here/features.sh" "$1"; }
+wifidev() { sh -c 'p() { printf "%s%s\n" "$ROOT" "$1"; }; . "$1"; wifi_default_dev' wifidev "$here/features.sh"; }
+[ "$(lower vlan30)" = "$PI" ] && [ "$(lower vlan5)" = "$PI" ] && [ "$(lower "$PI")" = "$PI" ] && [ "$(lower eth0.31)" = eth0 ] && [ "$(lower vlan99)" = vlan99 ] && [ "$(wifidev)" = "$PI" ] \
+  && ok "the parent behind vlan30 and vlan5 is the physical $PI (from the kernel), and the wireless check sees the default route's parent" || { lower vlan30; wifidev; bad "addr_lower behind vlan<id>"; }
+# the move cannot be proved: everything is put back, and it is vlan30 that is removed
+pi_net 10.10.10.170; cp "$ROOT/etc/network/interfaces.d/$PI" "$tmp/pi.before"; touch "$STATE/curl-fail"
+pi_run >"$tmp/out" 2>&1 && bad "an unproved move onto vlan30 was kept"
+grep -q 'FAILED  ncs_address' "$tmp/out" && grep -q 'ip link del dev vlan30' "$CALLS" && ! grep -qx 'vlan30' "$STATE/ip-links" && ! grep -q '^vlan30 ' "$STATE/ip-addrs" && ! grep -q '^vlan30 ' "$ROOT/proc/net/vlan/config" \
+  && [ "$(cat "$STATE/ip-route")" = "default via 10.10.10.1 dev $PI" ] && grep -qx "$PI 10.10.10.170/24" "$STATE/ip-addrs" && grep -qx 'vlan5 10.20.0.3/24' "$STATE/ip-addrs" \
+  && cmp -s "$tmp/pi.before" "$ROOT/etc/network/interfaces.d/$PI" && [ ! -e "$sf" ] && grep -q "ifup --force $PI" "$CALLS" \
+  && ok "ncs_address (VLAN): a failed move on a 15-character parent removes vlan30 and puts the address, the route and the files back" || { cat "$tmp/out"; cat "$CALLS"; bad "pi mvlan rollback"; }
+# a vlan30 that is someone else's (another parent, or not a VLAN at all) is left alone
+pi_net 10.10.10.170; echo vlan30 >>"$STATE/ip-links"; echo "vlan30 | 30 | eth1" >>"$ROOT/proc/net/vlan/config"
+pi_run >"$tmp/out" 2>&1 && bad "a vlan30 on another parent was taken"
+grep -q 'MANUAL  ncs_address' "$tmp/out" && grep -q "vlan30 exists already and is not VLAN 30 on $PI" "$tmp/out" && [ ! -s "$CALLS" ] || { cat "$tmp/out"; cat "$CALLS"; bad "pi vlan30 on another parent"; }
+pi_net 10.10.10.170; echo vlan30 >>"$STATE/ip-links"
+pi_run >"$tmp/out" 2>&1 && bad "a vlan30 that is not a VLAN was taken"
+grep -q 'MANUAL  ncs_address' "$tmp/out" && grep -q 'vlan30 exists already' "$tmp/out" && [ ! -s "$CALLS" ] && ok "ncs_address (VLAN): a vlan30 on another parent, or one that is not a VLAN, is left to a person and nothing changes" || { cat "$tmp/out"; cat "$CALLS"; bad "pi vlan30 not a VLAN"; }
+
 # 10. ncs_vlan: the tenant VLAN slice goes on the machine as a sub-interface, additive and undone if the platform is lost
 stub ifup 'echo "ifup $*" >>"$CALLS"; [ -e "$STATE/ifup-fail" ] && { echo "ifup: boom" >&2; exit 1; }
-case "$1" in eth0.5) for a in 10.20.0.18 10.20.0.19 10.20.0.20 10.20.0.21; do echo "eth0.5 $a/24" >>"$STATE/ip-addrs"; done;; esac'
-stub ifdown 'echo "ifdown $*" >>"$CALLS"; grep -v "^eth0.5 " "$STATE/ip-addrs" >"$STATE/ip-addrs.new"; mv "$STATE/ip-addrs.new" "$STATE/ip-addrs"'
+case "$1" in -*) ;; *) for a in 10.20.0.18 10.20.0.19 10.20.0.20 10.20.0.21; do echo "$1 $a/24" >>"$STATE/ip-addrs"; done;; esac'
+stub ifdown 'echo "ifdown $*" >>"$CALLS"; grep -v "^$2 " "$STATE/ip-addrs" >"$STATE/ip-addrs.new"; mv "$STATE/ip-addrs.new" "$STATE/ip-addrs"'
 stub ping 'echo "ping $*" >>"$CALLS"; [ ! -e "$STATE/gw-silent" ]'
 stub iptables 'true'
 stub ifquery '[ ! -e "$STATE/no-ifstate" ]'
 vlan_run() { env NCS_VLAN_ID=5 NCS_VLAN_PREFIX=24 NCS_VLAN_ADDRESS=10.20.0.18 NCS_VLAN_GATEWAY=10.20.0.1 NCS_VLAN_TENANT_ADDRESSES="${TENANTS-10.20.0.19 10.20.0.20 10.20.0.21}" NCS_PLATFORM_URL=https://agent.example sh "$here/bootstrap.sh" nuit-cloud-vlan ${1:+"$1"}; }
-vlan_net() { mk_net 10.10.10.170; sed -i.bak '/^eth0.5 /d' "$STATE/ip-addrs"; rm -f "$STATE/ifup-fail" "$STATE/gw-silent" "$STATE/no-ifstate"; : >"$CALLS"; rm -f "$ROOT/etc/network/interfaces.d/nuit-cloud-vlan5" "$ROOT/etc/modules-load.d/8021q.conf"; }
+vlan_net() { mk_net 10.10.10.170; sed -i.bak "/^${TVIF:-${NETIF:-eth0}.5} /d" "$STATE/ip-addrs"; rm -f "$STATE/ifup-fail" "$STATE/gw-silent" "$STATE/no-ifstate"; : >"$CALLS"; rm -f "$ROOT/etc/network/interfaces.d/nuit-cloud-vlan5" "$ROOT/etc/modules-load.d/8021q.conf"; }
 
 vlan_net
 vlan_run --check >"$tmp/out" 2>&1 && bad "a machine without the VLAN passed the check"
@@ -522,6 +568,39 @@ grep -q 'done    ncs_vlan' "$tmp/out" && grep -q '^iface eth0.5 inet static$' "$
 vlan_net; printf 'default via 10.20.0.1 dev eth0.5\n' >"$STATE/ip-route"
 vlan_run >"$tmp/out" 2>&1 && bad "a tenant VLAN carrying the default route was rewritten"
 grep -q 'MANUAL  ncs_vlan' "$tmp/out" && [ ! -s "$CALLS" ] && ok "ncs_vlan: a default route on the tenant VLAN's own interface is left to a person" || { cat "$tmp/out"; bad "vlan default on eth0.5"; }
+
+# 10b. a 15-character parent (nuit-cloud/nuit-cloud#197): the tenant VLAN is vlan5, tied to the parent by vlan-raw-device
+pi_vlan_net() { (NETIF=$PI; TVIF=vlan5; vlan_net); sed -i.bak '/^vlan5/d' "$STATE/ip-links" "$ROOT/proc/net/vlan/config"; }
+pi_vlan_net
+vlan_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "the tenant VLAN on a 15-character parent"; }
+grep -q 'done    ncs_vlan' "$tmp/out" && grep -qx 'auto vlan5' "$f" && grep -qx 'iface vlan5 inet static' "$f" && grep -qx "    vlan-raw-device $PI" "$f" && grep -q "ip link add link $PI name vlan5 type vlan id 5" "$f" \
+  && grep -q 'post-up ip addr add 10.20.0.20/24 dev vlan5' "$f" && grep -q 'net.ipv4.conf.vlan5.rp_filter=2' "$f" && grep -q 'post-down ip link del vlan5' "$f" && ! grep -q "$PI\\.5" "$f" \
+  && grep -q 'ifup vlan5' "$CALLS" && grep -qx 'vlan5 10.20.0.19/24' "$STATE/ip-addrs" && grep -qx "$PI 10.10.10.170/24" "$STATE/ip-addrs" && vlan_run --check >/dev/null 2>&1 \
+  && ok "ncs_vlan: on a 15-character parent the tenant VLAN is vlan5 (vlan-raw-device $PI), brought up, and then passes the check" || { cat "$tmp/out"; cat "$f"; cat "$CALLS"; bad "pi tenant vlan"; }
+pi_vlan_net; touch "$STATE/curl-fail"
+vlan_run >"$tmp/out" 2>&1 && bad "an unproved vlan5 was kept"
+grep -q 'FAILED  ncs_vlan' "$tmp/out" && grep -q 'ifdown --force vlan5' "$CALLS" && grep -q 'ip link del vlan5' "$CALLS" && [ ! -e "$f" ] && ! grep -q '^vlan5 ' "$STATE/ip-addrs" \
+  && ok "ncs_vlan: a tenant VLAN on vlan5 that cannot be proved is taken down by that name" || { cat "$tmp/out"; cat "$CALLS"; bad "pi tenant vlan rollback"; }
+# after the Pi's management move: the default route is on vlan30, whose parent (from the kernel) carries the tenant VLAN too
+pi_vlan_net; sed -i.bak "s/^$PI 10.10.10.170\/24\$/vlan30 10.30.0.11\/24/" "$STATE/ip-addrs"; printf 'default via 10.30.0.1 dev vlan30\n' >"$STATE/ip-route"
+echo vlan30 >>"$STATE/ip-links"; echo "vlan30 | 30 | $PI" >>"$ROOT/proc/net/vlan/config"
+vlan_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "the tenant VLAN with the default route on vlan30"; }
+grep -q 'done    ncs_vlan' "$tmp/out" && grep -qx 'iface vlan5 inet static' "$f" && grep -qx "    vlan-raw-device $PI" "$f" && ! grep -q 'vlan30' "$f" && grep -q 'ifup vlan5' "$CALLS" \
+  && grep -qx 'vlan30 10.30.0.11/24' "$STATE/ip-addrs" && vlan_run --check >/dev/null 2>&1 \
+  && ok "ncs_vlan: with the default route on vlan30 the tenant VLAN is vlan5 off $PI, beside it, and the management address is untouched" || { cat "$tmp/out"; cat "$f"; cat "$CALLS"; bad "pi tenant vlan behind vlan30"; }
+# a VLAN 5 the kernel already has on eth0 under the name vlan5 (made by hand) is used by that name, not doubled with eth0.5
+(TVIF=vlan5; vlan_net)
+vlan_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "the tenant VLAN over a hand-made vlan5"; }
+grep -q 'done    ncs_vlan' "$tmp/out" && grep -qx 'iface vlan5 inet static' "$f" && grep -qx '    vlan-raw-device eth0' "$f" && ! grep -q 'eth0\.5' "$f" && grep -q 'ifup vlan5' "$CALLS" && vlan_run --check >/dev/null 2>&1 \
+  && ok "ncs_vlan: a VLAN 5 the kernel has on eth0 as vlan5 is found by its VLAN id and used as it is, not doubled with eth0.5" || { cat "$tmp/out"; cat "$f"; cat "$CALLS"; bad "vlan5 on a short parent"; }
+# a vlan5 that belongs to another parent is someone else's; a hostile interface name never reaches a file
+pi_vlan_net; echo vlan5 >>"$STATE/ip-links"; echo "vlan5 | 5 | eth1" >>"$ROOT/proc/net/vlan/config"
+vlan_run >"$tmp/out" 2>&1 && bad "a vlan5 on another parent was taken"
+grep -q 'MANUAL  ncs_vlan' "$tmp/out" && grep -q "vlan5 exists already and is not VLAN 5 on $PI" "$tmp/out" && [ ! -s "$CALLS" ] && [ ! -e "$f" ] || { cat "$tmp/out"; cat "$CALLS"; bad "vlan5 on another parent"; }
+vlan_net; printf 'default via 10.10.10.1 dev eth0;reboot\n' >"$STATE/ip-route"
+vlan_run >"$tmp/out" 2>&1 && bad "a hostile interface name was used"
+grep -q 'MANUAL  ncs_vlan' "$tmp/out" && grep -q 'cannot carry a VLAN sub-interface' "$tmp/out" && [ ! -s "$CALLS" ] && [ ! -e "$f" ] \
+  && ok "ncs_vlan: a vlan5 on another parent, or a hostile interface name, is left to a person and nothing changes" || { cat "$tmp/out"; cat "$CALLS"; bad "vlan hostile parent"; }
 
 # 11. ncs_ssh_harden: passwords and root login off only when a key the platform names can still get in, with a timer until confirmed
 ssh-keygen -q -t ed25519 -N '' -C test-admin -f "$tmp/adminkey" && FP="$(ssh-keygen -lf "$tmp/adminkey.pub" | awk '{print $2}')"

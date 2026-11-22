@@ -1,10 +1,13 @@
 // Package tenantaddress moves a tenant address on the tenant VLAN onto or off this machine (nuit-cloud/nuit-cloud#187), so an address
 // can follow its service when the service moves to another Nuit Cloud Server.
 //
-// Every Nuit Cloud Server carries the tenant VLAN as a sub-interface `<parent>.<vlanId>`, configured by ifupdown from
-// /etc/network/interfaces.d/nuit-cloud-vlan<vlanId>: the node's own address is the stanza's `address` line and each tenant address one line
+// Every Nuit Cloud Server carries the tenant VLAN as a sub-interface, `<parent>.<vlanId>` or, where that would be longer than the kernel's
+// 15 characters, `vlan<vlanId>` (nuit-cloud/nuit-cloud#197), configured by ifupdown from /etc/network/interfaces.d/nuit-cloud-vlan<vlanId>:
+// the node's own address is the stanza's `address` line and each tenant address one line
 //
 //	post-up ip addr add 10.20.0.3/24 dev enp0s31f6.5 2>/dev/null || true
+//
+// The VLAN interface is the one interface the kernel reports as VLAN <vlanId> (`ip -d -j addr show`), whatever its name.
 //
 // (indented four spaces; written by the ncs_vlan feature, or by hand with an equivalent script). The task `tenant-address` changes that
 // address both live (`ip addr add`/`del`) and in the file, so it survives a reboot. Every other line of the file is left byte for byte as
@@ -46,7 +49,7 @@ const (
 	Probes        = 3
 	// interval is the pause between two probes (spent listening for an answer) and between two announcements.
 	interval = time.Second
-	// maxIPOutput bounds what `ip -j addr show` may print.
+	// maxIPOutput bounds what `ip -d -j addr show` may print.
 	maxIPOutput = 4 << 20
 	// maxFile bounds the VLAN file the agent will read and rewrite.
 	maxFile = 256 << 10
@@ -229,7 +232,7 @@ func File(root string, vlanID int) string {
 	return filepath.Join(root, "etc", "network", "interfaces.d", "nuit-cloud-vlan"+strconv.Itoa(vlanID))
 }
 
-// ifaceAddr is one address of an interface, as `ip -j addr show` gives it.
+// ifaceAddr is one address of an interface, as `ip -d -j addr show` gives it.
 type ifaceAddr struct {
 	Family    string `json:"family"`
 	Local     string `json:"local"`
@@ -237,12 +240,33 @@ type ifaceAddr struct {
 	Secondary bool   `json:"secondary"`
 }
 
-// iface is one interface, as `ip -j addr show` gives it.
+// iface is one interface, as `ip -d -j addr show` gives it.
 type iface struct {
-	Index int         `json:"ifindex"`
-	Name  string      `json:"ifname"`
-	MAC   string      `json:"address"`
-	Addrs []ifaceAddr `json:"addr_info"`
+	Index    int         `json:"ifindex"`
+	Name     string      `json:"ifname"`
+	MAC      string      `json:"address"`
+	Addrs    []ifaceAddr `json:"addr_info"`
+	LinkInfo *linkInfo   `json:"linkinfo,omitempty"`
+}
+
+// linkInfo is what `ip -d` says about the kind of an interface; for a VLAN, its 802.1Q id.
+type linkInfo struct {
+	Kind string `json:"info_kind"`
+	Data struct {
+		Protocol string `json:"protocol,omitempty"`
+		ID       int    `json:"id"`
+	} `json:"info_data"`
+}
+
+// vlanID is the 802.1Q VLAN id the kernel reports for the interface, and whether it is a VLAN interface at all.
+func (i iface) vlanID() (int, bool) {
+	if i.LinkInfo == nil || i.LinkInfo.Kind != "vlan" {
+		return 0, false
+	}
+	if p := i.LinkInfo.Data.Protocol; p != "" && p != "802.1Q" {
+		return 0, false
+	}
+	return i.LinkInfo.Data.ID, true
 }
 
 // has says whether the interface holds a (IPv4), and the entry for it.
@@ -259,8 +283,8 @@ func (i iface) has(a netip.Addr) (ifaceAddr, bool) {
 }
 
 // vifName is the shape of an interface name the agent will write into the VLAN file: a kernel interface name (at most 15 characters,
-// checked beside it) of plain characters, nothing a shell would read as anything but a word.
-var vifName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*\.[0-9]{1,4}$`)
+// checked beside it) of plain characters, nothing a shell would read as anything but a word: <parent>.<id> or vlan<id>.
+var vifName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*(\.[0-9]{1,4})?$`)
 
 // machine is what both actions read first: the interfaces, the VLAN interface and the VLAN file.
 type machine struct {
@@ -277,7 +301,7 @@ type machine struct {
 }
 
 func (m Mover) read(ctx context.Context, p Params) (machine, error) {
-	out, err := m.ip(ctx, "-j", "addr", "show")
+	out, err := m.ip(ctx, "-d", "-j", "addr", "show")
 	if err != nil {
 		return machine{}, fmt.Errorf("could not list this machine's interfaces: %w", err)
 	}
@@ -288,16 +312,16 @@ func (m Mover) read(ctx context.Context, p Params) (machine, error) {
 	if err := json.Unmarshal([]byte(out), &ifaces); err != nil {
 		return machine{}, fmt.Errorf("could not read this machine's interfaces: %w", err)
 	}
-	suffix := "." + strconv.Itoa(p.VLANID)
+	// the interface the kernel says carries the VLAN, whatever its name (<parent>.<id>, or vlan<id> where that would not fit)
 	var found []iface
 	for _, i := range ifaces {
-		if strings.HasSuffix(i.Name, suffix) && len(i.Name) > len(suffix) {
+		if id, ok := i.vlanID(); ok && id == p.VLANID {
 			found = append(found, i)
 		}
 	}
 	switch {
 	case len(found) == 0:
-		return machine{}, fmt.Errorf("this machine has no interface for VLAN %d (none named <interface>%s)", p.VLANID, suffix)
+		return machine{}, fmt.Errorf("this machine has no interface for VLAN %d", p.VLANID)
 	case len(found) > 1:
 		names := make([]string, len(found))
 		for i, f := range found {

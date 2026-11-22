@@ -489,8 +489,8 @@ f_ncs_log_root_do() {
 #     MANUAL and left alone.
 # The agent passes NCS_MANAGEMENT_ADDRESS (from the signed task) and NCS_PLATFORM_URL (what to reach to prove it works).
 # Another subnet is handled only when it is a tagged VLAN the platform names (nuit-cloud/nuit-cloud#197): the agent then also passes
-# NCS_MANAGEMENT_VLAN, NCS_MANAGEMENT_PREFIX and NCS_MANAGEMENT_GATEWAY, and the address moves onto <parent>.<vlan> together with the
-# machine's default route (addr_vlan_ok and addr_vlan_do below).
+# NCS_MANAGEMENT_VLAN, NCS_MANAGEMENT_PREFIX and NCS_MANAGEMENT_GATEWAY, and the address moves onto the VLAN's interface (<parent>.<vlan>,
+# or vlan<vlan> where that name would not fit: vlan_ifname) together with the machine's default route (addr_vlan_ok and addr_vlan_do).
 ADDR_DIR="${ADDR_DIR:-/var/lib/nuit-cloud-agent/address}"
 ADDR_ROLLBACK_SECONDS="${ADDR_ROLLBACK_SECONDS:-180}"
 ADDR_STATIC_FILE="/etc/network/interfaces.d/nuit-cloud-address"
@@ -499,10 +499,54 @@ ADDR_STATIC_FILE="/etc/network/interfaces.d/nuit-cloud-address"
 addr_net_of() { awk -v ip="$1" -v pl="$2" 'BEGIN {split(ip, o, "."); v = ((o[1] * 256 + o[2]) * 256 + o[3]) * 256 + o[4]; b = 2 ^ (32 - pl); print int(v / b)}'; }
 addr_is_ipv4() { printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' && ! printf '%s' "$1" | grep -Eq '(^|\.)(25[6-9]|2[6-9][0-9]|[3-9][0-9][0-9])(\.|$)'; }
 
-# The physical interface under <interface>: for a VLAN interface named <if>.<n> (the only kind the agent makes), <if>; for any other,
-# the interface itself. Once the management address is on a VLAN the default route is on <if>.<n>, and whatever hangs a VLAN of its
-# own off the machine's link (the tenant VLAN) must hang it off <if>, not off <if>.<n>.
+# ─── VLAN interface names (nuit-cloud/nuit-cloud#197) ────────────────────────────────────────────────────────────────────────────
+# A VLAN interface is <parent>.<id> wherever that fits the kernel's 15 characters (IFNAMSIZ); a parent whose name is already long (a
+# Raspberry Pi's enx<mac> is 15) gets vlan<id>, tied to its parent by ifupdown's vlan-raw-device. Whatever looks for "the interface of
+# VLAN <id>" asks the kernel (/proc/net/vlan/config), so either name is found, and so are interfaces made by hand.
+
+# vlan_kernel: one "<name> <vlan id> <parent>" line for each VLAN interface the kernel has (nothing when the 8021q module is not loaded,
+# which means there are none).
+vlan_kernel() {
+  _vkf="$(p /proc/net/vlan/config)"
+  [ -r "$_vkf" ] || return 0
+  awk -F'|' '{for (k = 1; k <= 3; k++) gsub(/[[:space:]]/, "", $k)} NF >= 3 && $1 != "" && $2 ~ /^[0-9]+$/ && $3 != "" {print $1, $2, $3}' "$_vkf"
+}
+
+# vlan_ifname <parent> <vlan id> -> the name the agent gives a new VLAN interface: <parent>.<id> when the parent is a plain name and the
+# whole fits in 15 characters, vlan<id> otherwise. The dotted name is kept wherever it fits, so machines set up before keep theirs.
+vlan_ifname() {
+  _vn="$1.$2"
+  if printf '%s\n' "$1" | grep -Eq '^[a-zA-Z0-9_-]+$' && [ "${#_vn}" -le 15 ]; then printf '%s\n' "$_vn"; else printf 'vlan%s\n' "$2"; fi
+}
+
+# vlan_dev <parent> <vlan id> -> the interface carrying VLAN <id> on <parent>: the one the kernel has, whatever its name, or else the
+# name the agent would give it.
+vlan_dev() {
+  _vd="$(vlan_kernel | awk -v l="$1" -v i="$2" '$3 == l && $2 == i {print $1; exit}')"
+  if [ -n "$_vd" ]; then printf '%s\n' "$_vd"; else vlan_ifname "$1" "$2"; fi
+}
+
+# vlan_name_free <name> <parent> <vlan id>: no interface has <name> yet, or it is VLAN <id> on <parent> already. An existing interface
+# the kernel knows as another VLAN, or a vlan<id> the kernel does not know as a VLAN at all, is someone else's; an existing dotted
+# <parent>.<id> the kernel says nothing about is taken as what its name says (as before).
+vlan_name_free() {
+  ip link show dev "$1" >/dev/null 2>&1 || return 0
+  _vk="$(vlan_kernel | awk -v n="$1" '$1 == n {print $2, $3; exit}')"
+  if [ -n "$_vk" ]; then [ "$_vk" = "$3 $2" ]; return; fi
+  [ "$1" = "$2.$3" ]
+}
+
+# The physical interface under <interface>: for a VLAN interface, its parent (from the kernel; else from the vlan-raw-device line of
+# its ifupdown stanza; else <if> from a name <if>.<n>); for any other, the interface itself. Once the management address is on a VLAN
+# the default route is on that VLAN's interface, and whatever hangs a VLAN of its own off the machine's link (the tenant VLAN) must hang
+# it off the parent, beside it.
 addr_lower() {
+  _lk="$(vlan_kernel | awk -v n="$1" '$1 == n {print $3; exit}')"
+  if [ -n "$_lk" ]; then printf '%s\n' "$_lk"; return 0; fi
+  _lk="$(for _lf in "$(p /etc/network/interfaces)" "$(p /etc/network/interfaces.d)"/*; do
+    [ -f "$_lf" ] && awk -v i="$1" '$1 == "iface" {s = ($2 == i); next} /^(auto|allow-[a-z]+|mapping|source)/ {s = 0} s && $1 == "vlan-raw-device" {print $2; exit}' "$_lf"
+  done | head -n 1)"
+  if printf '%s\n' "$_lk" | grep -Eq '^[a-zA-Z0-9_-]{1,15}$'; then printf '%s\n' "$_lk"; return 0; fi
   case "$1" in
     ?*.*)
       _n="${1##*.}"; _l="${1%.*}"
@@ -714,11 +758,12 @@ STATIC
 }
 
 # ─── The management address on a tagged VLAN (nuit-cloud/nuit-cloud#197) ─────────────────────────────────────────────────────────
-# The platform names a VLAN (NCS_MANAGEMENT_VLAN), the address's prefix and the VLAN's gateway: the address moves onto <parent>.<vlan>,
-# and the machine's default route with it (the owner's decision), off the untagged address it had. <parent> is the physical interface
-# under today's default route. The parent stays up with no address of its own ("inet manual"): the tenant VLAN <parent>.5 and its
-# tenant addresses hang off it. The same discipline as above, with a state directory and a safety timer of its own
-# (nuit-cloud-address-vlan-rollback; the tenant VLAN's timer, table 105 and mark 0x5 are not touched):
+# The platform names a VLAN (NCS_MANAGEMENT_VLAN), the address's prefix and the VLAN's gateway: the address moves onto the VLAN's
+# interface (<parent>.<vlan>, or vlan<vlan> when the dotted name would be longer than 15 characters: vlan_ifname), and the machine's
+# default route with it (the owner's decision), off the untagged address it had. <parent> is the physical interface under today's
+# default route. The parent stays up with no address of its own ("inet manual"): the tenant VLAN and its tenant addresses hang off it.
+# The same discipline as above, with a state directory and a safety timer of its own (nuit-cloud-address-vlan-rollback; the tenant
+# VLAN's timer, table 105 and mark 0x5 are not touched):
 #   * the timer that puts everything back is armed before anything changes;
 #   * the VLAN interface and the new address come first, beside the old address; the default route then moves to the new gateway;
 #   * proof: the platform answers from the new address and the new gateway answers on the VLAN, or everything is undone at once;
@@ -742,7 +787,7 @@ addr_stanza() { [ -f "$1" ] && awk -v i="$2" -v m="$3" '$1 == "iface" && $2 == i
 # stanza, and no other file still asks DHCP for the parent.
 addr_vlan_ok() {
   addr_vlan_inputs_ok || return 1
-  mvif="$A_PARENT.$NCS_MANAGEMENT_VLAN"
+  mvif="$(vlan_dev "$A_PARENT" "$NCS_MANAGEMENT_VLAN")"
   [ "$A_IF" = "$mvif" ] && [ "$A_GW" = "$NCS_MANAGEMENT_GATEWAY" ] || return 1
   ip -4 -o addr show dev "$mvif" 2>/dev/null | awk '{print $4}' | grep -qx "$NCS_MANAGEMENT_ADDRESS/$NCS_MANAGEMENT_PREFIX" || return 1
   sf="$(p "$ADDR_STATIC_FILE")"
@@ -763,8 +808,10 @@ addr_vlan_do() {
   [ -n "${NCS_PLATFORM_URL:-}" ] || { echo "  the platform's address was not passed in, so the move cannot be proved safe" >&2; return 3; }
   printf '%s\n' "$A_IF" | grep -Eq '^[a-zA-Z0-9._-]{1,15}$' || { echo "  odd interface name $A_IF" >&2; return 3; }
   par="$A_PARENT"
-  printf '%s\n' "$par" | grep -Eq '^[a-zA-Z0-9_-]{1,10}$' || { echo "  the interface name $par cannot carry a VLAN sub-interface here: set $target by hand" >&2; return 3; }
-  mvif="$par.$vid"
+  printf '%s\n' "$par" | grep -Eq '^[a-zA-Z0-9_-]{1,15}$' || { echo "  the interface name $par cannot carry a VLAN sub-interface here: set $target by hand" >&2; return 3; }
+  mvif="$(vlan_dev "$par" "$vid")"
+  printf '%s\n' "$mvif" | grep -Eq '^[a-zA-Z0-9._-]{1,15}$' || { echo "  odd VLAN interface name $mvif: set $target by hand" >&2; return 3; }
+  vlan_name_free "$mvif" "$par" "$vid" || { echo "  $mvif exists already and is not VLAN $vid on $par: set $target by hand" >&2; return 3; }
   # from the untagged network, or again onto the same VLAN (a move that did not finish); from one VLAN onto another is a person's job
   [ "$A_IF" = "$par" ] || [ "$A_IF" = "$mvif" ] || { echo "  the default route is on the VLAN interface $A_IF already: moving from one VLAN to another is left to a person" >&2; return 3; }
   [ ! -e "$(p "/etc/network/interfaces.d/nuit-cloud-vlan$vid")" ] || { echo "  VLAN $vid is this machine's tenant VLAN: the management address cannot go on it" >&2; return 3; }
@@ -895,9 +942,10 @@ ROLLBACK
 }
 
 # ─── The tenant VLAN slice (ticket #67; ports nuit-cloud/nuit-cloud-servers scripts/server-vlan5.sh) ───────────────────────────────────────────────────────
-# Adds a VLAN sub-interface on the machine's default-route interface carrying the slice the platform allocated: the node's own
-# address and the tenant block as secondary addresses, plus the rules that send replies for connections that arrived on the VLAN
-# back out by the VLAN gateway (without them a reply from a tenant address leaves by the wrong interface and the router drops it).
+# Adds a VLAN sub-interface (<parent>.<id>, or vlan<id> where that would not fit) on the machine's default-route interface carrying
+# the slice the platform allocated: the node's own address and the tenant block as secondary addresses, plus the rules that send
+# replies for connections that arrived on the VLAN back out by the VLAN gateway (without them a reply from a tenant address leaves by
+# the wrong interface and the router drops it).
 # The agent passes NCS_VLAN_ID, NCS_VLAN_ADDRESS, NCS_VLAN_PREFIX, NCS_VLAN_GATEWAY and NCS_VLAN_TENANT_ADDRESSES (may be empty).
 # Tenant addresses are leases that follow their services between machines (nuit-cloud/nuit-cloud#189): the tenant-address task adds
 # and removes them, one `post-up ip addr add` line each in the same file. This feature owns the interface and the node's own address; it
@@ -932,19 +980,25 @@ vlan_tenant_lines() {
   done
 }
 
-vlan_render() { # vlan_render <interface> [existing file]  -> the stanza on stdout, keeping the existing file's tenant lines
-  _if="$1"; _vif="$_if.$NCS_VLAN_ID"
+# vlan_render <parent> [existing file] [VLAN interface] -> the stanza on stdout, keeping the existing file's tenant lines. The VLAN
+# interface is <parent>.<id> unless given, or unless that would not fit (vlan<id>, which then names its parent with vlan-raw-device).
+vlan_render() {
+  _if="$1"; _vif="${3:-$(vlan_ifname "$_if" "$NCS_VLAN_ID")}"
+  _vsys="$(printf '%s' "$_vif" | tr . /)"   # sysctl writes a dot in an interface name as a slash
   cat <<EOF
 # Managed by the nuit-cloud agent (ncs_vlan): the tenant VLAN slice the platform allocated for this machine.
 auto ${_vif}
 iface ${_vif} inet static
     address ${NCS_VLAN_ADDRESS}/${NCS_VLAN_PREFIX}
+EOF
+  [ "$_vif" = "$_if.$NCS_VLAN_ID" ] || echo "    vlan-raw-device ${_if}"
+  cat <<EOF
     pre-up modprobe 8021q 2>/dev/null || true
     pre-up ip link show ${_vif} >/dev/null 2>&1 || ip link add link ${_if} name ${_vif} type vlan id ${NCS_VLAN_ID}
 EOF
   vlan_tenant_lines "$_vif" "${2:-}"
   cat <<EOF
-    post-up sysctl -qw net.ipv4.conf.${_if}/${NCS_VLAN_ID}.rp_filter=2
+    post-up sysctl -qw net.ipv4.conf.${_vsys}.rp_filter=2
     post-up iptables -t mangle -C PREROUTING -i ${_vif} -m conntrack --ctstate NEW -j CONNMARK --set-mark ${VLAN_MARK} 2>/dev/null || iptables -t mangle -A PREROUTING -i ${_vif} -m conntrack --ctstate NEW -j CONNMARK --set-mark ${VLAN_MARK}
     post-up iptables -t mangle -C PREROUTING ! -i ${_vif} -m connmark --mark ${VLAN_MARK} -j CONNMARK --restore-mark 2>/dev/null || iptables -t mangle -A PREROUTING ! -i ${_vif} -m connmark --mark ${VLAN_MARK} -j CONNMARK --restore-mark
     post-up ip route replace default via ${NCS_VLAN_GATEWAY} dev ${_vif} table ${VLAN_TABLE}
@@ -968,7 +1022,7 @@ vlan_inputs_ok() {
 f_ncs_vlan_ok() {
   vlan_inputs_ok && addr_discover || return 1
   _file="$(p "$(vlan_file)")"
-  _vif="$A_PARENT.$NCS_VLAN_ID"
+  _vif="$(vlan_dev "$A_PARENT" "$NCS_VLAN_ID")"
   # what this feature writes, or an equivalent configuration made by hand (nuit-cloud/nuit-cloud-servers scripts/server-vlan5.sh): the
   # sub-interface with the node's own address, and every given tenant address named in it. Other tenant lines are the tenant-address
   # task's and are allowed. A working VLAN made by hand is adopted as it is, never rewritten.
@@ -990,11 +1044,13 @@ f_ncs_vlan_do() {
   command -v iptables >/dev/null 2>&1 || apt-get install -y -qq iptables >/dev/null 2>&1 || true
   command -v systemd-run >/dev/null 2>&1 && command -v iptables >/dev/null 2>&1 || { echo "  systemd-run (the safety timer) and iptables (reply routing) are needed" >&2; return 3; }
   addr_discover && [ -n "$A_GW" ] || { echo "  could not find the default route and its interface" >&2; return 3; }
-  # the VLAN hangs off the physical interface: when the management address is itself on a VLAN (<if>.<n>, nuit-cloud/nuit-cloud#197),
-  # off <if>, beside it
-  printf '%s\n' "$A_PARENT" | grep -Eq '^[a-zA-Z0-9_-]{1,10}$' || { echo "  the interface name $A_PARENT cannot carry a VLAN sub-interface here" >&2; return 3; }
-  [ "$A_IF" != "$A_PARENT.$NCS_VLAN_ID" ] || { echo "  the machine's default route is on $A_IF, which is the tenant VLAN's own interface: set this up by hand" >&2; return 3; }
-  vif="$A_PARENT.$NCS_VLAN_ID"
+  # the VLAN hangs off the physical interface: when the management address is itself on a VLAN (nuit-cloud/nuit-cloud#197), off that
+  # VLAN's parent, beside it. Its interface is <parent>.<id>, or vlan<id> when that would be longer than 15 characters (vlan_ifname).
+  printf '%s\n' "$A_PARENT" | grep -Eq '^[a-zA-Z0-9_-]{1,15}$' || { echo "  the interface name $A_PARENT cannot carry a VLAN sub-interface here" >&2; return 3; }
+  vif="$(vlan_dev "$A_PARENT" "$NCS_VLAN_ID")"
+  printf '%s\n' "$vif" | grep -Eq '^[a-zA-Z0-9._-]{1,15}$' || { echo "  odd VLAN interface name $vif: set the VLAN up by hand" >&2; return 3; }
+  [ "$A_IF" != "$vif" ] || { echo "  the machine's default route is on $A_IF, which is the tenant VLAN's own interface: set this up by hand" >&2; return 3; }
+  vlan_name_free "$vif" "$A_PARENT" "$NCS_VLAN_ID" || { echo "  $vif exists already and is not VLAN $NCS_VLAN_ID on $A_PARENT: set the VLAN up by hand" >&2; return 3; }
   # ifup of a VLAN sub-interface first brings up its parent interface unless ifupdown already has it recorded as up; on a machine whose
   # parent was configured another way that would run its address configuration again. Found on a real kernel: only proceed if ifupdown
   # itself holds the parent up.
@@ -1030,7 +1086,7 @@ ROLLBACK
 
   mkdir -p "$(dirname "$file")"
   # the tenant lines already there (the tenant-address task's, or a hand setup's) are kept; the given ones are added
-  if [ "$existing" = 1 ]; then vlan_render "$A_PARENT" "$d/previous" >"$file"; else vlan_render "$A_PARENT" >"$file"; fi
+  if [ "$existing" = 1 ]; then vlan_render "$A_PARENT" "$d/previous" "$vif" >"$file"; else vlan_render "$A_PARENT" "" "$vif" >"$file"; fi
   [ -e "$(p /etc/modules-load.d/8021q.conf)" ] || { mkdir -p "$(p /etc/modules-load.d)"; echo 8021q >"$(p /etc/modules-load.d/8021q.conf)"; }   # load the VLAN module at boot
   systemctl restart systemd-modules-load.service >/dev/null 2>&1 || true   # the agent's own sandbox may not load modules; systemd can
   if ! ifup "$vif" >"$d/ifup.out" 2>&1; then

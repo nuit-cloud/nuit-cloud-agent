@@ -67,6 +67,13 @@ const (
 	line3    = "    post-up ip addr add 10.20.0.3/24 dev enp0s31f6.5 2>/dev/null || true\n"
 )
 
+// vlan is what `ip -d` reports for a VLAN interface with this 802.1Q id.
+func vlan(id int) *linkInfo {
+	l := &linkInfo{Kind: "vlan"}
+	l.Data.Protocol, l.Data.ID = "802.1Q", id
+	return l
+}
+
 // fakeMachine is a machine's interfaces as `ip` sees them, changed by the `ip addr add`/`del` it is asked to run.
 type fakeMachine struct {
 	ifaces []iface
@@ -76,7 +83,7 @@ type fakeMachine struct {
 
 func (f *fakeMachine) ip(_ context.Context, args ...string) (string, error) {
 	f.calls = append(f.calls, strings.Join(args, " "))
-	if len(args) == 3 && args[0] == "-j" {
+	if len(args) == 4 && args[0] == "-d" && args[1] == "-j" {
 		b, _ := json.Marshal(f.ifaces)
 		return string(b), nil
 	}
@@ -115,7 +122,7 @@ func (f *fakeMachine) ip(_ context.Context, args ...string) (string, error) {
 func (f *fakeMachine) changes() []string {
 	var out []string
 	for _, c := range f.calls {
-		if !strings.HasPrefix(c, "-j ") {
+		if !strings.HasPrefix(c, "-d -j ") {
 			out = append(out, c)
 		}
 	}
@@ -135,7 +142,7 @@ func (f *fakeMachine) on(name, addr string) bool {
 // newMachine has a loopback, the parent interface, a container bridge and the VLAN interface with the node's address and the given
 // tenant addresses.
 func newMachine(tenants ...string) *fakeMachine {
-	vif := iface{Index: 4, Name: "enp0s31f6.5", MAC: vifMAC, Addrs: []ifaceAddr{{Family: "inet", Local: "10.20.0.2", PrefixLen: 24}}}
+	vif := iface{Index: 4, Name: "enp0s31f6.5", MAC: vifMAC, Addrs: []ifaceAddr{{Family: "inet", Local: "10.20.0.2", PrefixLen: 24}}, LinkInfo: vlan(5)}
 	for _, t := range tenants {
 		vif.Addrs = append(vif.Addrs, ifaceAddr{Family: "inet", Local: t, PrefixLen: 24, Secondary: true})
 	}
@@ -374,7 +381,7 @@ func TestTakeAddsTheAddressAfterTheLastTenantLineAndAnnouncesIt(t *testing.T) {
 func TestAManagementVLANBesideTheTenantVLANIsLeftAlone(t *testing.T) {
 	root, file := scratch(t, agentFile)
 	m := newMachine("10.20.0.3", "10.20.0.30", "10.20.0.4")
-	m.ifaces = append(m.ifaces, iface{Index: 5, Name: "enp0s31f6.31", MAC: vifMAC, Addrs: []ifaceAddr{{Family: "inet", Local: "10.31.0.18", PrefixLen: 24}}})
+	m.ifaces = append(m.ifaces, iface{Index: 5, Name: "enp0s31f6.31", MAC: vifMAC, Addrs: []ifaceAddr{{Family: "inet", Local: "10.31.0.18", PrefixLen: 24}}, LinkInfo: vlan(31)})
 	a := &fakeARP{}
 	if _, err := mover(root, m, a).Take(context.Background(), params("take", "10.20.0.7")); err != nil {
 		t.Fatal(err)
@@ -391,12 +398,50 @@ func TestAManagementVLANBesideTheTenantVLANIsLeftAlone(t *testing.T) {
 		t.Errorf("the file is\n%s", read(t, file))
 	}
 	// a management VLAN whose id ends in the tenant VLAN's digits (15, 105) is not a second interface for VLAN 5
-	for _, name := range []string{"enp0s31f6.15", "enp0s31f6.105"} {
+	for name, id := range map[string]int{"enp0s31f6.15": 15, "enp0s31f6.105": 105} {
 		root, _ := scratch(t, agentFile)
 		m := newMachine()
-		m.ifaces = append(m.ifaces, iface{Index: 5, Name: name, MAC: vifMAC, Addrs: []ifaceAddr{{Family: "inet", Local: "10.31.0.18", PrefixLen: 24}}})
+		m.ifaces = append(m.ifaces, iface{Index: 5, Name: name, MAC: vifMAC, Addrs: []ifaceAddr{{Family: "inet", Local: "10.31.0.18", PrefixLen: 24}}, LinkInfo: vlan(id)})
 		if _, err := mover(root, m, &fakeARP{}).Take(context.Background(), params("take", "10.20.0.7")); err != nil {
 			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+// A parent whose name leaves no room for <parent>.5 (a Raspberry Pi's enx<mac> is 15 characters, the kernel's limit) carries the tenant
+// VLAN as vlan5 (nuit-cloud/nuit-cloud#197). The VLAN interface is the one the kernel reports as VLAN 5, whichever name it has, and a
+// VLAN 15 or 105 beside it is never taken for it, whatever its name.
+func TestTheTenantVLANIsFoundByItsVLANIdWhateverItsName(t *testing.T) {
+	for _, vif := range []string{"vlan5", "enp0s31f6.5"} {
+		for _, others := range [][]string{nil, {"vlan15", "vlan105"}, {"enp0s31f6.15", "enp0s31f6.105"}, {"vlan15", "enp0s31f6.105"}} {
+			root, file := scratch(t, strings.ReplaceAll(agentFile, "enp0s31f6.5", vif))
+			m := newMachine("10.20.0.3")
+			m.ifaces[3].Name = vif
+			for i, o := range others {
+				id := 15
+				if strings.HasSuffix(o, "105") {
+					id = 105
+				}
+				m.ifaces = append(m.ifaces, iface{Index: 10 + i, Name: o, MAC: vifMAC, Addrs: []ifaceAddr{{Family: "inet", Local: "10.31.0.18", PrefixLen: 24}}, LinkInfo: vlan(id)})
+			}
+			a := &fakeARP{}
+			if _, err := mover(root, m, a).Take(context.Background(), params("take", "10.20.0.7")); err != nil {
+				t.Fatalf("%s beside %v: %v", vif, others, err)
+			}
+			if got := m.changes(); len(got) != 1 || got[0] != "addr add 10.20.0.7/24 dev "+vif {
+				t.Errorf("%s beside %v: ran %v", vif, others, got)
+			}
+			for _, l := range a.links {
+				if l.Name != vif {
+					t.Errorf("%s beside %v: ARP on %+v", vif, others, l)
+				}
+			}
+			if !strings.Contains(read(t, file), TenantLine(netip.MustParseAddr("10.20.0.7"), 24, vif)) {
+				t.Errorf("%s beside %v: the file is\n%s", vif, others, read(t, file))
+			}
+			if _, err := mover(root, m, a).Release(context.Background(), params("release", "10.20.0.3")); err != nil || m.on(vif, "10.20.0.3") || strings.Contains(read(t, file), "10.20.0.3/") {
+				t.Errorf("%s beside %v: release: %v\n%s", vif, others, err, read(t, file))
+			}
 		}
 	}
 }
@@ -527,13 +572,25 @@ func TestWithoutOneVLANInterfaceAndItsFileNothingIsDone(t *testing.T) {
 		"no VLAN interface": {func() *fakeMachine { m := newMachine(); m.ifaces = m.ifaces[:3]; return m }, agentFile, "no interface for VLAN 5"},
 		"two VLAN interfaces": {func() *fakeMachine {
 			m := newMachine()
-			m.ifaces = append(m.ifaces, iface{Index: 9, Name: "eth1.5", MAC: otherMAC})
+			m.ifaces = append(m.ifaces, iface{Index: 9, Name: "eth1.5", MAC: otherMAC, LinkInfo: vlan(5)})
 			return m
 		}, agentFile, "2 interfaces for VLAN 5 (enp0s31f6.5, eth1.5)"},
-		"no VLAN file":       {func() *fakeMachine { return newMachine() }, "", "no tenant VLAN set up by the platform"},
-		"another interface":  {func() *fakeMachine { return newMachine() }, strings.ReplaceAll(agentFile, "iface enp0s31f6.5 inet static", "iface eth0.5 inet static"), "no tenant VLAN set up by the platform"},
-		"no address line":    {func() *fakeMachine { return newMachine() }, strings.ReplaceAll(agentFile, "    address 10.20.0.2/24\n", ""), "no tenant VLAN set up by the platform"},
-		"VLAN 15 is not 5":   {func() *fakeMachine { m := newMachine(); m.ifaces[3].Name = "enp0s31f6.15"; return m }, agentFile, "no interface for VLAN 5"},
+		"no VLAN file":      {func() *fakeMachine { return newMachine() }, "", "no tenant VLAN set up by the platform"},
+		"another interface": {func() *fakeMachine { return newMachine() }, strings.ReplaceAll(agentFile, "iface enp0s31f6.5 inet static", "iface eth0.5 inet static"), "no tenant VLAN set up by the platform"},
+		"no address line":   {func() *fakeMachine { return newMachine() }, strings.ReplaceAll(agentFile, "    address 10.20.0.2/24\n", ""), "no tenant VLAN set up by the platform"},
+		"VLAN 15 is not 5": {func() *fakeMachine {
+			m := newMachine()
+			m.ifaces[3].Name, m.ifaces[3].LinkInfo = "enp0s31f6.15", vlan(15)
+			return m
+		}, agentFile, "no interface for VLAN 5"},
+		// the name is not what makes an interface VLAN 5: the kernel's VLAN id is
+		"named .5, not a VLAN": {func() *fakeMachine { m := newMachine(); m.ifaces[3].LinkInfo = nil; return m }, agentFile, "no interface for VLAN 5"},
+		"named .5, VLAN 15":    {func() *fakeMachine { m := newMachine(); m.ifaces[3].LinkInfo = vlan(15); return m }, agentFile, "no interface for VLAN 5"},
+		"an 802.1ad VLAN 5": {func() *fakeMachine {
+			m := newMachine()
+			m.ifaces[3].LinkInfo.Data.Protocol = "802.1ad"
+			return m
+		}, agentFile, "no interface for VLAN 5"},
 		"a hostile ifname":   {func() *fakeMachine { m := newMachine(); m.ifaces[3].Name = "a;reboot.5"; return m }, agentFile, "is not one the agent writes"},
 		"a file, not a link": {func() *fakeMachine { return newMachine() }, "symlink", "not a regular file"},
 	}

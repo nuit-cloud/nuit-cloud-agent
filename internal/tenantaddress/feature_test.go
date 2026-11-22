@@ -2,6 +2,7 @@ package tenantaddress
 
 import (
 	"context"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +13,12 @@ import (
 // renderByFeature is the VLAN file the real ncs_vlan feature (internal/profiles/bootstrap/features.sh, vlan_render) writes for node
 // 10.20.0.2/24 on enp0s31f6.5 with the given tenant addresses, keeping the tenant lines of existing (when not empty), as its apply does.
 func renderByFeature(t *testing.T, tenants, existing string) string {
+	t.Helper()
+	return renderByFeatureOn(t, "enp0s31f6", tenants, existing)
+}
+
+// renderByFeatureOn is renderByFeature with the VLAN on another parent interface.
+func renderByFeatureOn(t *testing.T, parent, tenants, existing string) string {
 	t.Helper()
 	sh, err := exec.LookPath("sh")
 	if err != nil {
@@ -28,7 +35,7 @@ func renderByFeature(t *testing.T, tenants, existing string) string {
 			t.Fatal(err)
 		}
 	}
-	cmd := exec.Command(sh, "-eu", "-c", `. "$1"; vlan_render enp0s31f6 "$2"`, "render", features, prev)
+	cmd := exec.Command(sh, "-eu", "-c", `. "$1"; vlan_render "$3" "$2"`, "render", features, prev, parent)
 	cmd.Env = append(os.Environ(), "NC_USER=nuit", "NCS_VLAN_ID=5", "NCS_VLAN_PREFIX=24", "NCS_VLAN_ADDRESS=10.20.0.2", "NCS_VLAN_GATEWAY=10.20.0.1",
 		"NCS_VLAN_TENANT_ADDRESSES="+tenants)
 	out, err := cmd.Output()
@@ -118,5 +125,36 @@ func TestAFileTheFeatureRewroteFromAHandMadeOneKeepsItsTenantAddresses(t *testin
 	}
 	if strings.Contains(read(t, file), "10.20.0.30/") || !strings.Contains(read(t, file), "ip addr add 10.20.0.3/24") {
 		t.Errorf("the release took the wrong line:\n%s", read(t, file))
+	}
+}
+
+// On a parent whose name leaves no room for <parent>.5 (a Raspberry Pi's enx<mac>, 15 characters; nuit-cloud/nuit-cloud#197) the feature
+// writes vlan5, tied to its parent by vlan-raw-device, and Take and Release work on that file and that interface.
+func TestTakeAndReleaseWorkOnTheVLAN5FileTheFeatureWritesForAFifteenCharacterParent(t *testing.T) {
+	const parent = "enxb827ebdbcb96"
+	content := renderByFeatureOn(t, parent, "10.20.0.3", "")
+	for _, want := range []string{"auto vlan5\n", "iface vlan5 inet static\n", "    vlan-raw-device " + parent + "\n",
+		"ip link add link " + parent + " name vlan5 type vlan id 5", "net.ipv4.conf.vlan5.rp_filter=2", TenantLine(netip.MustParseAddr("10.20.0.3"), 24, "vlan5")} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("the feature rendered no %q:\n%s", want, content)
+		}
+	}
+	if strings.Contains(content, parent+".5") {
+		t.Fatalf("the feature rendered an interface name longer than 15 characters:\n%s", content)
+	}
+	root, file := scratch(t, content)
+	m := newMachine("10.20.0.3")
+	m.ifaces[1].Name, m.ifaces[3].Name = parent, "vlan5"
+	if _, err := mover(root, m, &fakeARP{}).Take(context.Background(), params("take", "10.20.0.7")); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.changes(); len(got) != 1 || got[0] != "addr add 10.20.0.7/24 dev vlan5" || !strings.Contains(read(t, file), TenantLine(netip.MustParseAddr("10.20.0.7"), 24, "vlan5")) {
+		t.Fatalf("ran %v; the file is\n%s", got, read(t, file))
+	}
+	if _, err := mover(root, m, &fakeARP{}).Release(context.Background(), params("release", "10.20.0.3")); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(read(t, file), "10.20.0.3/") || m.on("vlan5", "10.20.0.3") {
+		t.Errorf("after the release the file is\n%s", read(t, file))
 	}
 }

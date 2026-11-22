@@ -21,13 +21,13 @@ iface eth0.5 inet static
 `
 
 const ipShow = `[{"ifindex":1,"ifname":"lo","address":"00:00:00:00:00:00","addr_info":[{"family":"inet","local":"127.0.0.1","prefixlen":8}]},` +
-	`{"ifindex":3,"ifname":"eth0.5","link":"eth0","address":"aa:bb:cc:dd:ee:01","addr_info":[{"family":"inet","local":"10.20.0.2","prefixlen":24},{"family":"inet","local":"10.20.0.3","prefixlen":24,"secondary":true}]}]`
+	`{"ifindex":3,"ifname":"eth0.5","link":"eth0","address":"aa:bb:cc:dd:ee:01","linkinfo":{"info_kind":"vlan","info_data":{"protocol":"802.1Q","id":5,"flags":["REORDER_HDR"]}},"addr_info":[{"family":"inet","local":"10.20.0.2","prefixlen":24},{"family":"inet","local":"10.20.0.3","prefixlen":24,"secondary":true}]}]`
 
-// recordingIP answers `ip -j addr show` with ipShow and records every other command.
+// recordingIP answers `ip -d -j addr show` with ipShow and records every other command.
 type recordingIP struct{ changes []string }
 
 func (r *recordingIP) run(_ context.Context, args ...string) (string, error) {
-	if len(args) > 0 && args[0] == "-j" {
+	if len(args) > 1 && args[0] == "-d" && args[1] == "-j" {
 		return ipShow, nil
 	}
 	r.changes = append(r.changes, strings.Join(args, " "))
