@@ -35,34 +35,43 @@ var keyTypes = map[string]bool{
 // treats as a platform line, which it removes unless the registry lists it, so the survey and the feature agree on what is managed.
 var managedMarker = regexp.MustCompile(`^nuit-cloud:([a-z0-9][a-z0-9-]*)$`)
 
-// ParseAuthorizedKeys reads an authorized_keys file. A line with options before the key is found by its key type; a line that holds
-// no recognisable key is skipped. A line is the platform's only when it is exactly `<type> <base64> nuit-cloud:<id>`.
+// ClassifyAuthorizedKeyLine reads one line of an authorized_keys file (its line ending, if any, is ignored). A line with options before
+// the key is found by its key type; a blank line, a comment or a line that holds no recognisable key is not a key (ok false). A line is
+// the platform's (ManagedID set) only when it is exactly `<type> <base64> nuit-cloud:<id>`. The survey and the ssh-key-remove task both
+// read lines with it, so they agree on what a key and a platform line are.
+func ClassifyAuthorizedKeyLine(line string) (AuthorizedKey, bool) {
+	line = strings.TrimSpace(line)
+	if line == "" || strings.HasPrefix(line, "#") {
+		return AuthorizedKey{}, false
+	}
+	fields := strings.Fields(line)
+	for i := 0; i+1 < len(fields); i++ {
+		if !keyTypes[fields[i]] {
+			continue
+		}
+		blob, err := base64.StdEncoding.DecodeString(fields[i+1])
+		if err != nil || len(blob) == 0 {
+			return AuthorizedKey{}, false
+		}
+		sum := sha256.Sum256(blob)
+		k := AuthorizedKey{Fingerprint: "SHA256:" + base64.RawStdEncoding.EncodeToString(sum[:]), Type: fields[i]}
+		if i == 0 && len(fields) == 3 {
+			if m := managedMarker.FindStringSubmatch(fields[2]); m != nil {
+				id := m[1]
+				k.ManagedID = &id
+			}
+		}
+		return k, true
+	}
+	return AuthorizedKey{}, false
+}
+
+// ParseAuthorizedKeys reads an authorized_keys file, one ClassifyAuthorizedKeyLine per line, skipping lines that hold no key.
 func ParseAuthorizedKeys(text string) []AuthorizedKey {
 	out := []AuthorizedKey{}
 	for _, line := range strings.Split(text, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		fields := strings.Fields(line)
-		for i := 0; i+1 < len(fields); i++ {
-			if !keyTypes[fields[i]] {
-				continue
-			}
-			blob, err := base64.StdEncoding.DecodeString(fields[i+1])
-			if err != nil || len(blob) == 0 {
-				break
-			}
-			sum := sha256.Sum256(blob)
-			k := AuthorizedKey{Fingerprint: "SHA256:" + base64.RawStdEncoding.EncodeToString(sum[:]), Type: fields[i]}
-			if i == 0 && len(fields) == 3 {
-				if m := managedMarker.FindStringSubmatch(fields[2]); m != nil {
-					id := m[1]
-					k.ManagedID = &id
-				}
-			}
+		if k, ok := ClassifyAuthorizedKeyLine(line); ok {
 			out = append(out, k)
-			break
 		}
 		if len(out) == maxAuthorizedKeys {
 			break
@@ -71,15 +80,16 @@ func ParseAuthorizedKeys(text string) []AuthorizedKey {
 	return out
 }
 
-// loginHome finds the login account's home in /etc/passwd (the account is a local one, made when the machine was installed).
-func loginHome(passwd string) string {
+// LoginEntry finds the login account in /etc/passwd (the account is a local one, made when the machine was installed) and returns its
+// home and numeric primary group id; both are empty when there is no such account.
+func LoginEntry(passwd string) (home, gid string) {
 	for _, line := range strings.Split(passwd, "\n") {
 		f := strings.Split(line, ":")
 		if len(f) >= 7 && f[0] == LoginAccount {
-			return f[5]
+			return f[5], f[3]
 		}
 	}
-	return ""
+	return "", ""
 }
 
 // collectAuthorizedKeys reports the keys that can log in as the platform's login account. A missing file is no keys ([]); a file that
@@ -90,7 +100,7 @@ func collectAuthorizedKeys(s Sources, problem func(string, error)) []AuthorizedK
 		problem("authorized_keys", err)
 		return nil
 	}
-	home := loginHome(passwd)
+	home, _ := LoginEntry(passwd)
 	if home == "" || !strings.HasPrefix(home, "/") {
 		problem("authorized_keys", errors.New("there is no account "+LoginAccount))
 		return nil

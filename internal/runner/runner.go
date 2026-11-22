@@ -30,6 +30,7 @@ import (
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/runtimeinstall"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/servicelog"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/sshconfirm"
+	"github.com/nuit-cloud/nuit-cloud-agent/internal/sshkeyremove"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/survey"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/taskverify"
 	"github.com/nuit-cloud/nuit-cloud-agent/internal/tenantaddress"
@@ -97,6 +98,9 @@ type Runner struct {
 	// RootConsole sets or locks root's console password (root-console): its zero value works on the real machine (chpasswd, usermod,
 	// /etc/shadow); tests give it a scratch root and a stub.
 	RootConsole rootconsole.Console
+	// SSHKeys removes unknown keys from the login account's authorized_keys (ssh-key-remove): its zero value works on the real machine
+	// (/etc/passwd, a transient systemd unit for the write); tests give it a scratch root and a stub writer.
+	SSHKeys sshkeyremove.Remover
 	// Restart is set when a task has changed the agent itself (an update), so the loop restarts it after reporting.
 	Restart *atomic.Bool
 	Now     func() time.Time
@@ -107,7 +111,7 @@ func (r Runner) RestartRequested() bool { return r.Restart != nil && r.Restart.L
 
 // Names is the catalog: what this agent can do.
 func (r Runner) Names() []string {
-	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke", "address-scan", "ssh-confirm", "firewall-confirm", "runtime-repair", "set-hostname", "connectivity-check", "service-log", "trust-key", "retire-key", "volume-export", "volume-import", "volume-remove", "tenant-address", "root-console"}
+	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke", "address-scan", "ssh-confirm", "firewall-confirm", "runtime-repair", "set-hostname", "connectivity-check", "service-log", "trust-key", "retire-key", "volume-export", "volume-import", "volume-remove", "tenant-address", "root-console", "ssh-key-remove"}
 }
 
 // Run performs one task, bounded by its timeout, and says how it went. It never panics the agent: a task that blows up is a
@@ -166,6 +170,8 @@ func (r Runner) Run(ctx context.Context, task *taskverify.Task) (report client.R
 		return r.tenantAddress(ctx, task)
 	case "root-console":
 		return r.rootConsole(ctx, task)
+	case "ssh-key-remove":
+		return r.sshKeyRemove(ctx, task)
 	}
 	return client.Report{Status: "failed", ExitCode: &one, Output: "unknown task " + task.Name}
 }
@@ -1057,6 +1063,23 @@ func (r Runner) rootConsole(ctx context.Context, task *taskverify.Task) client.R
 		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
 	}
 	return client.Report{Status: "done", ExitCode: &zero, Output: "root's console password is set (" + res.Scheme + ")", Result: res}
+}
+
+// sshKeyRemove takes keys the registry does not know out of the login account's authorized_keys, by fingerprint
+// (nuit-cloud/nuit-cloud#200). The params are checked again here (exactly fingerprints, keep and requireOneOf, each a list of unique
+// SHA256 fingerprints, none to remove also kept or required); anything else changes nothing. Only unmarked lines are removed, never
+// one holding a keep key, and never so that no administrator or break-glass key is left. Only fingerprints are reported.
+func (r Runner) sshKeyRemove(ctx context.Context, task *taskverify.Task) client.Report {
+	one, zero := 1, 0
+	p, err := sshkeyremove.Parse(task.Params)
+	if err != nil {
+		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+	}
+	res, err := r.SSHKeys.Remove(ctx, p)
+	if err != nil {
+		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+	}
+	return client.Report{Status: "done", ExitCode: &zero, Output: res.Summary(), Result: res}
 }
 
 // firewallConfirm completes the baseline firewall once the platform has tested from outside.
