@@ -360,6 +360,74 @@ func TestTheManagementAddressReachesTheScriptsAsEnvironment(t *testing.T) {
 	}
 }
 
+// Moving the management address onto a tagged VLAN (nuit-cloud/nuit-cloud#197): the VLAN, prefix and gateway reach the scripts, and a
+// combination that does not make sense never reaches them.
+func TestAManagementVLANReachesTheScriptsAndABadCombinationIsRefused(t *testing.T) {
+	good := func() map[string]any {
+		return map[string]any{"managementAddress": "10.31.0.18", "vlanId": float64(31), "prefix": float64(24), "gateway": "10.31.0.1"}
+	}
+	f := &fakeProfiles{res: profiles.Result{Features: []profiles.Feature{{Name: "ncs_address", Status: "applied"}}}}
+	r := withProfiles(f)
+	r.PlatformURL = "https://agent.example"
+	task := &taskverify.Task{Name: "profile-apply", TimeoutSeconds: 30, Params: map[string]any{"profile": "nuit-cloud-address", "network": good()}}
+	if rep := r.Run(context.Background(), task); rep.Status != "done" || strings.Join(f.env, "|") != "NCS_MANAGEMENT_ADDRESS=10.31.0.18|NCS_PLATFORM_URL=https://agent.example|NCS_MANAGEMENT_VLAN=31|NCS_MANAGEMENT_PREFIX=24|NCS_MANAGEMENT_GATEWAY=10.31.0.1" {
+		t.Errorf("%+v env=%v", rep, f.env)
+	}
+	// the edges of what is allowed
+	for name, mutate := range map[string]func(map[string]any){
+		"vlan 1":    func(m map[string]any) { m["vlanId"] = float64(1) },
+		"vlan 4094": func(m map[string]any) { m["vlanId"] = float64(4094) },
+		"/16":       func(m map[string]any) { m["prefix"] = float64(16); m["gateway"] = "10.31.255.254" },
+		"/30":       func(m map[string]any) { m["managementAddress"] = "10.31.0.2"; m["prefix"] = float64(30) },
+	} {
+		v := good()
+		mutate(v)
+		f2 := &fakeProfiles{}
+		task.Params["network"] = v
+		if rep := withProfiles(f2).Run(context.Background(), task); rep.Status != "done" || len(f2.calls) != 1 || len(f2.env) != 5 {
+			t.Errorf("%s: %+v env=%v", name, rep, f2.env)
+		}
+	}
+	for name, mutate := range map[string]func(map[string]any){
+		"vlan without prefix":    func(m map[string]any) { delete(m, "prefix") },
+		"vlan without gateway":   func(m map[string]any) { delete(m, "gateway") },
+		"prefix without vlan":    func(m map[string]any) { delete(m, "vlanId"); delete(m, "gateway") },
+		"gateway without vlan":   func(m map[string]any) { delete(m, "vlanId"); delete(m, "prefix") },
+		"vlan 0":                 func(m map[string]any) { m["vlanId"] = float64(0) },
+		"vlan 4095":              func(m map[string]any) { m["vlanId"] = float64(4095) },
+		"vlan not whole":         func(m map[string]any) { m["vlanId"] = 31.5 },
+		"vlan as text":           func(m map[string]any) { m["vlanId"] = "31" },
+		"vlan null":              func(m map[string]any) { m["vlanId"] = nil },
+		"vlan hostile":           func(m map[string]any) { m["vlanId"] = "31; reboot" },
+		"prefix 15":              func(m map[string]any) { m["prefix"] = float64(15) },
+		"prefix 31":              func(m map[string]any) { m["prefix"] = float64(31) },
+		"prefix as text":         func(m map[string]any) { m["prefix"] = "24" },
+		"gateway outside subnet": func(m map[string]any) { m["gateway"] = "10.10.10.1" },
+		"gateway is the address": func(m map[string]any) { m["gateway"] = "10.31.0.18" },
+		"gateway is the network": func(m map[string]any) { m["gateway"] = "10.31.0.0" },
+		"gateway is broadcast":   func(m map[string]any) { m["gateway"] = "10.31.0.255" },
+		"address is broadcast":   func(m map[string]any) { m["managementAddress"] = "10.31.0.255" },
+		"gateway not IPv4":       func(m map[string]any) { m["gateway"] = "fe80::1" },
+		"gateway hostile":        func(m map[string]any) { m["gateway"] = "10.31.0.1; reboot" },
+		"gateway command":        func(m map[string]any) { m["gateway"] = "$(id)" },
+		"gateway leading zero":   func(m map[string]any) { m["gateway"] = "10.31.0.01" },
+		"gateway outside a /30": func(m map[string]any) {
+			m["managementAddress"] = "10.31.0.2"
+			m["prefix"] = float64(30)
+			m["gateway"] = "10.31.0.5"
+		},
+		"address hostile": func(m map[string]any) { m["managementAddress"] = "10.31.0.18\nNCS_MANAGEMENT_VLAN=5" },
+	} {
+		v := good()
+		mutate(v)
+		f2 := &fakeProfiles{}
+		task.Params["network"] = v
+		if rep := withProfiles(f2).Run(context.Background(), task); rep.Status != "failed" || len(f2.calls) != 0 {
+			t.Errorf("%s: %+v calls=%v", name, rep, f2.calls)
+		}
+	}
+}
+
 func TestAnAddressScanReportsWhatAnswered(t *testing.T) {
 	r := newRunner()
 	r.Scan = func(_ context.Context, first, last string) (lanscan.Result, error) {

@@ -237,7 +237,8 @@ mk_net() { # mk_net <current address> : a Debian with ifupdown whose eth0 got <c
   printf 'auto lo\niface lo inet loopback\nauto eth0\niface eth0 inet dhcp\n    hwaddress ether 02:00:00:00:00:01\n\n# a second interface that must stay\niface eth1 inet static\n    address 192.168.9.2/24\n' >"$ROOT/etc/network/interfaces.d/eth0"
   printf 'eth0 %s/24\neth0.5 10.20.0.2/24\neth0.5 10.20.0.3/24\n' "$1" >"$STATE/ip-addrs"; printf 'default via 10.10.10.1 dev eth0\n' >"$STATE/ip-route"
   printf '10.10.10.0/24 dev eth0 proto kernel scope link src %s\n10.20.0.0/24 dev eth0.5 proto kernel scope link src 10.20.0.2\n' "$1" >"$STATE/ip-routes"; printf '0:\tfrom all lookup local\n100:\tfrom all fwmark 0x5 lookup 105\n' >"$STATE/ip-rules"
-  rm -f "$STATE/active-NetworkManager" "$STATE/arping-dupe" "$STATE/curl-fail" "$STATE/lose-vlan" "$STATE/stubborn"; : >"$CALLS"
+  printf 'lo\neth0\neth1\neth0.5\n' >"$STATE/ip-links"
+  rm -f "$STATE/active-NetworkManager" "$STATE/arping-dupe" "$STATE/curl-fail" "$STATE/lose-vlan" "$STATE/stubborn" "$STATE/gw-silent"; : >"$CALLS"
 }
 stub ip 'case "$*" in
   "-4 route show default") cat "$STATE/ip-route";;
@@ -248,9 +249,15 @@ stub ip 'case "$*" in
   "addr add "*) echo "ip $*" >>"$CALLS"; if [ -e "$STATE/stubborn" ] && [ "$5" = eth0.5 ]; then :; else grep -qx "$5 $3" "$STATE/ip-addrs" || echo "$5 $3" >>"$STATE/ip-addrs"; fi;;
   "addr del "*) echo "ip $*" >>"$CALLS"; grep -vx "$5 $3" "$STATE/ip-addrs" >"$STATE/ip-addrs.new"; mv "$STATE/ip-addrs.new" "$STATE/ip-addrs"
     if [ -e "$STATE/lose-vlan" ]; then grep -v "^eth0.5 " "$STATE/ip-addrs" >"$STATE/ip-addrs.new"; mv "$STATE/ip-addrs.new" "$STATE/ip-addrs"; fi;;
+  "route replace default "*) echo "ip $*" >>"$CALLS"; r="$*"; echo "${r#route replace }" >"$STATE/ip-route";;
   "route replace "*) echo "ip $*" >>"$CALLS";;
+  "link show dev "*) grep -Fqx "$4" "$STATE/ip-links";;
+  "link add "*) echo "ip $*" >>"$CALLS"; echo "$6" >>"$STATE/ip-links";;
+  "link del dev "*) echo "ip $*" >>"$CALLS"; grep -Fvx "$4" "$STATE/ip-links" >"$STATE/ip-links.new"; mv "$STATE/ip-links.new" "$STATE/ip-links"
+    grep -v "^$4 " "$STATE/ip-addrs" >"$STATE/ip-addrs.new"; mv "$STATE/ip-addrs.new" "$STATE/ip-addrs";;
   *) echo "ip $*" >>"$CALLS";;
 esac'
+stub ping 'echo "ping $*" >>"$CALLS"; [ ! -e "$STATE/gw-silent" ]'
 stub ifup 'echo "ifup $*" >>"$CALLS"'
 stub systemd-run 'echo "systemd-run $*" >>"$CALLS"'
 stub arping 'echo "arping $*" >>"$CALLS"; [ ! -e "$STATE/arping-dupe" ]'
@@ -309,6 +316,98 @@ mk_net 10.10.10.170; touch "$STATE/lose-vlan" "$STATE/stubborn"; cp "$ROOT/etc/n
 addr_run 10.10.10.171 >"$tmp/out" 2>&1 && bad "a change that lost the VLAN was kept"
 grep -q 'FAILED  ncs_address' "$tmp/out" && grep -q 'lost other network configuration' "$tmp/out" && grep -q 'addr eth0.5 10.20.0.3/24' "$tmp/out" && cmp -s "$tmp/eth0.before" "$ROOT/etc/network/interfaces.d/eth0" && [ ! -e "$ROOT/etc/network/interfaces.d/nuit-cloud-address" ] \
   && grep -qx 'eth0 10.10.10.170/24' "$STATE/ip-addrs" && ! grep -qx 'eth0 10.10.10.171/24' "$STATE/ip-addrs" && ok "ncs_address: when other network configuration cannot be kept, everything is undone and the loss is named" || { cat "$tmp/out"; cat "$STATE/ip-addrs"; bad "address vlan rollback"; }
+
+# without a management VLAN nothing changes: the same-subnet move never makes a VLAN interface or moves the gateway
+mk_net 10.10.10.170
+addr_run 10.10.10.171 >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "same-subnet move"; }
+grep -q 'done    ncs_address' "$tmp/out" && ! grep -q 'ip link' "$CALLS" && ! grep -q 'vlan-raw-device' "$ROOT/etc/network/interfaces.d/nuit-cloud-address" && [ "$(cat "$STATE/ip-route")" = "default via 10.10.10.1 dev eth0" ] \
+  && ok "ncs_address: without a management VLAN the move stays within the subnet, with no VLAN interface and the same gateway" || { cat "$tmp/out"; cat "$CALLS"; bad "address same subnet unchanged"; }
+
+# 9b. ncs_address onto a tagged VLAN (nuit-cloud/nuit-cloud#197): the address moves onto eth0.31 with the default route; the old one
+#     goes only after the proof; a failed proof puts everything back
+mvlan_run() { env NCS_MANAGEMENT_ADDRESS="${MADDR-10.31.0.18}" NCS_MANAGEMENT_VLAN="${MVLAN-31}" NCS_MANAGEMENT_PREFIX="${MPFX-24}" NCS_MANAGEMENT_GATEWAY="${MGW-10.31.0.1}" NCS_PLATFORM_URL=https://agent.example sh "$here/bootstrap.sh" nuit-cloud-address ${1:+"$1"}; }
+sf="$ROOT/etc/network/interfaces.d/nuit-cloud-address"
+mk_net 10.10.10.170
+mvlan_run --check >"$tmp/out" 2>&1 && bad "a machine still on the old network passed the VLAN check"
+grep -q 'DRIFT   ncs_address' "$tmp/out" && [ ! -s "$CALLS" ] && ok "ncs_address (VLAN): a machine still on the old network is drift, and --check changes nothing" || { cat "$tmp/out"; cat "$CALLS"; bad "mvlan check before"; }
+mvlan_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; cat "$CALLS"; bad "mvlan apply"; }
+line_of() { grep -n "$1" "$CALLS" | head -1 | cut -d: -f1; }
+grep -q 'done    ncs_address' "$tmp/out" && grep -q 'systemd-run.*--unit=nuit-cloud-address-vlan-rollback' "$CALLS" && ! grep -q 'nuit-cloud-vlan-rollback' "$CALLS" \
+  && grep -q 'ip link add link eth0 name eth0.31 type vlan id 31' "$CALLS" && grep -q 'ip link set dev eth0.31 up' "$CALLS" && grep -q 'arping .*-I eth0.31 10.31.0.18' "$CALLS" \
+  && grep -q 'ip addr add 10.31.0.18/24 dev eth0.31' "$CALLS" && grep -q 'ip route replace default via 10.31.0.1 dev eth0.31' "$CALLS" && grep -q 'ping .*-I eth0.31 10.31.0.1' "$CALLS" \
+  && grep -q 'curl .*--interface 10.31.0.18 .*agent.example/api/agent/download/VERSION' "$CALLS" && grep -q 'ip addr del 10.10.10.170/24 dev eth0' "$CALLS" \
+  && [ "$(line_of '^systemd-run')" -lt "$(line_of 'ip link add')" ] && [ "$(line_of 'ip addr add 10.31.0.18')" -lt "$(line_of 'ip route replace default')" ] \
+  && [ "$(line_of '^curl ')" -lt "$(line_of 'ip addr del 10.10.10.170')" ] && [ "$(line_of '^ping ')" -lt "$(line_of 'ip addr del 10.10.10.170')" ] \
+  && grep -q 'systemctl stop nuit-cloud-address-vlan-rollback.timer' "$CALLS" && [ ! -e "$ROOT/var/lib/nuit-cloud-agent/address/management-vlan/armed" ] && [ -f "$ROOT/var/lib/nuit-cloud-agent/address/management-vlan/backup/files" ] \
+  && ok "ncs_address (VLAN): timer first, then eth0.31 with the address beside the old one, the default route moved, proved by the gateway and the platform, the old address removed last" || { cat "$tmp/out"; cat "$CALLS"; bad "mvlan apply calls"; }
+grep -qx 'eth0.31 10.31.0.18/24' "$STATE/ip-addrs" && ! grep -q '^eth0 ' "$STATE/ip-addrs" && grep -qx 'eth0.5 10.20.0.2/24' "$STATE/ip-addrs" && grep -qx 'eth0.5 10.20.0.3/24' "$STATE/ip-addrs" \
+  && [ "$(cat "$STATE/ip-route")" = "default via 10.31.0.1 dev eth0.31" ] && ! grep -q 'table 105\|fwmark' "$CALLS" && [ ! -e "$ROOT/etc/network/interfaces.d/nuit-cloud-vlan31" ] \
+  && ok "ncs_address (VLAN): the machine is left with the address on eth0.31, the default route by 10.31.0.1, and the tenant VLAN eth0.5 as it was" || { cat "$STATE/ip-addrs"; cat "$STATE/ip-route"; bad "mvlan apply state"; }
+grep -q '^# nuit-cloud: iface eth0 inet dhcp$' "$ROOT/etc/network/interfaces.d/eth0" && grep -q '^auto eth0$' "$ROOT/etc/network/interfaces.d/eth0" && grep -q '^iface eth1 inet static$' "$ROOT/etc/network/interfaces.d/eth0" \
+  && grep -qx 'iface eth0 inet manual' "$sf" && ! grep -qx 'auto eth0' "$sf" && grep -qx 'auto eth0.31' "$sf" && grep -qx 'iface eth0.31 inet static' "$sf" && grep -qx '    address 10.31.0.18/24' "$sf" && grep -qx '    gateway 10.31.0.1' "$sf" \
+  && grep -qx '    vlan-raw-device eth0' "$sf" && grep -q 'pre-up ip link show eth0.31 >/dev/null 2>&1 || ip link add link eth0 name eth0.31 type vlan id 31' "$sf" && grep -qx '8021q' "$ROOT/etc/modules-load.d/8021q.conf" \
+  && ok "ncs_address (VLAN): eth0's DHCP stanza is commented out, eth0 stays up with no address, and eth0.31 is written with the address, gateway and its link" || { cat "$sf"; cat "$ROOT/etc/network/interfaces.d/eth0"; bad "mvlan files"; }
+: >"$CALLS"; mvlan_run >"$tmp/out" 2>&1 && mvlan_run --check >/dev/null 2>&1 && [ ! -s "$CALLS" ] && ok "ncs_address (VLAN): once moved, a second run is a no-op and --check is clean" || { cat "$tmp/out"; cat "$CALLS"; bad "mvlan idempotent"; }
+(MGW=10.31.0.254; mvlan_run --check >/dev/null 2>&1) && bad "a default route by another gateway passed the check" || ok "ncs_address (VLAN): a default route by another gateway is drift"
+printf 'default via 10.10.10.1 dev eth0\n' >"$STATE/ip-route"
+mvlan_run --check >/dev/null 2>&1 && bad "the default route still on the old network passed the check" || ok "ncs_address (VLAN): the address on eth0.31 with the default route still on eth0 is drift"
+printf 'default via 10.31.0.1 dev eth0.31\n' >"$STATE/ip-route"
+# a machine that holds the tenant VLAN on eth0.5 keeps hanging it off eth0
+vlan_check() { env NCS_VLAN_ID=5 NCS_VLAN_PREFIX=24 NCS_VLAN_ADDRESS=10.20.0.2 NCS_VLAN_GATEWAY=10.20.0.1 NCS_VLAN_TENANT_ADDRESSES=10.20.0.3 sh "$here/bootstrap.sh" nuit-cloud-vlan --check; }
+cat >"$ROOT/etc/network/interfaces.d/nuit-cloud-vlan5" <<HAND
+auto eth0.5
+iface eth0.5 inet static
+    address 10.20.0.2/24
+    post-up ip addr add 10.20.0.3/24 dev eth0.5 2>/dev/null || true
+HAND
+vlan_check >"$tmp/out" 2>&1 && ok "ncs_vlan: with the default route on eth0.31 the tenant VLAN is still eth0.5 (its parent is eth0)" || { cat "$tmp/out"; bad "vlan check after the management move"; }
+
+# the platform cannot be reached from the new address: the files, the old address, the old route and DHCP come back; eth0.31 goes
+mk_net 10.10.10.170; cp "$ROOT/etc/network/interfaces.d/eth0" "$tmp/eth0.before"; touch "$STATE/curl-fail"
+mvlan_run >"$tmp/out" 2>&1 && bad "an unproved VLAN move was kept"
+grep -q 'FAILED  ncs_address' "$tmp/out" && grep -q 'platform could not be reached from 10.31.0.18 on eth0.31, so the old configuration was put back' "$tmp/out" \
+  && cmp -s "$tmp/eth0.before" "$ROOT/etc/network/interfaces.d/eth0" && [ ! -e "$sf" ] && grep -qx 'eth0 10.10.10.170/24' "$STATE/ip-addrs" && ! grep -q '^eth0.31 ' "$STATE/ip-addrs" && ! grep -qx 'eth0.31' "$STATE/ip-links" \
+  && grep -qx 'eth0.5 10.20.0.3/24' "$STATE/ip-addrs" && [ "$(cat "$STATE/ip-route")" = "default via 10.10.10.1 dev eth0" ] && grep -q 'ip link del dev eth0.31' "$CALLS" && grep -q 'ifup --force eth0' "$CALLS" \
+  && ! grep -q 'ip addr del 10.10.10.170' "$CALLS" && grep -q 'systemctl stop nuit-cloud-address-vlan-rollback.timer' "$CALLS" \
+  && ok "ncs_address (VLAN): a failed proof restores the files, removes eth0.31, keeps the old address, puts the default route back and restarts DHCP" || { cat "$tmp/out"; cat "$CALLS"; cat "$STATE/ip-addrs"; cat "$STATE/ip-route"; bad "mvlan rollback"; }
+# the new gateway does not answer on the VLAN: the same, and the platform is not even asked
+mk_net 10.10.10.170; touch "$STATE/gw-silent"
+mvlan_run >"$tmp/out" 2>&1 && bad "a VLAN move whose gateway is silent was kept"
+grep -q 'FAILED  ncs_address' "$tmp/out" && grep -q 'gateway 10.31.0.1 did not answer on eth0.31' "$tmp/out" && ! grep -q '^curl ' "$CALLS" && [ ! -e "$sf" ] && grep -qx 'eth0 10.10.10.170/24' "$STATE/ip-addrs" \
+  && ! grep -q '^eth0.31 ' "$STATE/ip-addrs" && [ "$(cat "$STATE/ip-route")" = "default via 10.10.10.1 dev eth0" ] \
+  && ok "ncs_address (VLAN): a gateway that does not answer on the VLAN undoes the move" || { cat "$tmp/out"; cat "$CALLS"; bad "mvlan silent gateway"; }
+# a static address applied before (the same-subnet move) is what comes back
+mk_net 10.10.10.170; addr_run 10.10.10.170 >/dev/null 2>&1 || bad "same-subnet apply before the VLAN move"
+cp "$sf" "$tmp/static.before"; cp "$ROOT/etc/network/interfaces.d/eth0" "$tmp/eth0.before"; touch "$STATE/curl-fail"; : >"$CALLS"
+mvlan_run >"$tmp/out" 2>&1 && bad "an unproved VLAN move over a static address was kept"
+cmp -s "$tmp/static.before" "$sf" && cmp -s "$tmp/eth0.before" "$ROOT/etc/network/interfaces.d/eth0" && grep -qx 'eth0 10.10.10.170/24' "$STATE/ip-addrs" \
+  && ok "ncs_address (VLAN): a failed move over an earlier static address puts that static file back as it was" || { cat "$tmp/out"; cat "$sf"; bad "mvlan rollback static"; }
+# the move loses the tenant VLAN's addresses: they are put back and the move stands
+mk_net 10.10.10.170; touch "$STATE/lose-vlan"
+mvlan_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "mvlan heal"; }
+grep -q 'done    ncs_address' "$tmp/out" && grep -qx 'eth0.5 10.20.0.2/24' "$STATE/ip-addrs" && grep -qx 'eth0.5 10.20.0.3/24' "$STATE/ip-addrs" && grep -qx 'eth0.31 10.31.0.18/24' "$STATE/ip-addrs" \
+  && ok "ncs_address (VLAN): tenant VLAN addresses lost by the move are put back, and the move stands" || { cat "$tmp/out"; cat "$STATE/ip-addrs"; bad "mvlan heal result"; }
+# another device answers for the address on the VLAN: refused, and the VLAN interface made for the check is taken away again
+mk_net 10.10.10.170; touch "$STATE/arping-dupe"
+mvlan_run >"$tmp/out" 2>&1 && bad "a duplicate address on the VLAN was taken"
+grep -q 'FAILED  ncs_address' "$tmp/out" && grep -q 'another device already answers for 10.31.0.18 on VLAN 31' "$tmp/out" && ! grep -q 'ip addr add 10.31.0.18' "$CALLS" && ! grep -q 'route replace default via 10.31' "$CALLS" \
+  && ! grep -qx 'eth0.31' "$STATE/ip-links" && grep -qx 'eth0 10.10.10.170/24' "$STATE/ip-addrs" && [ ! -e "$sf" ] && ok "ncs_address (VLAN): an address another device answers for on the VLAN is refused and nothing is kept" || { cat "$tmp/out"; cat "$CALLS"; bad "mvlan duplicate"; }
+# what a person must decide is left alone, and hostile or inconsistent values change nothing
+mk_net 10.10.10.170; : >"$ROOT/etc/network/interfaces.d/nuit-cloud-vlan31"
+mvlan_run >"$tmp/out" 2>&1 && bad "the tenant VLAN was taken for the management address"
+grep -q 'MANUAL  ncs_address' "$tmp/out" && grep -q "tenant VLAN" "$tmp/out" && [ ! -s "$CALLS" ] && ok "ncs_address (VLAN): the tenant VLAN's own id is refused" || { cat "$tmp/out"; bad "mvlan tenant id"; }
+mk_net 10.10.10.170; printf 'default via 10.40.0.1 dev eth0.40\n' >"$STATE/ip-route"; printf 'eth0.40 10.40.0.7/24\n' >>"$STATE/ip-addrs"
+mvlan_run >"$tmp/out" 2>&1 && bad "a move from one VLAN to another was made"
+grep -q 'MANUAL  ncs_address' "$tmp/out" && grep -q 'from one VLAN to another' "$tmp/out" && [ ! -s "$CALLS" ] && ok "ncs_address (VLAN): a move from one VLAN to another is left to a person" || { cat "$tmp/out"; bad "mvlan vlan to vlan"; }
+mk_net 10.10.10.170
+(MADDR=10.10.10.200 MGW=10.10.10.1; mvlan_run) >"$tmp/out" 2>&1 && bad "a VLAN overlapping the current network was accepted"
+grep -q 'MANUAL  ncs_address' "$tmp/out" && grep -q 'overlaps' "$tmp/out" && [ ! -s "$CALLS" ] && ok "ncs_address (VLAN): a VLAN subnet that holds the current address is refused" || { cat "$tmp/out"; bad "mvlan overlap"; }
+for hostile in "MVLAN=0" "MVLAN=4095" "MVLAN=31;reboot" "MVLAN=031" "MPFX=8" "MPFX=31" "MPFX=24x" "MGW=10.10.10.1" "MGW=10.31.0.18" "MGW=10.31.0.1;reboot" "MGW=" "MADDR=10.31.0.999"; do
+  mk_net 10.10.10.170
+  (export "$hostile"; mvlan_run) >"$tmp/out" 2>&1 && bad "hostile $hostile accepted"
+  [ ! -s "$CALLS" ] && [ ! -e "$sf" ] && grep -q 'MANUAL  ncs_address\|FAILED  ncs_address' "$tmp/out" || { cat "$tmp/out"; cat "$CALLS"; bad "hostile $hostile changed something"; }
+  (export "$hostile"; mvlan_run --check) >/dev/null 2>&1 && bad "hostile $hostile passed the check"
+done; ok "ncs_address (VLAN): a bad VLAN id, prefix, gateway or address changes nothing and never passes the check"
 
 # 10. ncs_vlan: the tenant VLAN slice goes on the machine as a sub-interface, additive and undone if the platform is lost
 stub ifup 'echo "ifup $*" >>"$CALLS"; [ -e "$STATE/ifup-fail" ] && { echo "ifup: boom" >&2; exit 1; }
@@ -413,6 +512,16 @@ env NCS_VLAN_ID=5 NCS_VLAN_PREFIX=24 NCS_VLAN_ADDRESS="10.20.0.18; reboot" NCS_V
 sh "$here/bootstrap.sh" nuit-cloud-vlan >"$tmp/out2" 2>&1 && bad "no slice was accepted"
 (TENANTS='10.20.0.19 $(touch /tmp/nuit-pwned) 10.20.0.999'; vlan_run) >"$tmp/out3" 2>&1 && bad "a bad tenant address was accepted"
 grep -q 'MANUAL  ncs_vlan' "$tmp/out" && grep -q 'MANUAL  ncs_vlan' "$tmp/out2" && grep -q 'MANUAL  ncs_vlan' "$tmp/out3" && [ ! -s "$CALLS" ] && [ ! -e "$f" ] && ok "ncs_vlan: no slice, or an invalid one, changes nothing" || { cat "$tmp/out"; bad "vlan inputs"; }
+
+# the management address on VLAN 31 (nuit-cloud/nuit-cloud#197): the default route is on eth0.31, and the tenant VLAN still hangs off eth0
+vlan_net; sed -i.bak 's/^eth0 10.10.10.170\/24$/eth0.31 10.31.0.18\/24/' "$STATE/ip-addrs"; printf 'default via 10.31.0.1 dev eth0.31\n' >"$STATE/ip-route"; echo eth0.31 >>"$STATE/ip-links"
+vlan_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "vlan apply with the default route on eth0.31"; }
+grep -q 'done    ncs_vlan' "$tmp/out" && grep -q '^iface eth0.5 inet static$' "$f" && grep -q 'ip link add link eth0 name eth0.5 type vlan id 5' "$f" && ! grep -q 'eth0\.31\.5' "$f" && grep -q 'ifup eth0.5' "$CALLS" \
+  && grep -qx 'eth0.31 10.31.0.18/24' "$STATE/ip-addrs" && grep -qx 'eth0.5 10.20.0.19/24' "$STATE/ip-addrs" && vlan_run --check >/dev/null 2>&1 \
+  && ok "ncs_vlan: with the default route on the management VLAN eth0.31, the tenant VLAN is eth0.5 off eth0, and the management address is untouched" || { cat "$tmp/out"; cat "$f"; cat "$CALLS"; bad "vlan off the lower link"; }
+vlan_net; printf 'default via 10.20.0.1 dev eth0.5\n' >"$STATE/ip-route"
+vlan_run >"$tmp/out" 2>&1 && bad "a tenant VLAN carrying the default route was rewritten"
+grep -q 'MANUAL  ncs_vlan' "$tmp/out" && [ ! -s "$CALLS" ] && ok "ncs_vlan: a default route on the tenant VLAN's own interface is left to a person" || { cat "$tmp/out"; bad "vlan default on eth0.5"; }
 
 # 11. ncs_ssh_harden: passwords and root login off only when a key the platform names can still get in, with a timer until confirmed
 ssh-keygen -q -t ed25519 -N '' -C test-admin -f "$tmp/adminkey" && FP="$(ssh-keygen -lf "$tmp/adminkey.pub" | awk '{print $2}')"

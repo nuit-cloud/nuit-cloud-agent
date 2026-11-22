@@ -369,6 +369,38 @@ func TestTakeAddsTheAddressAfterTheLastTenantLineAndAnnouncesIt(t *testing.T) {
 	}
 }
 
+// With the management address on a VLAN of its own (nuit-cloud/nuit-cloud#197) the machine has enp0s31f6.31 beside the tenant VLAN
+// enp0s31f6.5: the tenant VLAN is still the one interface for VLAN 5, and the management VLAN is never touched.
+func TestAManagementVLANBesideTheTenantVLANIsLeftAlone(t *testing.T) {
+	root, file := scratch(t, agentFile)
+	m := newMachine("10.20.0.3", "10.20.0.30", "10.20.0.4")
+	m.ifaces = append(m.ifaces, iface{Index: 5, Name: "enp0s31f6.31", MAC: vifMAC, Addrs: []ifaceAddr{{Family: "inet", Local: "10.31.0.18", PrefixLen: 24}}})
+	a := &fakeARP{}
+	if _, err := mover(root, m, a).Take(context.Background(), params("take", "10.20.0.7")); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.changes(); len(got) != 1 || got[0] != "addr add 10.20.0.7/24 dev enp0s31f6.5" {
+		t.Errorf("ran %v", got)
+	}
+	for _, l := range a.links {
+		if l.Name != "enp0s31f6.5" {
+			t.Errorf("ARP on %+v", l)
+		}
+	}
+	if !strings.Contains(read(t, file), "ip addr add 10.20.0.7/24 dev enp0s31f6.5") || !m.on("enp0s31f6.31", "10.31.0.18") {
+		t.Errorf("the file is\n%s", read(t, file))
+	}
+	// a management VLAN whose id ends in the tenant VLAN's digits (15, 105) is not a second interface for VLAN 5
+	for _, name := range []string{"enp0s31f6.15", "enp0s31f6.105"} {
+		root, _ := scratch(t, agentFile)
+		m := newMachine()
+		m.ifaces = append(m.ifaces, iface{Index: 5, Name: name, MAC: vifMAC, Addrs: []ifaceAddr{{Family: "inet", Local: "10.31.0.18", PrefixLen: 24}}})
+		if _, err := mover(root, m, &fakeARP{}).Take(context.Background(), params("take", "10.20.0.7")); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
 func TestTakeOnAMachineWithNoTenantAddressesAddsTheLineAfterTheAddressLine(t *testing.T) {
 	var noTenants strings.Builder
 	for _, l := range strings.SplitAfter(agentFile, "\n") {

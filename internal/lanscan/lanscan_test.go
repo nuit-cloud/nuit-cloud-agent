@@ -104,6 +104,25 @@ func TestTheDefaultInterfaceIsTheRouteTo0000(t *testing.T) {
 	}
 }
 
+// With the management address on a VLAN (nuit-cloud/nuit-cloud#197) the default route is on <if>.<n>: that is where the scan runs from.
+func TestTheDefaultInterfaceMayBeAVLANInterface(t *testing.T) {
+	table := "Iface\tDestination\tGateway\tFlags\nenp0s31f6.31\t00000000\t01001F0A\t0003\nenp0s31f6.31\t00001F0A\t00000000\t0001\nenp0s31f6.5\t0000140A\t00000000\t0001\n"
+	if got, err := DefaultInterface(table); err != nil || got != "enp0s31f6.31" {
+		t.Errorf("%q %v", got, err)
+	}
+	s, calls := fake(map[string]string{"10.31.0.20": "aa:bb:cc:00:00:20"}, "arping")
+	s.Interface = func() (string, error) { return "enp0s31f6.31", nil }
+	r, err := s.Scan(context.Background(), "10.31.0.20", "10.31.0.21")
+	if err != nil || r.From != "enp0s31f6.31" || len(r.Answered) != 1 {
+		t.Fatalf("%+v %v", r, err)
+	}
+	for _, c := range *calls {
+		if strings.HasPrefix(c, "arping ") && !strings.Contains(c, "enp0s31f6.31") {
+			t.Errorf("probed from elsewhere: %s", c)
+		}
+	}
+}
+
 func TestItsOwnAddressesAreReportedWithTheirMACButNeverProbed(t *testing.T) {
 	s, calls := fake(nil, "arping")
 	s.Own = func() map[string]string {

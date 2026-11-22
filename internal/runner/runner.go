@@ -189,11 +189,11 @@ func (r Runner) profile(ctx context.Context, task *taskverify.Task) client.Repor
 	apply := task.Name == "profile-apply"
 	var env []string
 	if raw, ok := task.Params["network"].(map[string]any); ok {
-		addr, _ := raw["managementAddress"].(string)
-		if !ipv4.MatchString(addr) || net.ParseIP(addr) == nil {
-			return client.Report{Status: "failed", ExitCode: &one, Output: "the task carries no usable management address"}
+		netEnv, err := managementEnvironment(raw, r.PlatformURL)
+		if err != nil {
+			return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
 		}
-		env = append(env, "NCS_MANAGEMENT_ADDRESS="+addr, "NCS_PLATFORM_URL="+r.PlatformURL)
+		env = append(env, netEnv...)
 	}
 	if raw, ok := task.Params["firewall"].(map[string]any); ok {
 		fwEnv, err := firewallEnvironment(raw)
@@ -577,6 +577,63 @@ func (r Runner) scan(ctx context.Context, task *taskverify.Task) client.Report {
 		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
 	}
 	return client.Report{Status: "done", ExitCode: &zero, Output: fmt.Sprintf("scanned %d addresses from %s (%s): %d answered", res.Scanned, res.From, res.Method, len(res.Answered)), Result: res}
+}
+
+// managementEnvironment turns the signed management network (`network` of the nuit-cloud-address profile) into what the ncs_address
+// feature reads. Without vlanId the address moves within the current subnet, as before, and prefix and gateway must be absent. With
+// vlanId (1-4094) the address moves onto that tagged VLAN, and prefix (16-30) and gateway (an IPv4 address inside the address's subnet,
+// neither the address itself nor the subnet's network or broadcast address) are required (nuit-cloud/nuit-cloud#197).
+func managementEnvironment(raw map[string]any, platformURL string) ([]string, error) {
+	addr, _ := raw["managementAddress"].(string)
+	if !ipv4.MatchString(addr) || net.ParseIP(addr) == nil {
+		return nil, errors.New("the task carries no usable management address")
+	}
+	env := []string{"NCS_MANAGEMENT_ADDRESS=" + addr, "NCS_PLATFORM_URL=" + platformURL}
+	_, hasVLAN := raw["vlanId"]
+	_, hasPrefix := raw["prefix"]
+	_, hasGateway := raw["gateway"]
+	if !hasVLAN {
+		if hasPrefix || hasGateway {
+			return nil, errors.New("a management prefix or gateway is only given with a management VLAN")
+		}
+		return env, nil
+	}
+	number := func(k string, lo, hi float64) (int, error) {
+		f, ok := raw[k].(float64)
+		if !ok || f != float64(int(f)) || f < lo || f > hi {
+			return 0, fmt.Errorf("the management %s is not a whole number from %v to %v", k, lo, hi)
+		}
+		return int(f), nil
+	}
+	id, err := number("vlanId", 1, 4094)
+	if err != nil {
+		return nil, err
+	}
+	prefix, err := number("prefix", 16, 30)
+	if err != nil {
+		return nil, err
+	}
+	gw, _ := raw["gateway"].(string)
+	if !ipv4.MatchString(gw) || net.ParseIP(gw) == nil {
+		return nil, fmt.Errorf("the management gateway %q is not an IPv4 address", gw)
+	}
+	a, g := netip.MustParseAddr(addr), netip.MustParseAddr(gw)
+	subnet := netip.PrefixFrom(a, prefix).Masked()
+	b := subnet.Addr().As4()
+	for i := prefix; i < 32; i++ {
+		b[i/8] |= 1 << (7 - i%8)
+	}
+	broadcast := netip.AddrFrom4(b)
+	if a == subnet.Addr() || a == broadcast {
+		return nil, fmt.Errorf("the management address %s is the network or broadcast address of %s", addr, subnet)
+	}
+	if !subnet.Contains(g) || g == subnet.Addr() || g == broadcast {
+		return nil, fmt.Errorf("the management gateway %s is not a host in %s", gw, subnet)
+	}
+	if g == a {
+		return nil, errors.New("the management gateway is the management address itself")
+	}
+	return append(env, "NCS_MANAGEMENT_VLAN="+strconv.Itoa(id), "NCS_MANAGEMENT_PREFIX="+strconv.Itoa(prefix), "NCS_MANAGEMENT_GATEWAY="+gw), nil
 }
 
 // vlanEnvironment turns the signed VLAN slice into what the profile scripts read, after checking every part is what it should be.
