@@ -9,9 +9,15 @@
 # It never prints a certificate or a key, and never puts one on a command line: they are only copied, file to file. Our files are the
 # platform's site files in confDir (00-nuit-cloud-default.conf, nuit-cloud-<name>.conf) and fullchain.pem/privkey.pem in the certificate
 # directories the stage names; nothing else in those directories is read, changed or removed. Exit 0 applied, 1 not applied (and the
-# previous files are back in place).
+# previous files are back in place), 3 not applied because a person (or another apply) has to do something first; nothing was written.
+#
+# With `host`, a site file may listen on a given IPv4 address (`listen 10.20.0.34:443 ssl;`, the Ingress Service's tenant-VLAN address,
+# nuit-cloud/nuit-cloud#205). Before anything is written each such address must be on the machine (`ip -o -4 addr show`), else exit 3; after
+# the reload nginx must listen on each address:port the files name (`ss -Htln`), else exit 1 and the revision is not recorded: `nginx -t`
+# does not bind, and `systemctl reload nginx` succeeds even when nginx cannot bind and keeps its old configuration. An optional eighth
+# argument, the word `addresses`, does only the first check (the feature runs it before it installs or changes anything) and exits 0 or 3.
 set -u
-R="$1"; S="$2"; CONF="$3"; CROOT="$4"; C="$5"; REV="$6"; SD="$7"
+R="$1"; S="$2"; CONF="$3"; CROOT="$4"; C="$5"; REV="$6"; SD="$7"; MODE="${8:-}"
 P() { printf '%s%s' "$R" "$1"; }
 say() { printf '  %s\n' "$*"; }
 fail() { say "$*" >&2; exit 1; }
@@ -37,6 +43,29 @@ while IFS=' ' read -r n d; do
   printf '%s' "$n" | grep -Eq '^[1-9][0-9]{0,3}$' && certdir_ok "$d" && [ -f "$S/certs/$n/fullchain.pem" ] && [ -f "$S/certs/$n/privkey.pem" ] \
     || fail "the staged configuration names a certificate directory that is not below $CROOT"
 done <"$S/certs.list"
+
+# ─── the addresses the site files listen on (with `host`): each must be on the machine before anything is written ──────────────────────
+# listen_addrs: every "A.B.C.D:port" a staged site file's listen directive names, once each (comments dropped, one statement per line;
+# anything that is not a dotted IPv4 address with a port, such as `listen 80;` or `listen [::]:443 ssl;`, is not an address here)
+OCTET='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
+listen_addrs() {
+  while IFS= read -r f; do sed 's/#.*//' "$S/sites/$f" | tr '{};' '\n\n\n' | awk '$1 == "listen" { print $2 }'; done <"$S/sites.list" \
+    | grep -E "^$OCTET(\.$OCTET){3}:[1-9][0-9]{0,4}\$" | awk -F: '$2 <= 65535' | LC_ALL=C sort -u
+}
+LISTENS=""
+if [ "$C" = host ]; then
+  LISTENS="$(listen_addrs)"
+  if [ -n "$LISTENS" ]; then
+    here_addrs="$(ip -o -4 addr show 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "inet") { split($(i + 1), a, "/"); print a[1] } }')"
+    for ap in $LISTENS; do
+      printf '%s\n' "$here_addrs" | grep -qxF "${ap%:*}" \
+        || { say "the Ingress Service address ${ap%:*} is not on this machine yet (the tenant VLAN apply puts it there)" >&2; exit 3; }
+    done
+  fi
+fi
+[ "$MODE" = addresses ] && exit 0
+[ -z "$MODE" ] || fail "the mode $MODE is not one this script has"
+
 CONFP="$(P "$CONF")"
 [ -d "$CONFP" ] && [ ! -L "$CONFP" ] || fail "the site directory $CONF does not exist"
 [ -d "$(P "$CROOT")" ] || fail "the certificate directory $CROOT does not exist"
@@ -152,6 +181,20 @@ if [ "$C" = host ]; then
 elif [ "$changed" = 1 ]; then
   rout="$(ngx -s reload 2>&1)" || { say "nginx accepted the configuration but did not reload: $(printf '%s' "$rout" | head -n 1 | cut -c1-300)" >&2; exit 1; }
   reloaded="; nginx reloaded"
+fi
+# a reload only signals nginx, and nginx that cannot bind an address logs it and keeps its old configuration: so (with `host`) it must now
+# listen on every address:port the files name, within ten seconds, or the revision is not recorded
+if [ -n "$LISTENS" ]; then
+  tries=0
+  while :; do
+    held="$(ss -Htln 2>/dev/null | awk '{ print $4 }')"
+    missing=""
+    for ap in $LISTENS; do printf '%s\n' "$held" | grep -qxF "$ap" || { missing="$ap"; break; }; done
+    [ -z "$missing" ] && break
+    tries=$((tries + 1))
+    [ "$tries" -lt 10 ] || fail "nginx did not take the new configuration: it does not listen on $missing; journalctl -u nginx says why"
+    sleep 1
+  done
 fi
 
 # ─── record (the revision last: it says the files above are this revision) ────────────────────────────────────────────────────────────

@@ -2485,6 +2485,10 @@ f_ncs_ingress_do() {
   if ing_host; then
     # nothing is installed or changed for a revision the agent has not staged
     ing_staged "$st" || { echo "  the ingress configuration for this revision was not fetched (the agent fetches it when it applies)" >&2; return 1; }
+    # an address the site files listen on that is not on the machine yet is MANUAL, before nginx is installed or anything is changed
+    ing_rc=0
+    sh "$here/ingress-apply.sh" "${ROOT:-}" "$st" "$NCS_INGRESS_CONF_DIR" "$NCS_INGRESS_CERT_ROOT" "$NCS_INGRESS_CONTAINER" "$NCS_INGRESS_REVISION" "$ING_STATE" addresses || ing_rc=$?
+    [ "$ing_rc" = 0 ] || { [ "$ing_rc" = 3 ] && return 3; return 1; }
     ing_rc=0; ing_host_base || ing_rc=$?
     [ "$ing_rc" = 0 ] || return "$ing_rc"
   elif ! ing_running; then
@@ -2495,7 +2499,8 @@ f_ncs_ingress_do() {
   cp "$here/ingress-apply.sh" "$st/apply.sh" && chmod 700 "$st/apply.sh" || return 1
   ing_rc=0
   ing_privileged "$st/apply.sh" "${ROOT:-}" "$st" "$NCS_INGRESS_CONF_DIR" "$NCS_INGRESS_CERT_ROOT" "$NCS_INGRESS_CONTAINER" "$NCS_INGRESS_REVISION" "$ING_STATE" || ing_rc=$?
-  [ "$ing_rc" = 0 ] || return 1
+  # 3 (an address not on the machine yet) is MANUAL; any other failure is FAILED
+  [ "$ing_rc" = 0 ] || { [ "$ing_rc" = 3 ] && return 3; return 1; }
   if ing_host && ! ing_running; then echo "  nginx did not stay up (journalctl -u nginx says why)" >&2; return 1; fi
   case "${NCS_INGRESS_PROBLEMS:-0}" in 0|'') ;; *) echo "  the platform left out ${NCS_INGRESS_PROBLEMS} route(s) it could not render (the portal names them)" ;; esac
   return 0

@@ -1760,7 +1760,7 @@ mkstage() {
   rm -rf "$1"; mkdir -m 700 -p "$1/sites" "$1/certs"; printf '%s\n' "$2" >"$1/revision"; : >"$1/sites.list"; : >"$1/certs.list"; k=0
   while IFS=' ' read -r kind a b c; do
     case "$kind" in
-      site) printf '%s\n' "$b" >"$1/sites/$a"; echo "$a" >>"$1/sites.list";;
+      site) printf '%s\n' "$b${c:+ $c}" >"$1/sites/$a"; echo "$a" >>"$1/sites.list";;
       cert) k=$((k + 1)); mkdir -m 700 "$1/certs/$k"; printf -- '-----BEGIN CERTIFICATE-----\n%s\n-----END CERTIFICATE-----\n' "$b" >"$1/certs/$k/fullchain.pem"
         printf -- '-----BEGIN PRIVATE KEY-----\n%s\n-----END PRIVATE KEY-----\n' "$c" >"$1/certs/$k/privkey.pem"; echo "$k $a" >>"$1/certs.list";;
     esac
@@ -1874,7 +1874,7 @@ export ROOT="$OLDROOT22"
 # 23. the Ingress Service on a machine with no Docker (container `host`): nginx is Debian's package, installed and kept by the profile. It is
 # installed only when missing (without starting on Debian's default site), Debian's default-site link alone is taken out, one include file
 # names the site directory, nginx is tested and reloaded on the machine itself, and docker is never asked anything.
-for c in systemctl apt-get docker; do cp -p "$tmp/bin/$c" "$tmp/$c.orig23"; done
+for c in systemctl apt-get docker ip ss; do cp -p "$tmp/bin/$c" "$tmp/$c.orig23"; done
 stub systemctl 'case "$1" in is-active|is-enabled) ;; *) echo "systemctl $*" >>"$CALLS";; esac
 case "$1" in
   enable) touch "$STATE/h-enabled-$2";;
@@ -1896,6 +1896,9 @@ stub nginx 'echo "nginx $*" >>"$CALLS"; [ "$1" = -t ] || exit 0
 if [ -e "$STATE/h-bad" ]; then echo "nginx: [emerg] unknown directive \"bogus\" in /home/nuitcloud/nginx/conf.d/nuit-cloud-abc12345-shop.conf:1" >&2; exit 1; fi
 echo "nginx: configuration file /etc/nginx/nginx.conf test is successful" >&2; exit 0'
 stub docker 'echo "docker $*" >>"$CALLS"; exit 1'
+# the machine's IPv4 addresses and nginx's listening sockets, as the test sets them
+stub ip 'echo "ip $*" >>"$CALLS"; [ "$*" = "-o -4 addr show" ] && cat "$STATE/h-addrs" 2>/dev/null; exit 0'
+stub ss 'echo "ss $*" >>"$CALLS"; cat "$STATE/h-listen" 2>/dev/null; exit 0'
 OLDROOT23="$ROOT"; export ROOT="$tmp/hostroot"; rm -rf "$ROOT" "$STATE"/h-* "$STATE"/pkg-nginx "$STATE"/policy-rc-seen; mkdir -p "$ROOT/etc"
 INC="$ROOT/etc/nginx/conf.d/nuit-cloud-ingress.conf"; DEFSITE="$ROOT/etc/nginx/sites-enabled/default"
 want_inc="$(printf '%s\n' "# Managed by the nuit-cloud agent (the ncs_ingress feature): the Ingress Service's site files. Changes made here are replaced." "include $ICONF/*.conf;")"
@@ -1934,6 +1937,7 @@ cmp -s "$IST3/sites/nuit-cloud-abc12345-shop.conf" "$ROOT$ICONF/nuit-cloud-abc12
   && [ "$(line_of '^nginx -t')" -lt "$(line_of 'systemctl reload nginx')" ] && ok "host ingress: nginx is enabled and started, then nginx -t runs on the machine before systemctl reloads it" || { cat "$CALLS"; bad "host ingress nginx order"; }
 ! grep -q '^docker' "$CALLS" && ok "host ingress: docker is never asked anything" || { cat "$CALLS"; bad "host ingress used docker"; }
 [ "$(cat "$ROOT/var/lib/nuit-cloud/ingress/revision")" = "$IREV1" ] && grep -qx 'container=host' "$ROOT/var/lib/nuit-cloud/ingress/settings" && ok "host ingress: the revision and container=host are recorded" || bad "host ingress record"
+! grep -q '^ip \|^ss ' "$CALLS" && ok "host ingress: site files that name no address are applied as before, without asking for the machine's addresses or sockets" || { cat "$CALLS"; bad "host ingress asked ip or ss"; }
 ing_run --check >"$tmp/out" 2>&1 && grep -q 'ok      ncs_ingress' "$tmp/out" && ok "host ingress: --check is clean after the apply" || { cat "$tmp/out"; bad "host ingress check after apply"; }
 : >"$CALLS"; ing_run >"$tmp/out" 2>&1 && ! grep -q applying "$tmp/out" && [ ! -s "$CALLS" ] && ok "host ingress: a second apply of the same revision changes nothing" || { cat "$tmp/out" "$CALLS"; bad "host ingress idempotent"; }
 
@@ -1998,6 +2002,52 @@ rm -f "$STATE/h-nostart"; : >"$CALLS"
 ing_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "host ingress start"; }; cat "$tmp/out" >>"$hout"
 [ -e "$STATE/h-active-nginx" ] && [ "$(cat "$ROOT/var/lib/nuit-cloud/ingress/revision")" = "$IREV1" ] && ok "host ingress: a stopped nginx is started again" || { cat "$CALLS"; bad "host ingress started"; }
 
+# the site files listen on the Ingress Service's own address (nuit-cloud/nuit-cloud#205): it must be on the machine before anything is
+# written (else MANUAL), and after the reload nginx must listen there (else FAILED, not recorded); a reload that "succeeds" is not enough
+printf '%s\n' '1: lo    inet 127.0.0.1/8 scope host lo\       valid_lft forever preferred_lft forever' \
+  '2: eth0    inet 10.31.0.12/24 brd 10.31.0.255 scope global eth0\       valid_lft forever preferred_lft forever' >"$STATE/h-addrs"
+printf '%s\n' 'LISTEN 0 511 0.0.0.0:80 0.0.0.0:*' 'LISTEN 0 511 0.0.0.0:443 0.0.0.0:*' 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*' >"$STATE/h-listen"
+export NCS_INGRESS_REVISION="$IREV2"; mkstage "$IST3" "$IREV2" <<STAGE
+site 00-nuit-cloud-default.conf server { listen 10.20.0.34:80 default_server; listen 10.20.0.34:443 ssl default_server; }
+site nuit-cloud-abc12345-shop.conf server { listen 10.20.0.34:443 ssl; }
+cert $ICERTS/def67890/www.example.org chain-www $ING_KEY3
+STAGE
+echo '# edited' >>"$INC"; before="$(snap)"; : >"$CALLS"
+ing_run >"$tmp/out" 2>&1 && bad "host ingress: applied with its address not on the machine"; cat "$tmp/out" >>"$hout"
+grep -q 'MANUAL  ncs_ingress' "$tmp/out" && grep -q 'the Ingress Service address 10.20.0.34 is not on this machine yet (the tenant VLAN apply puts it there)' "$tmp/out" \
+  && [ "$before" = "$(snap)" ] && [ "$(cat "$ROOT/var/lib/nuit-cloud/ingress/revision")" = "$IREV1" ] && ! grep -q '^nginx\|^systemctl\|^apt-get\|^ss ' "$CALLS" \
+  && ok "host ingress: an address the site files listen on that is not on the machine is MANUAL, before anything is written, installed or reloaded" \
+  || { cat "$tmp/out" "$CALLS"; echo "$before" >"$tmp/snap-before"; snap >"$tmp/snap-after"; diff "$tmp/snap-before" "$tmp/snap-after" || true; bad "host ingress address absent"; }
+
+printf '%s\n' '3: eth0.20    inet 10.20.0.34/24 brd 10.20.0.255 scope global eth0.20\       valid_lft forever preferred_lft forever' >>"$STATE/h-addrs"
+: >"$CALLS"; ing_run >"$tmp/out" 2>&1 && bad "host ingress: recorded while nginx still listens on every address"; cat "$tmp/out" >>"$hout"
+grep -q 'FAILED  ncs_ingress' "$tmp/out" && grep -q 'nginx did not take the new configuration: it does not listen on 10.20.0.34:\(80\|443\); journalctl -u nginx says why' "$tmp/out" \
+  && [ "$(line_of 'systemctl reload nginx')" -lt "$(line_of '^ss -Htln')" ] && [ "$(cat "$ROOT/var/lib/nuit-cloud/ingress/revision")" = "$IREV1" ] \
+  && ok "host ingress: a reload after which nginx does not listen on the address the files name is FAILED, and the revision is not recorded" || { cat "$tmp/out" "$CALLS"; bad "host ingress listen check"; }
+
+printf '%s\n' 'LISTEN 0 511 10.20.0.34:80 0.0.0.0:*' 'LISTEN 0 511 10.20.0.34:443 0.0.0.0:*' 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*' >"$STATE/h-listen"
+: >"$CALLS"; ing_run >"$tmp/out" 2>&1 || { cat "$tmp/out" "$CALLS"; bad "host ingress apply on its address"; }; cat "$tmp/out" >>"$hout"
+grep -q 'done    ncs_ingress' "$tmp/out" && [ "$(cat "$ROOT/var/lib/nuit-cloud/ingress/revision")" = "$IREV2" ] && cmp -s "$IST3/sites/nuit-cloud-abc12345-shop.conf" "$ROOT$ICONF/nuit-cloud-abc12345-shop.conf" \
+  && [ "$(cat "$INC")" = "$want_inc" ] && [ "$(line_of 'systemctl reload nginx')" -lt "$(line_of '^ss -Htln')" ] \
+  && ok "host ingress: with the address on the machine and nginx listening on it, the revision is applied and recorded" || { cat "$tmp/out" "$CALLS"; bad "host ingress address present"; }
+
+# only a dotted IPv4 address with a port is an address: a commented one, IPv6, a port alone, an impossible or hostile value are not asked for
+export NCS_INGRESS_REVISION="$IREV1"; mkstage "$IST3" "$IREV1" <<STAGE
+site 00-nuit-cloud-default.conf server { listen 10.20.0.34:80 default_server; } # listen 10.9.9.9:80;
+site nuit-cloud-abc12345-shop.conf server { listen 80; listen [::]:443 ssl; listen 999.1.1.1:80; listen 10.9.9.9:99999; listen 10.9.9.9:80\$(touch\${IFS}$STATE/h-pwned); }
+STAGE
+: >"$CALLS"; ing_run >"$tmp/out" 2>&1 || { cat "$tmp/out" "$CALLS"; bad "host ingress with values that are not addresses"; }; cat "$tmp/out" >>"$hout"
+grep -q 'done    ncs_ingress' "$tmp/out" && [ "$(cat "$ROOT/var/lib/nuit-cloud/ingress/revision")" = "$IREV1" ] && [ ! -e "$STATE/h-pwned" ] && ! grep -q '10\.9\.9\.9\|999' "$tmp/out" \
+  && ok "host ingress: a commented address, IPv6, a bare port, and an impossible or hostile value are not taken as addresses, and nothing in them is run" || { cat "$tmp/out" "$CALLS"; bad "host ingress strict parse"; }
+
+# an address-free revision again: neither the addresses nor the sockets are asked for
+mkstage "$IST3" "$IREV2" <<STAGE
+site 00-nuit-cloud-default.conf server { listen 80 default_server; listen [::]:80 default_server; }
+STAGE
+export NCS_INGRESS_REVISION="$IREV2"; : >"$CALLS"; ing_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "host ingress without an address"; }; cat "$tmp/out" >>"$hout"
+grep -q 'done    ncs_ingress' "$tmp/out" && [ "$(cat "$ROOT/var/lib/nuit-cloud/ingress/revision")" = "$IREV2" ] && ! grep -q '^ip \|^ss ' "$CALLS" \
+  && ok "host ingress: listen lines without an address (today's form) are applied as before" || { cat "$tmp/out" "$CALLS"; bad "host ingress no address"; }
+
 # only the exact word is the machine's nginx: `Host` is a container name like any other (and not running here, so a person's job)
 : >"$CALLS"; env NCS_INGRESS_CONTAINER=Host sh "$here/bootstrap.sh" nuit-cloud-ingress >"$tmp/out" 2>&1 && bad "host ingress: Host was taken for host"
 grep -q 'MANUAL  ncs_ingress' "$tmp/out" && grep -q 'docker inspect' "$CALLS" && ! grep -q 'apt-get\|^nginx\|^systemctl' "$CALLS" && ok "host ingress: only the exact word host means the machine's nginx" || { cat "$tmp/out" "$CALLS"; bad "host ingress word"; }
@@ -2009,6 +2059,6 @@ for s in "$ING_KEY1" "$ING_KEY3" chain-shop chain-www; do
 done
 [ "$leaks" = 0 ] && ok "host ingress: no certificate or key appears in any output, command or record" || bad "host ingress leaked key material"
 rm -f "$STATE"/h-* "$STATE"/pkg-nginx "$STATE"/policy-rc-seen; unset NCS_INGRESS_REVISION NCS_INGRESS_CONF_DIR NCS_INGRESS_CERT_ROOT NCS_INGRESS_CONTAINER NCS_INGRESS_STAGE
-for c in systemctl apt-get docker; do cp -p "$tmp/$c.orig23" "$tmp/bin/$c"; done; rm -f "$tmp/bin/nginx"
+for c in systemctl apt-get docker ip ss; do cp -p "$tmp/$c.orig23" "$tmp/bin/$c"; done; rm -f "$tmp/bin/nginx"
 export ROOT="$OLDROOT23"
 echo "all passed"
