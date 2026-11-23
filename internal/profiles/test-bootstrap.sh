@@ -2065,12 +2065,13 @@ for want in '  nginx also listens on every address on port 80: another configura
   '  nginx also listens on every address on port 443: another configuration has a listen without an address' \
   '    LISTEN 0 511 0.0.0.0:80 0.0.0.0:*' '    LISTEN 0 511 [::]:443 [::]:*' \
   '    /etc/nginx/sites-enabled/old-site: listen 80 default_server;' '    /etc/nginx/sites-enabled/old-site: listen [::]:80 default_server;' \
-  '    /etc/nginx/sites-enabled/old-site: listen *:80;' '    /etc/nginx/conf.d/legacy.conf: listen 443 ssl http2;' '    /etc/nginx/conf.d/legacy.conf: listen 0.0.0.0:443 ssl;'; do
+  '    /etc/nginx/sites-enabled/old-site: listen *:80;' '    /etc/nginx/conf.d/legacy.conf: listen 443 ssl http2;' '    /etc/nginx/conf.d/legacy.conf: listen 0.0.0.0:443 ssl;' \
+  '    /etc/nginx/conf.d/legacy.conf: listen [::1]:443 ssl;'; do
   grep -qxF -- "$want" "$tmp/out" || { cat "$tmp/out"; bad "host ingress wildcard: missing line: $want"; }
 done
 grep -q 'FAILED  ncs_ingress' "$tmp/out" && [ "$(cat "$ROOT/var/lib/nuit-cloud/ingress/revision")" = "$IREV1" ] && grep -qx 'nginx -T' "$CALLS" && [ "$(line_of 'systemctl reload nginx')" -lt "$(line_of '^nginx -T')" ] \
-  && ! grep -q 'secret-marker\|8080\|\[::1\]\|10\.20\.0\.34:\|0\.0\.0\.0:22\|user www-data\|in a comment\|syntax is ok' "$tmp/out" \
-  && ok "host ingress: nginx also listening on every address on a port the files name is FAILED, not recorded, and the listen lines without an address are named by file, nothing else" \
+  && ! grep -q 'secret-marker\|8080\|10\.20\.0\.34:\|0\.0\.0\.0:22\|user www-data\|in a comment\|syntax is ok' "$tmp/out" \
+  && ok "host ingress: nginx also listening on every address on a port the files name is FAILED, not recorded, and the listen lines on that port not on the files' addresses are named by file, nothing else" \
   || { cat "$tmp/out" "$CALLS"; bad "host ingress wildcard"; }
 
 # the culprits are capped at twenty lines, and an nginx -T that names none says what else it can be
@@ -2090,6 +2091,56 @@ grep -q 'done    ncs_ingress' "$tmp/out" && [ "$(cat "$ROOT/var/lib/nuit-cloud/i
   && [ "$(cat "$INC")" = "$want_inc" ] && [ "$(line_of 'systemctl reload nginx')" -lt "$(line_of '^ss -Htln')" ] \
   && ok "host ingress: with the address on the machine and nginx listening on it, the revision is applied and recorded" || { cat "$tmp/out" "$CALLS"; bad "host ingress address present"; }
 
+# the recorded revision alone is not "in step" (nuit-cloud/nuit-cloud#205, ncs-mini-1): the check also looks, once, at where nginx listens
+# on the ports the installed site files name. In step, the check is clean and an apply of the same revision changes nothing
+: >"$CALLS"; ing_run --check >"$tmp/out" 2>&1 && grep -q 'ok      ncs_ingress' "$tmp/out" && [ "$(count '^ss -Htln')" = 1 ] && ! grep -q '^nginx\|^systemctl [a-z]' "$CALLS" \
+  && ok "host ingress: same revision with nginx listening only where the site files say: the check is clean and asks ss once" || { cat "$tmp/out" "$CALLS"; bad "host ingress check in step"; }
+: >"$CALLS"; ing_run >"$tmp/out" 2>&1 && ! grep -q applying "$tmp/out" && ! grep -q 'reload\|^nginx' "$CALLS" \
+  && ok "host ingress: same revision with nginx listening only where the site files say: an apply changes nothing" || { cat "$tmp/out" "$CALLS"; bad "host ingress apply in step"; }
+
+# same revision, but nginx also listens on every address on port 80: the check is drift with a one-line reason and changes nothing; the
+# apply writes the same revision again, reloads, and fails naming the culprit (rewriting the files does not take another file's listen away)
+printf '%s\n' 'LISTEN 0 511 10.20.0.34:80 0.0.0.0:*' 'LISTEN 0 511 10.20.0.34:443 0.0.0.0:*' 'LISTEN 0 511 0.0.0.0:80 0.0.0.0:*' 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*' >"$STATE/h-listen"
+printf '%s\n' '# configuration file /etc/nginx/sites-enabled/old-site:' 'server { listen 80 default_server; server_name secret-marker.example; }' >"$STATE/h-dump"
+rm -f "$ROOT$ICONF/nuit-cloud-abc12345-shop.conf"; before="$(snap)"; : >"$CALLS"
+ing_run --check >"$tmp/out" 2>&1 && bad "host ingress: the check passed while nginx listens on every address"; cat "$tmp/out" >>"$hout"
+grep -q 'DRIFT   ncs_ingress' "$tmp/out" && grep -qxF '  nginx also listens on every address on port 80' "$tmp/out" && [ "$before" = "$(snap)" ] && ! grep -q '^nginx\|^systemctl [a-z]' "$CALLS" \
+  && ok "host ingress: same revision with nginx on every address: the check is drift, says so in one line, and changes nothing" || { cat "$tmp/out" "$CALLS"; bad "host ingress check wildcard"; }
+: >"$CALLS"; ing_run >"$tmp/out" 2>&1 && bad "host ingress: same revision applied while nginx listens on every address"; cat "$tmp/out" >>"$hout"
+grep -q 'applying ncs_ingress' "$tmp/out" && grep -q 'FAILED  ncs_ingress' "$tmp/out" \
+  && grep -qxF '  nginx also listens on every address on port 80: another configuration has a listen without an address' "$tmp/out" \
+  && grep -qxF '    LISTEN 0 511 0.0.0.0:80 0.0.0.0:*' "$tmp/out" && grep -qxF '    /etc/nginx/sites-enabled/old-site: listen 80 default_server;' "$tmp/out" \
+  && cmp -s "$IST3/sites/nuit-cloud-abc12345-shop.conf" "$ROOT$ICONF/nuit-cloud-abc12345-shop.conf" && grep -q '^nginx -t' "$CALLS" && grep -q 'systemctl reload nginx' "$CALLS" \
+  && [ "$(cat "$ROOT/var/lib/nuit-cloud/ingress/revision")" = "$IREV2" ] && ! grep -q 'secret-marker' "$tmp/out" \
+  && ok "host ingress: same revision with nginx on every address: the apply runs again (files written, nginx tested and reloaded) and fails naming the culprit" \
+  || { cat "$tmp/out" "$CALLS"; bad "host ingress apply wildcard"; }
+
+# same revision, nginx listens on another specific address on a port the files name (10.31.0.13:80 alone, the management address): the same
+printf '%s\n' 'LISTEN 0 511 10.20.0.34:80 0.0.0.0:*' 'LISTEN 0 511 10.20.0.34:443 0.0.0.0:*' 'LISTEN 0 511 10.31.0.13:80 0.0.0.0:*' 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*' >"$STATE/h-listen"
+printf '%s\n' '# configuration file /etc/nginx/sites-enabled/mgmt:' 'server { listen 10.31.0.13:80; listen 10.20.0.34:80; listen 10.31.0.13:8080; }' >"$STATE/h-dump"
+before="$(snap)"; : >"$CALLS"
+ing_run --check >"$tmp/out" 2>&1 && bad "host ingress: the check passed while nginx listens on an address the files do not name"; cat "$tmp/out" >>"$hout"
+grep -q 'DRIFT   ncs_ingress' "$tmp/out" && grep -qxF '  nginx listens on 10.31.0.13:80, which the site files do not name' "$tmp/out" && [ "$before" = "$(snap)" ] \
+  && ok "host ingress: same revision with nginx on another address: the check is drift, says so in one line, and changes nothing" || { cat "$tmp/out" "$CALLS"; bad "host ingress check other address"; }
+: >"$CALLS"; ing_run >"$tmp/out" 2>&1 && bad "host ingress: same revision applied while nginx listens on another address"; cat "$tmp/out" >>"$hout"
+grep -q 'applying ncs_ingress' "$tmp/out" && grep -q 'FAILED  ncs_ingress' "$tmp/out" \
+  && grep -qxF '  nginx listens on 10.31.0.13:80, which the site files do not name: another configuration listens there' "$tmp/out" \
+  && grep -qxF '    LISTEN 0 511 10.31.0.13:80 0.0.0.0:*' "$tmp/out" && grep -qxF '    /etc/nginx/sites-enabled/mgmt: listen 10.31.0.13:80;' "$tmp/out" \
+  && ! grep -q 'listen 10.20.0.34:80;\|8080' "$tmp/out" && grep -q 'systemctl reload nginx' "$CALLS" && [ "$(cat "$ROOT/var/lib/nuit-cloud/ingress/revision")" = "$IREV2" ] \
+  && ok "host ingress: same revision with nginx on another address: the apply runs again and fails naming that listen line, and only it" \
+  || { cat "$tmp/out" "$CALLS"; bad "host ingress apply other address"; }
+
+# same revision, nginx no longer listens on an address the files name: the check says which
+printf '%s\n' 'LISTEN 0 511 10.20.0.34:80 0.0.0.0:*' 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*' >"$STATE/h-listen"
+ing_run --check >"$tmp/out" 2>&1 && bad "host ingress: the check passed while nginx does not listen on its address"
+grep -q 'DRIFT   ncs_ingress' "$tmp/out" && grep -qxF '  nginx does not listen on 10.20.0.34:443' "$tmp/out" \
+  && ok "host ingress: same revision with nginx not listening on an address the files name: the check is drift and says which" || { cat "$tmp/out"; bad "host ingress check missing"; }
+rm -f "$STATE/h-dump"
+
+# and once only the files' addresses are listened on again, the same revision is in step
+printf '%s\n' 'LISTEN 0 511 10.20.0.34:80 0.0.0.0:*' 'LISTEN 0 511 10.20.0.34:443 0.0.0.0:*' 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*' >"$STATE/h-listen"
+ing_run --check >"$tmp/out" 2>&1 && grep -q 'ok      ncs_ingress' "$tmp/out" && ok "host ingress: with the stray listen gone, the same revision is in step again" || { cat "$tmp/out"; bad "host ingress in step again"; }
+
 # only a dotted IPv4 address with a port is an address: a commented one, IPv6, a port alone, an impossible or hostile value are not asked for
 export NCS_INGRESS_REVISION="$IREV1"; mkstage "$IST3" "$IREV1" <<STAGE
 site 00-nuit-cloud-default.conf server { listen 10.20.0.34:80 default_server; } # listen 10.9.9.9:80;
@@ -2106,6 +2157,8 @@ STAGE
 export NCS_INGRESS_REVISION="$IREV2"; : >"$CALLS"; ing_run >"$tmp/out" 2>&1 || { cat "$tmp/out"; bad "host ingress without an address"; }; cat "$tmp/out" >>"$hout"
 grep -q 'done    ncs_ingress' "$tmp/out" && [ "$(cat "$ROOT/var/lib/nuit-cloud/ingress/revision")" = "$IREV2" ] && ! grep -q '^ip \|^ss ' "$CALLS" \
   && ok "host ingress: listen lines without an address (today's form) are applied as before" || { cat "$tmp/out" "$CALLS"; bad "host ingress no address"; }
+: >"$CALLS"; ing_run --check >"$tmp/out" 2>&1 && grep -q 'ok      ncs_ingress' "$tmp/out" && ! grep -q '^ip \|^ss \|^nginx' "$CALLS" \
+  && ok "host ingress: with listen lines without an address, the check is the recorded revision as before, and asks no sockets" || { cat "$tmp/out" "$CALLS"; bad "host ingress no address check"; }
 
 # only the exact word is the machine's nginx: `Host` is a container name like any other (and not running here, so a person's job)
 : >"$CALLS"; env NCS_INGRESS_CONTAINER=Host sh "$here/bootstrap.sh" nuit-cloud-ingress >"$tmp/out" 2>&1 && bad "host ingress: Host was taken for host"

@@ -2473,11 +2473,20 @@ ing_host_base() {
 ing_staged() {
   [ -n "$1" ] && [ -d "$1" ] && [ "$(cat "$1/revision" 2>/dev/null || true)" = "$NCS_INGRESS_REVISION" ]
 }
+# in step: the revision and settings recorded, and (host) the base kept and nginx listening exactly where the installed site files say, when
+# they name an address (ingress-listens.sh, the check ingress-apply.sh makes after its reload, here once and read-only). A recorded revision
+# alone is not enough: another configuration on the machine can make nginx answer on every address, or another one, after the apply. That
+# check's one-line reason is said, and the apply then writes the same revision again and fails, naming the culprits, if that does not fix it.
 f_ncs_ingress_ok() {
   ing_inputs_ok || return 1
   [ "$(cat "$(p "$ING_STATE")/revision" 2>/dev/null || true)" = "$NCS_INGRESS_REVISION" ] || return 1
   [ "$(cat "$(p "$ING_STATE")/settings" 2>/dev/null || true)" = "$(ing_settings)" ] || return 1
-  if ing_host; then ing_host_base_ok; else ing_running; fi
+  if ing_host; then
+    ing_host_base_ok || return 1
+    sh "$here/ingress-listens.sh" check "$(p "$NCS_INGRESS_CONF_DIR")" 1 brief
+  else
+    ing_running
+  fi
 }
 f_ncs_ingress_do() {
   ing_inputs_ok || { echo "  the task carries no usable ingress settings (revision, confDir, certRoot, container)" >&2; return 1; }
@@ -2496,7 +2505,7 @@ f_ncs_ingress_do() {
     return 3
   fi
   ing_staged "$st" || { echo "  the ingress configuration for this revision was not fetched (the agent fetches it when it applies)" >&2; return 1; }
-  cp "$here/ingress-apply.sh" "$st/apply.sh" && chmod 700 "$st/apply.sh" || return 1
+  cp "$here/ingress-apply.sh" "$st/apply.sh" && cp "$here/ingress-listens.sh" "$st/ingress-listens.sh" && chmod 700 "$st/apply.sh" "$st/ingress-listens.sh" || return 1
   ing_rc=0
   ing_privileged "$st/apply.sh" "${ROOT:-}" "$st" "$NCS_INGRESS_CONF_DIR" "$NCS_INGRESS_CERT_ROOT" "$NCS_INGRESS_CONTAINER" "$NCS_INGRESS_REVISION" "$ING_STATE" || ing_rc=$?
   # 3 (an address not on the machine yet) is MANUAL; any other failure is FAILED

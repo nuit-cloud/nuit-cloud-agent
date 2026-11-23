@@ -15,8 +15,10 @@
 # nuit-cloud/nuit-cloud#205). Before anything is written each such address must be on the machine (`ip -o -4 addr show`), else exit 3; after
 # the reload nginx must listen on each address:port the files name (`ss -Htln`), else exit 1 and the revision is not recorded: `nginx -t`
 # does not bind, and `systemctl reload nginx` succeeds even when nginx cannot bind and keeps its old configuration. Nor may nginx then listen
-# on every address (0.0.0.0, *, [::]) on any of those ports, else exit 1: the `listen` lines without an address that cause it are named from
-# `nginx -T` (file and line, nothing else of the configuration). An optional eighth
+# on anything else on any of those ports, every address (0.0.0.0, *, [::]) or another address the files do not name, else exit 1: the
+# `listen` lines that cause it are named from `nginx -T` (file and line, nothing else of the configuration). Those checks are
+# ingress-listens.sh, which must be beside this script (the feature's check runs it too). It writes and reloads whenever it runs, the same
+# revision too: the feature runs it again when the listen check fails on a machine whose recorded revision is in step. An optional eighth
 # argument, the word `addresses`, does only the first check (the feature runs it before it installs or changes anything) and exits 0 or 3.
 set -u
 R="$1"; S="$2"; CONF="$3"; CROOT="$4"; C="$5"; REV="$6"; SD="$7"; MODE="${8:-}"
@@ -47,16 +49,13 @@ while IFS=' ' read -r n d; do
 done <"$S/certs.list"
 
 # ─── the addresses the site files listen on (with `host`): each must be on the machine before anything is written ──────────────────────
-# listen_addrs: every "A.B.C.D:port" a staged site file's listen directive names, once each (comments dropped, one statement per line;
-# anything that is not a dotted IPv4 address with a port, such as `listen 80;` or `listen [::]:443 ssl;`, is not an address here)
-OCTET='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
-listen_addrs() {
-  while IFS= read -r f; do sed 's/#.*//' "$S/sites/$f" | tr '{};' '\n\n\n' | awk '$1 == "listen" { print $2 }'; done <"$S/sites.list" \
-    | grep -E "^$OCTET(\.$OCTET){3}:[1-9][0-9]{0,4}\$" | awk -F: '$2 <= 65535' | LC_ALL=C sort -u
-}
+# the listen checks are ingress-listens.sh, beside this script (the feature copies both into the stage): the same read-only check the feature's
+# own check runs on the installed site files. `addrs` lists every "A.B.C.D:port" the staged site files name, once each.
+LCHECK="$(dirname "$0")/ingress-listens.sh"
+[ -f "$LCHECK" ] || fail "ingress-listens.sh is not beside this script"
 LISTENS=""
 if [ "$C" = host ]; then
-  LISTENS="$(listen_addrs)"
+  LISTENS="$(sh "$LCHECK" addrs "$S/sites")" || fail "could not read the addresses the site files listen on"
   if [ -n "$LISTENS" ]; then
     here_addrs="$(ip -o -4 addr show 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "inet") { split($(i + 1), a, "/"); print a[1] } }')"
     for ap in $LISTENS; do
@@ -185,57 +184,12 @@ elif [ "$changed" = 1 ]; then
   reloaded="; nginx reloaded"
 fi
 # a reload only signals nginx, and nginx that cannot bind an address logs it and keeps its old configuration: so (with `host`) it must now
-# listen on every address:port the files name, within ten seconds, or the revision is not recorded. It must also not listen on every
-# address on any of those ports (0.0.0.0, *, [::]): another configuration on the machine (sites-enabled, conf.d, nginx.conf, an old file)
-# with a listen without an address makes nginx bind the wildcard, and the Ingress Service then answers on the management address too.
-# wild_held <port>: the ss lines that listen on every address on that port
-wild_held() { printf '%s\n' "$sockets" | awk -v p="$1" '$4 == "0.0.0.0:" p || $4 == "*:" p || $4 == "[::]:" p'; }
-# wild_listens <ports>: from `nginx -T` (read-only, a fixed command), each listen line with no IPv4 address on one of the ports, as
-# "<file>: <line>", at most 20 lines; nothing else of the configuration is printed
-wild_listens() {
-  ngx -T 2>/dev/null | awk -v ports=" $1 " '
-    function stmt(x,   n, w, t, port, i) {
-      sub(/^[ \t]+/, "", x); sub(/[ \t]+$/, "", x)
-      n = split(x, w, /[ \t]+/)
-      if (n < 2 || w[1] != "listen") return
-      t = w[2]; gsub(/"/, "", t)
-      if (t ~ /^[0-9]+$/) port = t
-      else if (t ~ /^(\*|0\.0\.0\.0|\[::\]):[0-9]+$/) { port = t; sub(/.*:/, "", port) }
-      else return
-      if (index(ports, " " port " ") == 0) return
-      x = w[1]; for (i = 2; i <= n; i++) x = x " " w[i]
-      found++; if (found <= 20) printf "%s: %s;\n", file, x
-    }
-    /^# configuration file .*:$/ { file = substr($0, 22, length($0) - 22); buf = ""; next }
-    {
-      line = $0; sub(/#.*/, "", line); buf = buf " " line
-      while (match(buf, /[;{}]/)) { stmt(substr(buf, 1, RSTART - 1)); buf = substr(buf, RSTART + 1) }
-    }
-    END {
-      if (found > 20) printf "... and %d more\n", found - 20
-      if (found == 0) print "nginx -T names no such listen line (a server block with no listen line at all listens on every address on port 80)"
-    }' | LC_ALL=C tr -c '[:print:]\n' '?' | cut -c1-300
-}
+# listen on every address:port the files name, within ten seconds, or the revision is not recorded. On those ports it must also listen on
+# nothing else: not on every address (0.0.0.0, *, [::]: another configuration on the machine, in sites-enabled, conf.d, nginx.conf or an old
+# file, has a listen without an address) and not on another address the files do not name; the Ingress Service would answer there too
+# (the management address). ingress-listens.sh says which, with the sockets and the listen lines from nginx -T that cause it.
 if [ -n "$LISTENS" ]; then
-  ports="$(for ap in $LISTENS; do printf '%s\n' "${ap##*:}"; done | LC_ALL=C sort -un | tr '\n' ' ')"
-  tries=0
-  while :; do
-    sockets="$(ss -Htln 2>/dev/null)"
-    held="$(printf '%s\n' "$sockets" | awk '{ print $4 }')"
-    missing=""; wild=""
-    for ap in $LISTENS; do printf '%s\n' "$held" | grep -qxF "$ap" || { missing="$ap"; break; }; done
-    for p in $ports; do [ -z "$(wild_held "$p")" ] || wild="$wild $p"; done
-    [ -z "$missing" ] && [ -z "$wild" ] && break
-    tries=$((tries + 1))
-    [ "$tries" -lt 10 ] && { sleep 1; continue; }
-    if [ -n "$wild" ]; then
-      for p in $wild; do say "nginx also listens on every address on port $p: another configuration has a listen without an address" >&2; done
-      for p in $wild; do wild_held "$p"; done | head -n 10 | LC_ALL=C tr -c '[:print:]\n' '?' | cut -c1-300 | sed 's/^/    /' >&2
-      wild_listens "${wild# }" | sed 's/^/    /' >&2
-      exit 1
-    fi
-    fail "nginx did not take the new configuration: it does not listen on $missing; journalctl -u nginx says why"
-  done
+  sh "$LCHECK" check "$S/sites" 10 full || exit 1
 fi
 
 # ─── record (the revision last: it says the files above are this revision) ────────────────────────────────────────────────────────────
