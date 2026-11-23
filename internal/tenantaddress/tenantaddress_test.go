@@ -29,18 +29,12 @@ iface enp0s31f6.5 inet static
     post-up iptables -t mangle -C PREROUTING ! -i enp0s31f6.5 -m connmark --mark 0x5 -j CONNMARK --restore-mark 2>/dev/null || iptables -t mangle -A PREROUTING ! -i enp0s31f6.5 -m connmark --mark 0x5 -j CONNMARK --restore-mark
     post-up ip route replace default via 10.20.0.1 dev enp0s31f6.5 table 105
     post-up ip rule show | grep -q "fwmark 0x5 lookup 105" || ip rule add fwmark 0x5 lookup 105 priority 1050
-    post-up iptables -t mangle -C PREROUTING -i enp0s31f6 -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x31 2>/dev/null || iptables -t mangle -A PREROUTING -i enp0s31f6 -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x31
-    post-up iptables -t mangle -C PREROUTING -i ocisaas0 -m connmark --mark 0x31 -j CONNMARK --restore-mark 2>/dev/null || iptables -t mangle -A PREROUTING -i ocisaas0 -m connmark --mark 0x31 -j CONNMARK --restore-mark
-    post-up ip -4 rule show | grep -Ewq 'fwmark 0x31 lookup main' || ip rule add fwmark 0x31 lookup main priority 1030
     post-up ip -4 rule show | grep -Ewq 'to 10\.89\.0\.0/16 iif ocisaas0 ([[]detached[]] )?lookup main' || ip rule add to 10.89.0.0/16 iif ocisaas0 lookup main priority 1040
     post-up ip -4 rule show | grep -Ewq 'to 10\.20\.0\.0/24 iif ocisaas0 ([[]detached[]] )?lookup main' || ip rule add to 10.20.0.0/24 iif ocisaas0 lookup main priority 1041
     post-up ip -4 rule show | grep -Ewq 'iif ocisaas0 ([[]detached[]] )?lookup 105' || ip rule add iif ocisaas0 lookup 105 priority 1045
     pre-down ip rule del iif ocisaas0 lookup 105 2>/dev/null || true
     pre-down ip rule del to 10.20.0.0/24 iif ocisaas0 lookup main 2>/dev/null || true
     pre-down ip rule del to 10.89.0.0/16 iif ocisaas0 lookup main 2>/dev/null || true
-    pre-down ip rule del fwmark 0x31 lookup main 2>/dev/null || true
-    pre-down iptables -t mangle -D PREROUTING -i ocisaas0 -m connmark --mark 0x31 -j CONNMARK --restore-mark 2>/dev/null || true
-    pre-down iptables -t mangle -D PREROUTING -i enp0s31f6 -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x31 2>/dev/null || true
     pre-down ip rule del fwmark 0x5 lookup 105 2>/dev/null || true
     pre-down iptables -t mangle -D PREROUTING ! -i enp0s31f6.5 -m connmark --mark 0x5 -j CONNMARK --restore-mark 2>/dev/null || true
     pre-down iptables -t mangle -D PREROUTING -i enp0s31f6.5 -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x5 2>/dev/null || true
