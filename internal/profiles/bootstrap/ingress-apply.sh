@@ -14,7 +14,9 @@
 # With `host`, a site file may listen on a given IPv4 address (`listen 10.20.0.34:443 ssl;`, the Ingress Service's tenant-VLAN address,
 # nuit-cloud/nuit-cloud#205). Before anything is written each such address must be on the machine (`ip -o -4 addr show`), else exit 3; after
 # the reload nginx must listen on each address:port the files name (`ss -Htln`), else exit 1 and the revision is not recorded: `nginx -t`
-# does not bind, and `systemctl reload nginx` succeeds even when nginx cannot bind and keeps its old configuration. An optional eighth
+# does not bind, and `systemctl reload nginx` succeeds even when nginx cannot bind and keeps its old configuration. Nor may nginx then listen
+# on every address (0.0.0.0, *, [::]) on any of those ports, else exit 1: the `listen` lines without an address that cause it are named from
+# `nginx -T` (file and line, nothing else of the configuration). An optional eighth
 # argument, the word `addresses`, does only the first check (the feature runs it before it installs or changes anything) and exits 0 or 3.
 set -u
 R="$1"; S="$2"; CONF="$3"; CROOT="$4"; C="$5"; REV="$6"; SD="$7"; MODE="${8:-}"
@@ -183,17 +185,56 @@ elif [ "$changed" = 1 ]; then
   reloaded="; nginx reloaded"
 fi
 # a reload only signals nginx, and nginx that cannot bind an address logs it and keeps its old configuration: so (with `host`) it must now
-# listen on every address:port the files name, within ten seconds, or the revision is not recorded
+# listen on every address:port the files name, within ten seconds, or the revision is not recorded. It must also not listen on every
+# address on any of those ports (0.0.0.0, *, [::]): another configuration on the machine (sites-enabled, conf.d, nginx.conf, an old file)
+# with a listen without an address makes nginx bind the wildcard, and the Ingress Service then answers on the management address too.
+# wild_held <port>: the ss lines that listen on every address on that port
+wild_held() { printf '%s\n' "$sockets" | awk -v p="$1" '$4 == "0.0.0.0:" p || $4 == "*:" p || $4 == "[::]:" p'; }
+# wild_listens <ports>: from `nginx -T` (read-only, a fixed command), each listen line with no IPv4 address on one of the ports, as
+# "<file>: <line>", at most 20 lines; nothing else of the configuration is printed
+wild_listens() {
+  ngx -T 2>/dev/null | awk -v ports=" $1 " '
+    function stmt(x,   n, w, t, port, i) {
+      sub(/^[ \t]+/, "", x); sub(/[ \t]+$/, "", x)
+      n = split(x, w, /[ \t]+/)
+      if (n < 2 || w[1] != "listen") return
+      t = w[2]; gsub(/"/, "", t)
+      if (t ~ /^[0-9]+$/) port = t
+      else if (t ~ /^(\*|0\.0\.0\.0|\[::\]):[0-9]+$/) { port = t; sub(/.*:/, "", port) }
+      else return
+      if (index(ports, " " port " ") == 0) return
+      x = w[1]; for (i = 2; i <= n; i++) x = x " " w[i]
+      found++; if (found <= 20) printf "%s: %s;\n", file, x
+    }
+    /^# configuration file .*:$/ { file = substr($0, 22, length($0) - 22); buf = ""; next }
+    {
+      line = $0; sub(/#.*/, "", line); buf = buf " " line
+      while (match(buf, /[;{}]/)) { stmt(substr(buf, 1, RSTART - 1)); buf = substr(buf, RSTART + 1) }
+    }
+    END {
+      if (found > 20) printf "... and %d more\n", found - 20
+      if (found == 0) print "nginx -T names no such listen line (a server block with no listen line at all listens on every address on port 80)"
+    }' | LC_ALL=C tr -c '[:print:]\n' '?' | cut -c1-300
+}
 if [ -n "$LISTENS" ]; then
+  ports="$(for ap in $LISTENS; do printf '%s\n' "${ap##*:}"; done | LC_ALL=C sort -un | tr '\n' ' ')"
   tries=0
   while :; do
-    held="$(ss -Htln 2>/dev/null | awk '{ print $4 }')"
-    missing=""
+    sockets="$(ss -Htln 2>/dev/null)"
+    held="$(printf '%s\n' "$sockets" | awk '{ print $4 }')"
+    missing=""; wild=""
     for ap in $LISTENS; do printf '%s\n' "$held" | grep -qxF "$ap" || { missing="$ap"; break; }; done
-    [ -z "$missing" ] && break
+    for p in $ports; do [ -z "$(wild_held "$p")" ] || wild="$wild $p"; done
+    [ -z "$missing" ] && [ -z "$wild" ] && break
     tries=$((tries + 1))
-    [ "$tries" -lt 10 ] || fail "nginx did not take the new configuration: it does not listen on $missing; journalctl -u nginx says why"
-    sleep 1
+    [ "$tries" -lt 10 ] && { sleep 1; continue; }
+    if [ -n "$wild" ]; then
+      for p in $wild; do say "nginx also listens on every address on port $p: another configuration has a listen without an address" >&2; done
+      for p in $wild; do wild_held "$p"; done | head -n 10 | LC_ALL=C tr -c '[:print:]\n' '?' | cut -c1-300 | sed 's/^/    /' >&2
+      wild_listens "${wild# }" | sed 's/^/    /' >&2
+      exit 1
+    fi
+    fail "nginx did not take the new configuration: it does not listen on $missing; journalctl -u nginx says why"
   done
 fi
 

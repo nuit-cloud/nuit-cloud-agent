@@ -1892,7 +1892,7 @@ for a in "$@"; do [ "$a" = nginx ] || continue
   mkdir -p "$ROOT/etc/nginx/sites-available" "$ROOT/etc/nginx/sites-enabled" "$ROOT/etc/nginx/conf.d"
   printf "server { listen 80 default_server; }\n" >"$ROOT/etc/nginx/sites-available/default"; ln -sf /etc/nginx/sites-available/default "$ROOT/etc/nginx/sites-enabled/default"
 done; exit 0'
-stub nginx 'echo "nginx $*" >>"$CALLS"; [ "$1" = -t ] || exit 0
+stub nginx 'echo "nginx $*" >>"$CALLS"; if [ "$1" = -T ]; then cat "$STATE/h-dump" 2>/dev/null; echo "nginx: the configuration file /etc/nginx/nginx.conf syntax is ok" >&2; exit 0; fi; [ "$1" = -t ] || exit 0
 if [ -e "$STATE/h-bad" ]; then echo "nginx: [emerg] unknown directive \"bogus\" in /home/nuitcloud/nginx/conf.d/nuit-cloud-abc12345-shop.conf:1" >&2; exit 1; fi
 echo "nginx: configuration file /etc/nginx/nginx.conf test is successful" >&2; exit 0'
 stub docker 'echo "docker $*" >>"$CALLS"; exit 1'
@@ -2020,10 +2020,69 @@ grep -q 'MANUAL  ncs_ingress' "$tmp/out" && grep -q 'the Ingress Service address
   || { cat "$tmp/out" "$CALLS"; echo "$before" >"$tmp/snap-before"; snap >"$tmp/snap-after"; diff "$tmp/snap-before" "$tmp/snap-after" || true; bad "host ingress address absent"; }
 
 printf '%s\n' '3: eth0.20    inet 10.20.0.34/24 brd 10.20.0.255 scope global eth0.20\       valid_lft forever preferred_lft forever' >>"$STATE/h-addrs"
-: >"$CALLS"; ing_run >"$tmp/out" 2>&1 && bad "host ingress: recorded while nginx still listens on every address"; cat "$tmp/out" >>"$hout"
+printf '%s\n' 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*' >"$STATE/h-listen"
+: >"$CALLS"; ing_run >"$tmp/out" 2>&1 && bad "host ingress: recorded while nginx does not listen on its address"; cat "$tmp/out" >>"$hout"
 grep -q 'FAILED  ncs_ingress' "$tmp/out" && grep -q 'nginx did not take the new configuration: it does not listen on 10.20.0.34:\(80\|443\); journalctl -u nginx says why' "$tmp/out" \
   && [ "$(line_of 'systemctl reload nginx')" -lt "$(line_of '^ss -Htln')" ] && [ "$(cat "$ROOT/var/lib/nuit-cloud/ingress/revision")" = "$IREV1" ] \
   && ok "host ingress: a reload after which nginx does not listen on the address the files name is FAILED, and the revision is not recorded" || { cat "$tmp/out" "$CALLS"; bad "host ingress listen check"; }
+
+# another configuration on the machine still has a listen without an address (ncs-mini-1, nuit-cloud/nuit-cloud#205): nginx listens on its
+# address and on every address too, so the Ingress Service answers on the management address. FAILED, not recorded, and the culprits named
+# from nginx -T as "<file>: <line>"; nothing else of the configuration is printed, and a wildcard on a port the files do not name is not one
+printf '%s\n' 'LISTEN 0 511 10.20.0.34:80 0.0.0.0:*' 'LISTEN 0 511 10.20.0.34:443 0.0.0.0:*' 'LISTEN 0 511 0.0.0.0:80 0.0.0.0:*' 'LISTEN 0 511 [::]:443 [::]:*' \
+  'LISTEN 0 511 0.0.0.0:8080 0.0.0.0:*' 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*' >"$STATE/h-listen"
+cat >"$STATE/h-dump" <<'DUMP'
+# configuration file /etc/nginx/nginx.conf:
+user www-data;
+http {
+    # listen 80; in a comment is not a listen
+    ssl_certificate_key /etc/nginx/secret-marker-key.pem;
+    include /etc/nginx/conf.d/*.conf;
+    include /etc/nginx/sites-enabled/*;
+}
+
+# configuration file /etc/nginx/sites-enabled/old-site:
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name secret-marker.example;
+}
+server { listen 8080; listen *:80; }
+
+# configuration file /etc/nginx/conf.d/legacy.conf:
+server {
+    listen
+        443 ssl http2;
+    listen 0.0.0.0:443 ssl;
+    listen [::1]:443 ssl;
+}
+
+# configuration file /home/nuitcloud/nginx/conf.d/00-nuit-cloud-default.conf:
+server { listen 10.20.0.34:80 default_server; listen 10.20.0.34:443 ssl default_server; }
+DUMP
+: >"$CALLS"; ing_run >"$tmp/out" 2>&1 && bad "host ingress: recorded while nginx also listens on every address"; cat "$tmp/out" >>"$hout"
+for want in '  nginx also listens on every address on port 80: another configuration has a listen without an address' \
+  '  nginx also listens on every address on port 443: another configuration has a listen without an address' \
+  '    LISTEN 0 511 0.0.0.0:80 0.0.0.0:*' '    LISTEN 0 511 [::]:443 [::]:*' \
+  '    /etc/nginx/sites-enabled/old-site: listen 80 default_server;' '    /etc/nginx/sites-enabled/old-site: listen [::]:80 default_server;' \
+  '    /etc/nginx/sites-enabled/old-site: listen *:80;' '    /etc/nginx/conf.d/legacy.conf: listen 443 ssl http2;' '    /etc/nginx/conf.d/legacy.conf: listen 0.0.0.0:443 ssl;'; do
+  grep -qxF -- "$want" "$tmp/out" || { cat "$tmp/out"; bad "host ingress wildcard: missing line: $want"; }
+done
+grep -q 'FAILED  ncs_ingress' "$tmp/out" && [ "$(cat "$ROOT/var/lib/nuit-cloud/ingress/revision")" = "$IREV1" ] && grep -qx 'nginx -T' "$CALLS" && [ "$(line_of 'systemctl reload nginx')" -lt "$(line_of '^nginx -T')" ] \
+  && ! grep -q 'secret-marker\|8080\|\[::1\]\|10\.20\.0\.34:\|0\.0\.0\.0:22\|user www-data\|in a comment\|syntax is ok' "$tmp/out" \
+  && ok "host ingress: nginx also listening on every address on a port the files name is FAILED, not recorded, and the listen lines without an address are named by file, nothing else" \
+  || { cat "$tmp/out" "$CALLS"; bad "host ingress wildcard"; }
+
+# the culprits are capped at twenty lines, and an nginx -T that names none says what else it can be
+{ echo '# configuration file /etc/nginx/conf.d/many.conf:'; i=0; while [ "$i" -lt 30 ]; do echo "server { listen 80; server_name s$i.example; }"; i=$((i + 1)); done; } >"$STATE/h-dump"
+: >"$CALLS"; ing_run >"$tmp/out" 2>&1 && bad "host ingress: recorded with thirty wildcard listens"; cat "$tmp/out" >>"$hout"
+[ "$(grep -cxF '    /etc/nginx/conf.d/many.conf: listen 80;' "$tmp/out")" = 20 ] && grep -qxF '    ... and 10 more' "$tmp/out" && ! grep -q 'server_name' "$tmp/out" \
+  && ok "host ingress: the listen lines named are capped at twenty, with how many more" || { cat "$tmp/out"; bad "host ingress wildcard cap"; }
+printf '# configuration file /etc/nginx/nginx.conf:\nhttp { server { server_name x; } }\n' >"$STATE/h-dump"
+: >"$CALLS"; ing_run >"$tmp/out" 2>&1 && bad "host ingress: recorded with a wildcard and no listen line"; cat "$tmp/out" >>"$hout"
+grep -q 'nginx -T names no such listen line' "$tmp/out" && [ "$(cat "$ROOT/var/lib/nuit-cloud/ingress/revision")" = "$IREV1" ] \
+  && ok "host ingress: a wildcard nginx -T names no listen line for is still FAILED, and says a server block without one listens on port 80" || { cat "$tmp/out"; bad "host ingress wildcard none named"; }
+rm -f "$STATE/h-dump"
 
 printf '%s\n' 'LISTEN 0 511 10.20.0.34:80 0.0.0.0:*' 'LISTEN 0 511 10.20.0.34:443 0.0.0.0:*' 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*' >"$STATE/h-listen"
 : >"$CALLS"; ing_run >"$tmp/out" 2>&1 || { cat "$tmp/out" "$CALLS"; bad "host ingress apply on its address"; }; cat "$tmp/out" >>"$hout"
