@@ -1880,6 +1880,7 @@ case "$1" in
   enable) touch "$STATE/h-enabled-$2";;
   start) [ -e "$STATE/h-nostart" ] && exit 1; touch "$STATE/h-active-$2";;
   stop) rm -f "$STATE/h-active-$2";;
+  restart) touch "$STATE/h-restarted-$2"; [ -e "$STATE/h-norestart" ] && { echo "Job for nginx.service failed." >&2; exit 1; }; touch "$STATE/h-active-$2";;
   reload) [ -e "$STATE/h-active-$2" ] || { echo "nginx.service is not active, cannot reload." >&2; exit 1; };;
   is-active) shift; [ "$1" = --quiet ] && shift; [ -e "$STATE/h-active-$1" ]; exit $?;;
   is-enabled) shift; [ "$1" = --quiet ] && shift; [ -e "$STATE/h-enabled-$1" ]; exit $?;;
@@ -1898,7 +1899,9 @@ echo "nginx: configuration file /etc/nginx/nginx.conf test is successful" >&2; e
 stub docker 'echo "docker $*" >>"$CALLS"; exit 1'
 # the machine's IPv4 addresses and nginx's listening sockets, as the test sets them
 stub ip 'echo "ip $*" >>"$CALLS"; [ "$*" = "-o -4 addr show" ] && cat "$STATE/h-addrs" 2>/dev/null; exit 0'
-stub ss 'echo "ss $*" >>"$CALLS"; cat "$STATE/h-listen" 2>/dev/null; exit 0'
+# (ss -p answers nothing with h-nop; after systemctl restart nginx the sockets are h-listen-restart, when the test gives one)
+stub ss 'echo "ss $*" >>"$CALLS"; case "$*" in *p*) [ -e "$STATE/h-nop" ] && exit 0;; esac
+if [ -e "$STATE/h-restarted-nginx" ] && [ -e "$STATE/h-listen-restart" ]; then cat "$STATE/h-listen-restart"; else cat "$STATE/h-listen" 2>/dev/null; fi; exit 0'
 OLDROOT23="$ROOT"; export ROOT="$tmp/hostroot"; rm -rf "$ROOT" "$STATE"/h-* "$STATE"/pkg-nginx "$STATE"/policy-rc-seen; mkdir -p "$ROOT/etc"
 INC="$ROOT/etc/nginx/conf.d/nuit-cloud-ingress.conf"; DEFSITE="$ROOT/etc/nginx/sites-enabled/default"
 want_inc="$(printf '%s\n' "# Managed by the nuit-cloud agent (the ncs_ingress feature): the Ingress Service's site files. Changes made here are replaced." "include $ICONF/*.conf;")"
@@ -2140,6 +2143,89 @@ rm -f "$STATE/h-dump"
 # and once only the files' addresses are listened on again, the same revision is in step
 printf '%s\n' 'LISTEN 0 511 10.20.0.34:80 0.0.0.0:*' 'LISTEN 0 511 10.20.0.34:443 0.0.0.0:*' 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*' >"$STATE/h-listen"
 ing_run --check >"$tmp/out" 2>&1 && grep -q 'ok      ncs_ingress' "$tmp/out" && ok "host ingress: with the stray listen gone, the same revision is in step again" || { cat "$tmp/out"; bad "host ingress in step again"; }
+
+# nginx kept its old configuration's sockets (ncs-mini-1, nuit-cloud/nuit-cloud#205): the files on disk all listen on 10.20.0.34, nginx -t
+# passes, systemctl reload "succeeds", but the running master still holds 0.0.0.0:80/443 and [::]:80/443 and could not bind the address-
+# specific sockets; nginx -T names no wildcard listen line. Only a restart rebinds: the apply restarts nginx once and checks again.
+NGX='users:(("nginx",pid=812,fd=6),("nginx",pid=811,fd=6))'
+printf '%s\n' "LISTEN 0 511 0.0.0.0:80 0.0.0.0:* $NGX" "LISTEN 0 511 0.0.0.0:443 0.0.0.0:* $NGX" "LISTEN 0 511 [::]:80 [::]:* $NGX" "LISTEN 0 511 [::]:443 [::]:* $NGX" \
+  'LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=600,fd=3))' >"$STATE/h-listen"
+printf '%s\n' "LISTEN 0 511 10.20.0.34:80 0.0.0.0:* $NGX" "LISTEN 0 511 10.20.0.34:443 0.0.0.0:* $NGX" 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=600,fd=3))' >"$STATE/h-listen-restart"
+cat >"$STATE/h-dump" <<'DUMP'
+# configuration file /etc/nginx/nginx.conf:
+http { include /etc/nginx/conf.d/*.conf; }
+
+# configuration file /home/nuitcloud/nginx/conf.d/00-nuit-cloud-default.conf:
+server { listen 10.20.0.34:80 default_server; listen 10.20.0.34:443 ssl default_server; }
+DUMP
+rm -f "$ROOT/var/lib/nuit-cloud/ingress/revision" "$STATE"/h-restarted-*; : >"$CALLS"
+ing_run >"$tmp/out" 2>&1 || { cat "$tmp/out" "$CALLS"; bad "host ingress: nginx holding its old sockets was not restarted into the new ones"; }; cat "$tmp/out" >>"$hout"
+grep -q 'done    ncs_ingress' "$tmp/out" && [ "$(cat "$ROOT/var/lib/nuit-cloud/ingress/revision")" = "$IREV2" ] && [ "$(count 'systemctl restart nginx')" = 1 ] \
+  && grep -qxF '  nginx kept its old listening sockets after the reload (a reload cannot move a port from every address to one address); restarting nginx' "$tmp/out" \
+  && grep -q 'nginx reloaded, then restarted (it had kept its old listening sockets)' "$tmp/out" && grep -q '^ss -Htlnp' "$CALLS" \
+  && [ "$(line_of 'systemctl reload nginx')" -lt "$(line_of '^nginx -T')" ] && [ "$(line_of '^nginx -T')" -lt "$(line_of 'systemctl restart nginx')" ] \
+  && ! grep -q 'also listens on every address' "$tmp/out" \
+  && ok "host ingress: nginx still on its old wildcard sockets after the reload, with no culprit in its configuration, is restarted once, then listens where the files say: applied and recorded, with a note" \
+  || { cat "$tmp/out" "$CALLS"; bad "host ingress stale sockets restart"; }
+
+# the restart does not help: FAILED with the full message, restarted once only, not recorded
+rm -f "$STATE/h-listen-restart" "$STATE"/h-restarted-* "$ROOT/var/lib/nuit-cloud/ingress/revision"; : >"$CALLS"
+ing_run >"$tmp/out" 2>&1 && bad "host ingress: recorded while nginx kept wildcard sockets after a restart"; cat "$tmp/out" >>"$hout"
+grep -q 'FAILED  ncs_ingress' "$tmp/out" && [ "$(count 'systemctl restart nginx')" = 1 ] && [ ! -e "$ROOT/var/lib/nuit-cloud/ingress/revision" ] \
+  && grep -qxF '  nginx also listens on every address on port 80: another configuration has a listen without an address' "$tmp/out" \
+  && grep -qxF "    LISTEN 0 511 0.0.0.0:80 0.0.0.0:* $NGX" "$tmp/out" && grep -q 'nginx -T names no such listen line' "$tmp/out" \
+  && grep -qxF '  nginx was restarted and still does not listen only where the site files say' "$tmp/out" \
+  && ok "host ingress: when nginx still holds the wildcard sockets after the restart the apply is FAILED with the full message, nginx was restarted once only, and nothing is recorded" \
+  || { cat "$tmp/out" "$CALLS"; bad "host ingress stale sockets restart fails"; }
+
+# a restart that fails is said plainly, and nothing is recorded
+touch "$STATE/h-norestart"; rm -f "$STATE"/h-restarted-*; : >"$CALLS"
+ing_run >"$tmp/out" 2>&1 && bad "host ingress: recorded after a failed restart"; cat "$tmp/out" >>"$hout"
+grep -q 'FAILED  ncs_ingress' "$tmp/out" && grep -qxF '  nginx did not restart: Job for nginx.service failed. (journalctl -u nginx says why)' "$tmp/out" && [ "$(count 'systemctl restart nginx')" = 1 ] \
+  && [ ! -e "$ROOT/var/lib/nuit-cloud/ingress/revision" ] && ok "host ingress: a restart that fails is FAILED plainly, and the revision is not recorded" || { cat "$tmp/out" "$CALLS"; bad "host ingress restart fails"; }
+rm -f "$STATE/h-norestart"; touch "$STATE/h-active-nginx"
+
+# the configuration names the culprit: a restart would bind the wildcard again, so nginx is not restarted and the culprit is named
+printf '%s\n' "LISTEN 0 511 10.20.0.34:80 0.0.0.0:* $NGX" "LISTEN 0 511 10.20.0.34:443 0.0.0.0:* $NGX" "LISTEN 0 511 0.0.0.0:80 0.0.0.0:* $NGX" >"$STATE/h-listen"
+printf '%s\n' "LISTEN 0 511 10.20.0.34:443 0.0.0.0:* $NGX" >"$STATE/h-listen-restart"
+printf '%s\n' '# configuration file /etc/nginx/sites-enabled/old-site:' 'server { listen 80 default_server; }' >"$STATE/h-dump"
+rm -f "$STATE"/h-restarted-*; : >"$CALLS"
+ing_run >"$tmp/out" 2>&1 && bad "host ingress: recorded with a culprit in the configuration"; cat "$tmp/out" >>"$hout"
+grep -q 'FAILED  ncs_ingress' "$tmp/out" && [ "$(count 'systemctl restart')" = 0 ] && ! grep -q 'restarting nginx' "$tmp/out" \
+  && grep -qxF '    /etc/nginx/sites-enabled/old-site: listen 80 default_server;' "$tmp/out" && grep -qxF "    LISTEN 0 511 0.0.0.0:80 0.0.0.0:* $NGX" "$tmp/out" \
+  && ok "host ingress: a wildcard the configuration on disk asks for is FAILED naming the listen line, and nginx is not restarted" || { cat "$tmp/out" "$CALLS"; bad "host ingress culprit no restart"; }
+
+# a wildcard on the port another program holds: that program is named, nginx is not restarted (it could not take the port either)
+printf '%s\n' "LISTEN 0 511 10.20.0.34:443 0.0.0.0:* $NGX" 'LISTEN 0 511 0.0.0.0:80 0.0.0.0:* users:(("apache2",pid=700,fd=4),("apache2",pid=701,fd=4))' >"$STATE/h-listen"
+cat >"$STATE/h-dump" <<'DUMP'
+# configuration file /home/nuitcloud/nginx/conf.d/00-nuit-cloud-default.conf:
+server { listen 10.20.0.34:80 default_server; listen 10.20.0.34:443 ssl default_server; }
+DUMP
+rm -f "$STATE"/h-restarted-*; printf '%s\n' "$IREV2" >"$ROOT/var/lib/nuit-cloud/ingress/revision"; : >"$CALLS"
+ing_run --check >"$tmp/out" 2>&1 && bad "host ingress: the check passed while apache2 holds port 80"
+grep -qxF '  apache2 listens on every address on port 80' "$tmp/out" && ok "host ingress: the check names another program on every address of a port" || { cat "$tmp/out"; bad "host ingress check foreign"; }
+: >"$CALLS"; ing_run >"$tmp/out" 2>&1 && bad "host ingress: recorded while apache2 holds port 80"; cat "$tmp/out" >>"$hout"
+grep -q 'FAILED  ncs_ingress' "$tmp/out" && [ "$(count 'systemctl restart')" = 0 ] && ! grep -q 'restarting nginx\|nginx also listens' "$tmp/out" \
+  && grep -qxF '  apache2 listens on every address on port 80: another program holds the port, so nginx cannot listen there' "$tmp/out" \
+  && grep -qxF '    LISTEN 0 511 0.0.0.0:80 0.0.0.0:* users:(("apache2",pid=700,fd=4),("apache2",pid=701,fd=4))' "$tmp/out" \
+  && ok "host ingress: a wildcard another program holds is named as that program's, FAILED, and nginx is not restarted" || { cat "$tmp/out" "$CALLS"; bad "host ingress foreign wildcard"; }
+
+# ss -p says nothing (no owners known): the sockets come from ss -Htln, spoken of as nginx's, and nginx is not restarted on a guess
+touch "$STATE/h-nop"
+printf '%s\n' 'LISTEN 0 511 0.0.0.0:80 0.0.0.0:*' 'LISTEN 0 511 0.0.0.0:443 0.0.0.0:*' >"$STATE/h-listen"
+rm -f "$STATE"/h-restarted-*; : >"$CALLS"
+ing_run >"$tmp/out" 2>&1 && bad "host ingress: recorded with sockets of no known owner"; cat "$tmp/out" >>"$hout"
+grep -q 'FAILED  ncs_ingress' "$tmp/out" && grep -q '^ss -Htlnp' "$CALLS" && grep -qx 'ss -Htln' "$CALLS" && [ "$(count 'systemctl restart')" = 0 ] \
+  && grep -qxF '  nginx also listens on every address on port 80: another configuration has a listen without an address' "$tmp/out" && grep -qxF '    LISTEN 0 511 0.0.0.0:80 0.0.0.0:*' "$tmp/out" \
+  && ok "host ingress: when ss -p names no process the sockets come from ss -Htln, and nginx is not restarted for sockets of no known owner" || { cat "$tmp/out" "$CALLS"; bad "host ingress ss fallback"; }
+rm -f "$STATE/h-nop" "$STATE/h-dump" "$STATE/h-listen-restart" "$STATE"/h-restarted-*
+
+# a hostile process name in ss's answer is not run, and is said only as plain characters
+printf '%s\n' "LISTEN 0 511 10.20.0.34:80 0.0.0.0:* $NGX" "LISTEN 0 511 10.20.0.34:443 0.0.0.0:* $NGX" 'LISTEN 0 511 0.0.0.0:443 0.0.0.0:* users:(("$(touch /tmp/x);rm",pid=9,fd=4))' >"$STATE/h-listen"
+: >"$CALLS"; ing_run >"$tmp/out" 2>&1 && bad "host ingress: recorded with a hostile process on port 443"; cat "$tmp/out" >>"$hout"
+grep -q 'FAILED  ncs_ingress' "$tmp/out" && grep -qxF '  __touch__tmp_x__rm listens on every address on port 443: another program holds the port, so nginx cannot listen there' "$tmp/out" \
+  && [ "$(count 'systemctl restart')" = 0 ] && ok "host ingress: a process name with shell characters is said with them replaced, and changes nothing" || { cat "$tmp/out" "$CALLS"; bad "host ingress hostile process name"; }
+printf '%s\n' 'LISTEN 0 511 10.20.0.34:80 0.0.0.0:*' 'LISTEN 0 511 10.20.0.34:443 0.0.0.0:*' 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*' >"$STATE/h-listen"
 
 # only a dotted IPv4 address with a port is an address: a commented one, IPv6, a port alone, an impossible or hostile value are not asked for
 export NCS_INGRESS_REVISION="$IREV1"; mkstage "$IST3" "$IREV1" <<STAGE

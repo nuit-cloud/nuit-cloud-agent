@@ -13,13 +13,15 @@
 #
 # With `host`, a site file may listen on a given IPv4 address (`listen 10.20.0.34:443 ssl;`, the Ingress Service's tenant-VLAN address,
 # nuit-cloud/nuit-cloud#205). Before anything is written each such address must be on the machine (`ip -o -4 addr show`), else exit 3; after
-# the reload nginx must listen on each address:port the files name (`ss -Htln`), else exit 1 and the revision is not recorded: `nginx -t`
+# the reload nginx must listen on each address:port the files name (`ss -Htlnp`), else exit 1 and the revision is not recorded: `nginx -t`
 # does not bind, and `systemctl reload nginx` succeeds even when nginx cannot bind and keeps its old configuration. Nor may nginx then listen
 # on anything else on any of those ports, every address (0.0.0.0, *, [::]) or another address the files do not name, else exit 1: the
 # `listen` lines that cause it are named from `nginx -T` (file and line, nothing else of the configuration). Those checks are
 # ingress-listens.sh, which must be beside this script (the feature's check runs it too). It writes and reloads whenever it runs, the same
 # revision too: the feature runs it again when the listen check fails on a machine whose recorded revision is in step. An optional eighth
 # argument, the word `addresses`, does only the first check (the feature runs it before it installs or changes anything) and exits 0 or 3.
+# When, after a reload, nginx still holds sockets of its own that the configuration on disk does not name, it kept its old configuration
+# (it could not bind the new addresses while its old wildcard held the ports): nginx is then restarted once and checked again.
 set -u
 R="$1"; S="$2"; CONF="$3"; CROOT="$4"; C="$5"; REV="$6"; SD="$7"; MODE="${8:-}"
 P() { printf '%s%s' "$R" "$1"; }
@@ -188,8 +190,28 @@ fi
 # nothing else: not on every address (0.0.0.0, *, [::]: another configuration on the machine, in sites-enabled, conf.d, nginx.conf or an old
 # file, has a listen without an address) and not on another address the files do not name; the Ingress Service would answer there too
 # (the management address). ingress-listens.sh says which, with the sockets and the listen lines from nginx -T that cause it.
+# A reload cannot move a port from every address to one address: nginx's master still holds the old configuration's 0.0.0.0:80, the
+# new configuration's 10.20.0.34:80 then cannot be bound (EADDRINUSE), and nginx keeps its old configuration while systemctl says the
+# reload worked (ncs-mini-1, nuit-cloud/nuit-cloud#205). The check says so with 4: every stray socket is nginx's and nginx -T names no
+# listen line for it. Then, and only after a reload, nginx is restarted once (a fixed command, never one a task supplies) and checked
+# again; a configuration that does name the culprit, or a port another program holds, is not restarted for: it would not help.
 if [ -n "$LISTENS" ]; then
-  sh "$LCHECK" check "$S/sites" 10 full || exit 1
+  lrc=0; lout="$(sh "$LCHECK" check "$S/sites" 10 full 2>&1)" || lrc=$?
+  if [ "$lrc" = 4 ] && [ "$reloaded" = "; nginx reloaded" ]; then
+    say "nginx kept its old listening sockets after the reload (a reload cannot move a port from every address to one address); restarting nginx"
+    rout="$(bounded systemctl restart nginx 2>&1)" \
+      || { say "nginx did not restart: $(printf '%s' "$rout" | head -n 1 | cut -c1-300) (journalctl -u nginx says why)" >&2; exit 1; }
+    reloaded="; nginx reloaded, then restarted (it had kept its old listening sockets)"
+    lrc=0; lout="$(sh "$LCHECK" check "$S/sites" 10 full 2>&1)" || lrc=$?
+    if [ "$lrc" != 0 ]; then
+      printf '%s\n' "$lout" >&2
+      say "nginx was restarted and still does not listen only where the site files say" >&2
+      exit 1
+    fi
+  elif [ "$lrc" != 0 ]; then
+    printf '%s\n' "$lout" >&2
+    exit 1
+  fi
 fi
 
 # ─── record (the revision last: it says the files above are this revision) ────────────────────────────────────────────────────────────
