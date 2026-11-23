@@ -1748,7 +1748,7 @@ f_ncs_login_do() {
 # ─── A baseline firewall that leaves the platform's ports open and nothing else ───────────────────────────────────────────────────
 # One nftables table (`inet nuit_cloud`) with an INPUT chain that drops by default and accepts: loopback, the container bridges (pods keep
 # the host as their gateway and resolver, as before), replies to what the machine started, ICMP, DHCP, SSH from the platform's own
-# ranges (NCS_FIREWALL_SSH_FROM, default the private ranges) and the TCP ports the task names (NCS_FIREWALL_TCP, e.g. 80 443 on a machine
+# ranges (NCS_FIREWALL_SSH_FROM, default the IPv4 private ranges; over IPv6 only from IPv6 ranges it names) and the TCP ports the task names (NCS_FIREWALL_TCP, e.g. 80 443 on a machine
 # that serves routes; open to anyone).
 # A machine forwards traffic only for its own containers (nuit-cloud/nuit-cloud#202). Every Nuit Cloud Server has ip_forward on (pods
 # need it) and an address on more than one network (the tenant VLAN <if>.5, the management VLAN <if>.31), so without this anything on
@@ -1858,7 +1858,11 @@ fw_render_forward() {
   echo "  }"
 }
 fw_render() { # the ruleset on stdout
-  v4="$(fw_ssh_from | tr -s ' ' ',' | sed 's/,$//')"
+  # SSH sources by family (nuit-cloud/nuit-cloud#202): an IPv4 rule for the IPv4 ranges, and an IPv6 rule only when the task names IPv6
+  # ranges. Before 0.4.22 the IPv6 private and link-local ranges were always admitted, so a neighbour on any of the machine's networks
+  # could reach SSH over IPv6 whatever the setting said.
+  v4="$(fw_ssh_from | tr ' ' '\n' | grep -v ':' | grep -v '^$' | tr '\n' ',' | sed 's/,$//')"
+  v6="$(fw_ssh_from | tr ' ' '\n' | grep ':' | tr '\n' ',' | sed 's/,$//')"
   fw_pods="${NCS_FIREWALL_POD_MODE:-}"
   echo "# Written by the nuit-cloud agent (profile nuit-cloud-firewall). Edit the task, not this file."
   [ -z "$fw_pods" ] || echo "# pod-mode: $fw_pods"
@@ -1881,8 +1885,8 @@ fw_render() { # the ruleset on stdout
   echo "    ip protocol icmp accept"
   echo "    ip6 nexthdr icmpv6 accept"
   echo "    udp dport 68 accept"
-  echo "    tcp dport 22 ip saddr { $v4 } accept"
-  echo "    tcp dport 22 ip6 saddr { fc00::/7, fe80::/10 } accept"
+  [ -z "$v4" ] || echo "    tcp dport 22 ip saddr { $v4 } accept"
+  [ -z "$v6" ] || echo "    tcp dport 22 ip6 saddr { $v6 } accept"
   ports="$(fw_ports | sed 's/ *$//' | tr -s ' ' ',')"
   [ -z "$ports" ] || echo "    tcp dport { $ports } accept"
   echo "  }"

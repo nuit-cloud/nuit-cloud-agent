@@ -1217,6 +1217,15 @@ fw_net() { rm -rf "$ROOT"; mkdir -p "$ROOT/var/lib/nuit-cloud-agent"; rm -f "$ST
 stub ss 'if [ -e "$STATE/ss-no-ssh" ]; then :; else echo "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"; fi'
 fw_run() { env ${FW_TCP+NCS_FIREWALL_TCP="$FW_TCP"} ${FW_FROM+NCS_FIREWALL_SSH_FROM="$FW_FROM"} sh "$here/bootstrap.sh" nuit-cloud-firewall ${1:+"$1"}; }
 OLDROOT4="$ROOT"; export ROOT="$tmp/fwroot"; RULES="$ROOT/etc/nuit-cloud/firewall.nft"
+# SSH over IPv6 follows the setting (nuit-cloud/nuit-cloud#202): no IPv6 range named, no IPv6 rule; one named, exactly that one.
+fw_mixed="$(sh -c 'p() { printf "%s\n" "$1"; }; NCS_FIREWALL_SSH_FROM="10.10.10.0/24 fd00:31::/64"; . "$1/features.sh"; fw_render' x "$here")"
+printf '%s\n' "$fw_mixed" | grep -qx '    tcp dport 22 ip saddr { 10.10.10.0/24 } accept' || bad "a mixed SSH setting should give the IPv4 rule for its IPv4 range"
+printf '%s\n' "$fw_mixed" | grep -qx '    tcp dport 22 ip6 saddr { fd00:31::/64 } accept' || bad "a mixed SSH setting should give the IPv6 rule for its IPv6 range only"
+fw_v4only="$(sh -c 'p() { printf "%s\n" "$1"; }; NCS_FIREWALL_SSH_FROM="10.10.10.0/24"; . "$1/features.sh"; fw_render' x "$here")"
+printf '%s\n' "$fw_v4only" | grep -q 'ip6 saddr' && bad "with no IPv6 range named, SSH over IPv6 must not be admitted"
+fw_default="$(sh -c 'p() { printf "%s\n" "$1"; }; . "$1/features.sh"; fw_render' x "$here")"
+printf '%s\n' "$fw_default" | grep -q 'fe80::\|fc00::' && bad "the default must not admit IPv6 link-local or ULA to SSH"
+ok "ncs_firewall: SSH over IPv6 is admitted only from IPv6 ranges the setting names"
 export FW_TCP="80,443" FW_FROM="10.10.10.0/24"
 fw_net; fw_run --check >"$tmp/out" 2>&1 && bad "a machine with no firewall passed the check"
 grep -q 'DRIFT   ncs_firewall' "$tmp/out" && [ ! -s "$CALLS" ] && [ ! -e "$RULES" ] && ok "ncs_firewall: --check reports no firewall and changes nothing" || { cat "$tmp/out"; bad "fw check"; }
@@ -1258,7 +1267,6 @@ table inet nuit_cloud {
     ip6 nexthdr icmpv6 accept
     udp dport 68 accept
     tcp dport 22 ip saddr { 10.10.10.0/24 } accept
-    tcp dport 22 ip6 saddr { fc00::/7, fe80::/10 } accept
     tcp dport { 80,443 } accept
   }
   chain forward {
