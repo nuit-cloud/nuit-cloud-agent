@@ -1749,16 +1749,24 @@ f_ncs_login_do() {
 # One nftables table (`inet nuit_cloud`) with an INPUT chain that drops by default and accepts: loopback, the container bridges (pods keep
 # the host as their gateway and resolver, as before), replies to what the machine started, ICMP, DHCP, SSH from the platform's own
 # ranges (NCS_FIREWALL_SSH_FROM, default the private ranges) and the TCP ports the task names (NCS_FIREWALL_TCP, e.g. 80 443 on a machine
-# that serves routes; open to anyone). Forwarded traffic is not touched: a pod's published ports are DNATed and forwarded, so the
-# tenants' services are unaffected and nothing here isolates tenants from each other (that is its own design, issue #91).
+# that serves routes; open to anyone).
+# A machine forwards traffic only for its own containers (nuit-cloud/nuit-cloud#202). Every Nuit Cloud Server has ip_forward on (pods
+# need it) and an address on more than one network (the tenant VLAN <if>.5, the management VLAN <if>.31), so without this anything on
+# one network that routed the other via this machine would be forwarded across, past the router's rules between them. The forward
+# chain is therefore always there: replies to what was let through, and anything coming in from or going out to a container bridge
+# (FW_BRIDGES: ocisaas0, cni0, docker0, Docker's br-*, Wings' pterodactyl0), are accepted, so a pod's published ports (DNATed on
+# arrival, then out to a bridge) and the pods' own traffic out are unaffected; everything else forwarded (one of the machine's own
+# interfaces to another) is logged (prefix `nc-host_route `, rate-limited), counted as `host_route` and dropped, always, whatever the
+# pod mode: nothing legitimate on a Nuit Cloud Server routes between its physical or VLAN interfaces. Nothing here isolates tenants'
+# pods from each other (that is its own design, issue #91).
 # Pod rules (nuit-cloud/nuit-cloud#91), only when the task names them (NCS_FIREWALL_POD_MODE; without it the ruleset is exactly the above):
-# INPUT from the bridges takes DNS, DHCP and ICMP and counts the rest as `pod_input`; a forward chain (policy accept, so other tables keep
-# their own say) lets pods reach their own range (10.89.0.0/16) and what NCS_FIREWALL_POD_ALLOW names, counts the rest of the private
-# ranges as `pod_private`, and lets only NCS_FIREWALL_ADMIN_FROM reach the platform services' admin ports (DNATed from
+# INPUT from the bridges takes DNS, DHCP and ICMP and counts the rest as `pod_input`; the forward chain, ahead of its bridge accepts, lets
+# pods reach their own range (10.89.0.0/16) and what NCS_FIREWALL_POD_ALLOW names, counts the rest of the private ranges as
+# `pod_private`, and lets only NCS_FIREWALL_ADMIN_FROM reach the platform services' admin ports (DNATed from
 # NCS_FIREWALL_ADMIN_TARGETS : NCS_FIREWALL_ADMIN_PORTS), counting the rest as `admin_other`. In `observe` mode every one of those is
 # logged (prefix `nc-<counter> `, rate-limited) and counted but still accepted, so nothing that passes today stops passing; in `enforce`
 # mode it is dropped. The internet is never touched. The mode is written in the file's header (`# pod-mode: ...`), which the agent's
-# `firewall` observation reads.
+# `firewall` observation reads (with every counter, `host_route` included).
 # Like the SSH change, this can lock everyone out, so: the rules are syntax-checked first; a timer (nuit-cloud-firewall-rollback) that
 # deletes the table is armed before anything is loaded; after loading, sshd must still be listening; and the timer is left ARMED
 # until the platform has tested from outside (SSH reachable, the open ports not blocked, a port nobody opened dropped) and sent
@@ -1772,7 +1780,7 @@ FW_DEFAULT_SSH_FROM="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
 fw_words() { printf '%s' "$1" | tr ',' ' '; }
 fw_ports() { fw_words "${NCS_FIREWALL_TCP:-}" | tr -s ' ' '\n' | grep -v '^$' | sort -n -u | tr '\n' ' '; }
 fw_ssh_from() { v="$(fw_words "${NCS_FIREWALL_SSH_FROM:-}")"; [ -n "$v" ] || v="$FW_DEFAULT_SSH_FROM"; printf '%s' "$v" | tr -s ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' '; }
-FW_BRIDGES='{ "ocisaas0", "cni0", "docker0", "br-*" }'
+FW_BRIDGES='{ "ocisaas0", "cni0", "docker0", "br-*", "pterodactyl0" }'
 FW_POD_RANGE="$POD_RANGE"
 FW_PRIVATE="10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16"
 fw_list() { fw_words "$1" | tr -s ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' '; }
@@ -1823,22 +1831,30 @@ fw_render_forward() {
   echo "  chain forward {"
   echo "    type filter hook forward priority 0; policy accept;"
   echo "    ct state established,related accept"
-  if [ -n "${NCS_FIREWALL_ADMIN_TARGETS:-}" ]; then
-    fw_admin="ct status dnat ct original ip daddr { $(fw_set "$NCS_FIREWALL_ADMIN_TARGETS") } ct original proto-dst { $(fw_ports_set "$NCS_FIREWALL_ADMIN_PORTS") }"
-    echo "    $fw_admin ip saddr { $(fw_set "$NCS_FIREWALL_ADMIN_FROM") } accept"
-    fw_counted admin_other "$fw_admin"
+  if [ -n "${NCS_FIREWALL_POD_MODE:-}" ]; then
+    if [ -n "${NCS_FIREWALL_ADMIN_TARGETS:-}" ]; then
+      fw_admin="ct status dnat ct original ip daddr { $(fw_set "$NCS_FIREWALL_ADMIN_TARGETS") } ct original proto-dst { $(fw_ports_set "$NCS_FIREWALL_ADMIN_PORTS") }"
+      echo "    $fw_admin ip saddr { $(fw_set "$NCS_FIREWALL_ADMIN_FROM") } accept"
+      fw_counted admin_other "$fw_admin"
+    fi
+    echo "    iifname $FW_BRIDGES ip daddr $FW_POD_RANGE accept"
+    # Containers on this machine talking to each other (Docker's own networks, a pod reaching a service published on this node): in on a bridge
+    # and out on a bridge never leaves the machine. After the admin rules, so a local pod still cannot reach the platform services' admin ports.
+    echo "    iifname $FW_BRIDGES oifname $FW_BRIDGES accept"
+    for fw_e in $(fw_list "${NCS_FIREWALL_POD_ALLOW:-}"); do
+      case "$fw_e" in
+        *:*) echo "    iifname $FW_BRIDGES ip daddr ${fw_e%:*} meta l4proto { tcp, udp } th dport ${fw_e##*:} accept";;
+        *) echo "    iifname $FW_BRIDGES ip daddr $fw_e accept";;
+      esac
+    done
+    fw_counted pod_private "iifname $FW_BRIDGES ip daddr { $FW_PRIVATE }"
   fi
-  echo "    iifname $FW_BRIDGES ip daddr $FW_POD_RANGE accept"
-  # Containers on this machine talking to each other (Docker's own networks, a pod reaching a service published on this node): in on a bridge
-  # and out on a bridge never leaves the machine. After the admin rules, so a local pod still cannot reach the platform services' admin ports.
-  echo "    iifname $FW_BRIDGES oifname $FW_BRIDGES accept"
-  for fw_e in $(fw_list "${NCS_FIREWALL_POD_ALLOW:-}"); do
-    case "$fw_e" in
-      *:*) echo "    iifname $FW_BRIDGES ip daddr ${fw_e%:*} meta l4proto { tcp, udp } th dport ${fw_e##*:} accept";;
-      *) echo "    iifname $FW_BRIDGES ip daddr $fw_e accept";;
-    esac
-  done
-  fw_counted pod_private "iifname $FW_BRIDGES ip daddr { $FW_PRIVATE }"
+  # The machine forwards only for its own containers: from a bridge (pods out), to a bridge (published ports, DNATed on arrival). After the
+  # pod rules, so they see pod traffic first. The rest, one of the machine's own interfaces to another, is dropped in every pod mode.
+  echo "    iifname $FW_BRIDGES accept"
+  echo "    oifname $FW_BRIDGES accept"
+  echo "    limit rate 10/minute log prefix \"nc-host_route \""
+  echo "    counter name host_route drop"
   echo "  }"
 }
 fw_render() { # the ruleset on stdout
@@ -1849,9 +1865,8 @@ fw_render() { # the ruleset on stdout
   echo "table inet $FW_TABLE"
   echo "delete table inet $FW_TABLE"
   echo "table inet $FW_TABLE {"
-  if [ -n "$fw_pods" ]; then
-    for c in pod_input pod_private admin_other; do echo "  counter $c {"; echo "  }"; done
-  fi
+  fw_counters=host_route; [ -z "$fw_pods" ] || fw_counters="pod_input pod_private admin_other host_route"
+  for c in $fw_counters; do echo "  counter $c {"; echo "  }"; done
   echo "  chain input {"
   echo "    type filter hook input priority 0; policy drop;"
   echo "    iif lo accept"
@@ -1871,7 +1886,7 @@ fw_render() { # the ruleset on stdout
   ports="$(fw_ports | sed 's/ *$//' | tr -s ' ' ',')"
   [ -z "$ports" ] || echo "    tcp dport { $ports } accept"
   echo "  }"
-  [ -z "$fw_pods" ] || fw_render_forward
+  fw_render_forward
   echo "}"
 }
 fw_loaded() { nft list table inet "$FW_TABLE" >/dev/null 2>&1; }

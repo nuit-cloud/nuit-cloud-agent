@@ -25,8 +25,9 @@ const (
 	maxFirewallLogLines = 5000
 )
 
-// FirewallCounters are the pod rules' named counters, in the order they are reported.
-var FirewallCounters = []string{"pod_input", "pod_private", "admin_other"}
+// FirewallCounters are the firewall's named counters, in the order they are reported: the pod rules' three (only when pod rules are
+// set) and host_route, what the machine refused to forward between its own interfaces (always there; nuit-cloud/nuit-cloud#202).
+var FirewallCounters = []string{"pod_input", "pod_private", "admin_other", "host_route"}
 
 // FirewallCounter is one named counter's totals since the rules were last loaded.
 type FirewallCounter struct {
@@ -103,7 +104,7 @@ func FirewallMode(rules string) string {
 	return "off"
 }
 
-// ParseFirewallCounters reads `nft -j list counters table inet nuit_cloud`, keeping only the pod rules' counters of that table.
+// ParseFirewallCounters reads `nft -j list counters table inet nuit_cloud`, keeping only the firewall's own counters of that table.
 func ParseFirewallCounters(out string) map[string]FirewallCounter {
 	var parsed struct {
 		Nftables []struct {
