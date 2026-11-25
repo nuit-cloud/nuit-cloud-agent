@@ -335,3 +335,51 @@ func TestTheTaskKeysObservationNamesTheTrustedKeyIdsAndChangesOnlyWithThem(t *te
 		t.Errorf("a collector without the agent's keys sent %v", data)
 	}
 }
+
+// File-mounted secrets (nuit-cloud/nuit-cloud#222): the platform may write a secret's files for the runtime only on a machine whose running
+// containerd takes them from the directory the profile makes. Any other value, or none, is reported as nothing, and the version moves with it.
+func TestRuntimeObservationSaysFileSecretsOnlyWhenTheRunningRuntimeHasTheProfilesDirectory(t *testing.T) {
+	dir := ""
+	c := Collector{
+		Run:               func(context.Context, string, ...string) (string, error) { return `{"leftovers":[]}`, nil },
+		RuntimeKubeletDir: func(context.Context) string { return dir },
+	}
+	collect := func() (RuntimeFacts, string) {
+		d, v, _ := c.Collect(context.Background(), Runtime)
+		return d.(RuntimeFacts), v
+	}
+	without, v0 := collect()
+	if without.FileSecrets || without.FileSecretsDir != "" {
+		t.Errorf("no kubelet dir: %+v", without)
+	}
+	dir = "/run/nuit-cloud/kubelet"
+	with, v1 := collect()
+	if !with.FileSecrets || with.FileSecretsDir != "/run/nuit-cloud/kubelet" || v1 == v0 || !versionOK.MatchString(v1) {
+		t.Errorf("the profile's dir: %+v %q (before %q)", with, v1, v0)
+	}
+	for _, other := range []string{"/var/lib/kubelet", "/run/nuit-cloud/kubelet/", "/run/nuit-cloud/kubelet/../../../etc", "/tmp/x;rm -rf /", "relative"} {
+		dir = other
+		if f, v := collect(); f.FileSecrets || f.FileSecretsDir != "" || v != v0 {
+			t.Errorf("%q: %+v %q", other, f, v)
+		}
+	}
+	// an agent that does not read it reports what it always did, with the same version
+	c.RuntimeKubeletDir = nil
+	if f, v := collect(); f.FileSecrets || v != v0 {
+		t.Errorf("not read: %+v %q", f, v)
+	}
+}
+
+func TestTheKubeletDirIsReadFromAProcessEnvironment(t *testing.T) {
+	for env, want := range map[string]string{
+		"PATH=/usr/bin\x00OCI_SAAS_KUBELET_DIR=/run/nuit-cloud/kubelet\x00":  "/run/nuit-cloud/kubelet",
+		"OCI_SAAS_KUBELET_DIR=/var/lib/kubelet":                              "/var/lib/kubelet",
+		"PATH=/usr/bin\x00XOCI_SAAS_KUBELET_DIR=/run/nuit-cloud/kubelet\x00": "",
+		"PATH=/usr/bin\x00OCI_SAAS_KUBELET_DIRX=/a\x00":                      "",
+		"": "",
+	} {
+		if got := KubeletDirFromEnviron([]byte(env)); got != want {
+			t.Errorf("%q: got %q, want %q", env, got, want)
+		}
+	}
+}

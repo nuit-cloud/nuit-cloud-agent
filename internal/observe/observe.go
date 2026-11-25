@@ -62,6 +62,14 @@ const (
 
 var bundleSum = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+// FileSecretsDir is where container-management writes a container's file-mounted secrets just before it creates the container, and the
+// kubelet dir the runtime's containerd is told (OCI_SAAS_KUBELET_DIR): the ncs_file_secrets profile feature makes both (nuit-cloud/nuit-cloud#222).
+// The runtime observation says the machine supports file secrets only when the running containerd has exactly this value.
+const FileSecretsDir = "/run/nuit-cloud/kubelet"
+
+// kubeletDirVar is the variable the runtime's shim reads its kubelet dir from (oci-saas crates/shim/src/kubelet.rs).
+const kubeletDirVar = "OCI_SAAS_KUBELET_DIR"
+
 // Limits (the platform enforces the same ones again).
 const (
 	maxInterfaces = 32
@@ -94,6 +102,11 @@ type RuntimeFacts struct {
 	LeftoverSupervisors []int `json:"leftoverSupervisors"`
 	// BundleSHA256 is the installed runtime bundle's checksum; empty (and left out) when unrecorded, unreadable or not a checksum.
 	BundleSHA256 string `json:"bundleSha256,omitempty"`
+	// FileSecrets says the runtime takes file-mounted secrets from FileSecretsDir (its running containerd has that kubelet dir, and the
+	// directory is there); left out otherwise, which means not supported.
+	FileSecrets bool `json:"fileSecrets,omitempty"`
+	// FileSecretsDir is that directory, sent only with FileSecrets.
+	FileSecretsDir string `json:"fileSecretsDir,omitempty"`
 }
 
 // DNSAnswer is one resolver's answer for one name: whether it returned an address.
@@ -151,6 +164,9 @@ type Collector struct {
 	ReadIngressState func(name string) (string, error)
 	// ListDir lists the names of the regular files in a directory (the ingress observation counts the platform's site files).
 	ListDir func(dir string) ([]string, error)
+	// RuntimeKubeletDir returns the kubelet dir the runtime's running containerd has (its OCI_SAAS_KUBELET_DIR), and only when that is an
+	// existing directory; "" otherwise. nil means it is not read (file secrets are not reported).
+	RuntimeKubeletDir func(ctx context.Context) string
 }
 
 func realRun(ctx context.Context, name string, args ...string) (string, error) {
@@ -169,7 +185,42 @@ func Real() Collector {
 	}, ReadFirewallRules: func() (string, error) {
 		b, err := os.ReadFile(FirewallRules)
 		return string(b), err
-	}, ReadIngressState: readIngressState, ListDir: listFiles}
+	}, ReadIngressState: readIngressState, ListDir: listFiles, RuntimeKubeletDir: realRuntimeKubeletDir}
+}
+
+// realRuntimeKubeletDir reads the environment of the runtime's running containerd (systemd's main process of containerd-ocisaas): the
+// value it was started with, which is what the shims it starts get, not what a drop-in says it will have after a restart.
+func realRuntimeKubeletDir(ctx context.Context) string {
+	out, err := realRun(ctx, "systemctl", "show", "-p", "MainPID", "--value", "containerd-ocisaas")
+	if err != nil {
+		return ""
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil || pid <= 0 {
+		return ""
+	}
+	env, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/environ")
+	if err != nil {
+		return ""
+	}
+	dir := KubeletDirFromEnviron(env)
+	if dir == "" {
+		return ""
+	}
+	if fi, err := os.Lstat(dir); err != nil || !fi.IsDir() {
+		return ""
+	}
+	return dir
+}
+
+// KubeletDirFromEnviron finds OCI_SAAS_KUBELET_DIR in a process's environment (/proc/<pid>/environ: NUL-separated); "" when it is not there.
+func KubeletDirFromEnviron(environ []byte) string {
+	for _, kv := range bytes.Split(environ, []byte{0}) {
+		if v, ok := bytes.CutPrefix(kv, []byte(kubeletDirVar+"=")); ok {
+			return string(v)
+		}
+	}
+	return ""
 }
 
 func realInterfaces() []Interface {
@@ -272,9 +323,16 @@ func (c Collector) runtime(ctx context.Context) (any, string, error) {
 			bundle = strings.TrimSpace(text)
 		}
 	}
-	sum := sha256.Sum256([]byte(strings.Join(parts, ",") + "|" + bundle))
+	facts := RuntimeFacts{LeftoverSupervisors: pids, BundleSHA256: bundle}
+	key := strings.Join(parts, ",") + "|" + bundle
+	// only the exact directory the profile makes counts: any other value (a kubelet's, or one set by hand) is not where the platform writes
+	if c.RuntimeKubeletDir != nil && c.RuntimeKubeletDir(ctx) == FileSecretsDir {
+		facts.FileSecrets, facts.FileSecretsDir = true, FileSecretsDir
+		key += "|files=" + FileSecretsDir
+	}
+	sum := sha256.Sum256([]byte(key))
 	version := "r" + hex.EncodeToString(sum[:])[:12]
-	return RuntimeFacts{LeftoverSupervisors: pids, BundleSHA256: bundle}, version, nil
+	return facts, version, nil
 }
 
 // taskKeys reads the ids of the keys the agent trusts from its own state: nothing on the machine is asked. An agent that trusts no key

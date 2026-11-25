@@ -105,6 +105,13 @@ rm -rf "$ROOT/sys/class/net/enp3s0"; mkdir -p "$ROOT/sys/class/net/wlan0/wireles
 SSHD_ROOT=no SSHD_PASS=no run nuit-cloud-server >"$tmp/out" 2>&1 && bad "wireless only should need a person"
 grep -q 'MANUAL  ncs_wired' "$tmp/out" && ok "wireless-only is reported MANUAL: connect a cable" || { cat "$tmp/out"; bad "wireless"; }
 NCS_CLEAN
+# the file-secrets directory is the platform user's: chown records the owner for that one path, and stat answers it (the scratch root's files
+# all belong to whoever runs the test); every other path goes to the real commands
+REALCHOWN="$(command -v chown)"; REALSTAT="$(command -v stat)"
+stub chown "for a in \"\$@\"; do last=\"\$a\"; done
+case \"\$last\" in */run/nuit-cloud/kubelet) echo \"chown \$*\" >>\"\$CALLS\"; echo \"\$1\" >\"\$STATE/kubelet-owner\";; *) exec $REALCHOWN \"\$@\";; esac"
+stub stat "for a in \"\$@\"; do last=\"\$a\"; done
+case \"\$last\" in */run/nuit-cloud/kubelet) [ -d \"\$last\" ] || exit 1; m=\"\$($REALSTAT -c %a \"\$last\" 2>/dev/null || $REALSTAT -f %Lp \"\$last\")\"; echo \"\$(cat \"\$STATE/kubelet-owner\" 2>/dev/null || echo root) \$m\";; *) exec $REALSTAT \"\$@\";; esac"
 
 # the container-service profile adds /dev/kvm, cgroup v2 and the runtime; modprobe is tried, and a missing /dev/kvm needs a person
 SSHD_ROOT=no SSHD_PASS=no run nuit-container-service --check >"$tmp/out" 2>&1 && bad "no kvm and no runtime passed"
@@ -123,11 +130,12 @@ tar -C "$OCI" -czf "$OCI/bundle.tar.gz" bundle; tar -C "$OCI/cd" -czf "$OCI/cont
 printf '#!/bin/sh\necho crictl\n' >"$OCI/crictl"; chmod +x "$OCI/crictl"; tar -C "$OCI" -czf "$OCI/crictl.tar.gz" crictl; mkdir -p "$ROOT/usr/local/bin"
 mkdir -p "$ROOT/run/oci-saas" "$ROOT/usr/bin" "$ROOT/usr/local/lib/nuit-cloud"; rm -f "$ROOT/usr/local/bin/crictl-ocisaas"; rm -f "$STATE/active-containerd-ocisaas"
 GOODFP="$(printf '00112233445566778899aabbccddeeff' | xxd -r -p | sha256sum | awk '{print $1}')"
-stub systemd-version 'true'; stub systemctl 'case "$1" in --version) echo "systemd 257 (257.9-1)";; is-enabled|is-active) ;; *) echo "systemctl $*" >>"$CALLS";; esac
+stub systemd-version 'true'; stub systemctl 'case "$1" in --version) echo "systemd 257 (257.9-1)";; is-enabled|is-active|show) ;; *) echo "systemctl $*" >>"$CALLS";; esac
 case "$1" in
   enable) shift; [ "$1" = --now ] && shift; touch "$STATE/enabled-$1"; touch "$STATE/active-$1";;
   is-enabled) shift; [ "$1" = --quiet ] && shift; [ -e "$STATE/enabled-$1" ];;
   is-active) shift; [ "$1" = --quiet ] && shift; [ -e "$STATE/active-$1" ];;
+  show) for a in "$@"; do u="$a"; done; cat "$STATE/mainpid-$u" 2>/dev/null || echo 0;;
 esac'
 RT="NCS_RUNTIME_BUNDLE=$OCI/bundle.tar.gz NCS_CONTAINERD_TARBALL=$OCI/containerd.tar.gz NCS_CRICTL_TARBALL=$OCI/crictl.tar.gz NCS_RUNTIME_BUNDLE_SHA256=abc123"
 : >"$CALLS"; env SSHD_ROOT=no SSHD_PASS=no $RT NCS_RUNTIME_ROOT_FINGERPRINT=deadbeef sh "$here/bootstrap.sh" nuit-container-service >"$tmp/out" 2>&1 && bad "a wrong root fingerprint was accepted"
@@ -188,6 +196,57 @@ grep -q 'nothing to record' "$tmp/out" && ok "record: a runtime that is not runn
 env SSHD_ROOT=no SSHD_PASS=no NCS_RUNTIME_BUNDLE_SHA256=abc123 sh "$here/bootstrap.sh" nuit-container-service --check >"$tmp/out" 2>&1 && bad "a stopped runtime was clean"
 grep -q 'not installed, or not running here; missing: containerd-ocisaas(service not active)' "$tmp/out" && ok "runtime: a stopped runtime says which part is missing" || { cat "$tmp/out"; bad "runtime stopped"; }
 touch "$STATE/active-containerd-ocisaas"
+
+# File-mounted secrets (nuit-cloud/nuit-cloud#222): a directory of the platform user's under /run (made again at boot), and the runtime's
+# containerd told it is the kubelet dir. containerd is restarted only when the one running lacks the setting. A profile of that one feature.
+printf 'PROFILE_FEATURES="ncs_file_secrets"\n' >"$here/profiles/test-file-secrets.sh"
+KD="$ROOT/run/nuit-cloud/kubelet"; KDROP="$ROOT/etc/systemd/system/containerd-ocisaas.service.d/20-nuit-kubelet-dir.conf"; KTMP="$ROOT/etc/tmpfiles.d/nuit-cloud-kubelet.conf"
+fs_old_env() { mkdir -p "$ROOT/proc/4242"; printf 'PATH=/usr/bin\0OCI_SAAS_ARTIFACTS_DIR=/etc/oci-saas/artifacts\0' >"$ROOT/proc/4242/environ"; echo 4242 >"$STATE/mainpid-containerd-ocisaas"; }
+fs_new_env() { mkdir -p "$ROOT/proc/4242"; printf 'PATH=/usr/bin\0OCI_SAAS_KUBELET_DIR=/run/nuit-cloud/kubelet\0' >"$ROOT/proc/4242/environ"; echo 4242 >"$STATE/mainpid-containerd-ocisaas"; }
+rm -rf "$KD" "$KDROP" "$KTMP" "$STATE/kubelet-owner"; fs_old_env; : >"$CALLS"
+run test-file-secrets --check >"$tmp/out" 2>&1 && bad "file secrets: a machine without them passed the check"
+grep -q 'DRIFT   ncs_file_secrets' "$tmp/out" && grep -q 'is not a directory of nuitcloud' "$tmp/out" && grep -q 'not told OCI_SAAS_KUBELET_DIR=/run/nuit-cloud/kubelet' "$tmp/out" && [ ! -s "$CALLS" ] && [ ! -e "$KD" ] \
+  && ok "file secrets: a machine without them is drift, says what is missing, and --check changes nothing" || { cat "$tmp/out" "$CALLS"; bad "file secrets check"; }
+# a running runtime started without the setting: everything is made and containerd (only) is restarted, saying pods keep running
+run test-file-secrets >"$tmp/out" 2>&1 || true
+[ -d "$KD" ] && [ "$(cat "$STATE/kubelet-owner")" = nuitcloud ] && [ "$(stat "$KD" | awk '{print $2}')" = 700 ] \
+  && grep -qx 'd /run/nuit-cloud 0755 root root -' "$KTMP" && grep -qx 'd /run/nuit-cloud/kubelet 0700 nuitcloud - -' "$KTMP" \
+  && grep -qx '\[Service\]' "$KDROP" && grep -qx 'Environment=OCI_SAAS_KUBELET_DIR=/run/nuit-cloud/kubelet' "$KDROP" \
+  && grep -qx 'systemctl daemon-reload' "$CALLS" && [ "$(grep -c 'systemctl restart containerd-ocisaas' "$CALLS")" = 1 ] && grep -q 'running pods keep running' "$tmp/out" \
+  && ok "file secrets: the directory is nuitcloud's with 0700, made again at boot, the drop-in names it, and containerd is restarted once" || { cat "$tmp/out" "$CALLS"; ls -la "$KD" 2>&1; bad "file secrets apply"; }
+# the restarted containerd has it: a second apply and the check change nothing
+fs_new_env; : >"$CALLS"
+run test-file-secrets >"$tmp/out" 2>&1 && run test-file-secrets --check >/dev/null 2>&1 && grep -q 'ok      ncs_file_secrets' "$tmp/out" && [ ! -s "$CALLS" ] \
+  && ok "file secrets: once in place, apply and check change nothing (no restart)" || { cat "$tmp/out" "$CALLS"; bad "file secrets idempotent"; }
+# a wrong mode or owner is drift, and is put right without restarting anything
+chmod 755 "$KD"; run test-file-secrets --check >"$tmp/out" 2>&1 && bad "file secrets: mode 0755 passed"
+grep -q 'DRIFT   ncs_file_secrets' "$tmp/out" && ok "file secrets: a directory others can read is drift" || { cat "$tmp/out"; bad "file secrets mode"; }
+echo root >"$STATE/kubelet-owner"; run test-file-secrets --check >/dev/null 2>&1 && bad "file secrets: a directory of root's passed"
+: >"$CALLS"; run test-file-secrets >"$tmp/out" 2>&1 || true
+grep -q 'done    ncs_file_secrets' "$tmp/out" && [ "$(stat "$KD")" = "nuitcloud 700" ] && ! grep -q 'restart\|daemon-reload' "$CALLS" \
+  && ok "file secrets: a wrong owner and mode are put right without a restart" || { cat "$tmp/out" "$CALLS"; bad "file secrets owner"; }
+# the boot entry or the drop-in missing is drift; a drop-in written again with containerd already having the value restarts nothing
+rm -f "$KTMP"; run test-file-secrets --check >/dev/null 2>&1 && bad "file secrets: no tmpfiles entry passed"
+rm -f "$KDROP"; : >"$CALLS"; run test-file-secrets >"$tmp/out" 2>&1 || true
+grep -q 'done    ncs_file_secrets' "$tmp/out" && [ -s "$KTMP" ] && [ -s "$KDROP" ] && grep -qx 'systemctl daemon-reload' "$CALLS" && ! grep -q 'restart' "$CALLS" \
+  && ok "file secrets: a missing boot entry and drop-in are written again, with no restart when containerd already has the value" || { cat "$tmp/out" "$CALLS"; bad "file secrets rewrite"; }
+# every file in place but the running containerd without the value (a restart that never happened): drift, and the apply restarts it
+fs_old_env; run test-file-secrets --check >"$tmp/out" 2>&1 && bad "file secrets: a containerd without the value passed"
+grep -q 'started without OCI_SAAS_KUBELET_DIR' "$tmp/out" || { cat "$tmp/out"; bad "file secrets live note"; }
+: >"$CALLS"; run test-file-secrets >"$tmp/out" 2>&1 || true
+grep -q 'systemctl restart containerd-ocisaas' "$CALLS" && ! grep -q 'daemon-reload' "$CALLS" && ok "file secrets: a running containerd without the value is drift and is restarted" || { cat "$tmp/out" "$CALLS"; bad "file secrets live"; }
+# a machine whose runtime is not running yet (before the first install): files written, nothing restarted
+rm -rf "$KD" "$KDROP" "$KTMP" "$STATE/kubelet-owner" "$STATE/mainpid-containerd-ocisaas"; rm -f "$STATE/active-containerd-ocisaas"; : >"$CALLS"
+run test-file-secrets >"$tmp/out" 2>&1 || true
+grep -q 'done    ncs_file_secrets' "$tmp/out" && [ -s "$KDROP" ] && grep -qx 'systemctl daemon-reload' "$CALLS" && ! grep -q 'restart' "$CALLS" \
+  && ok "file secrets: before the runtime runs, the setting is written and nothing is restarted" || { cat "$tmp/out" "$CALLS"; bad "file secrets before runtime"; }
+# a symbolic link where the directory goes is never followed
+rm -rf "$KD"; mkdir -p "$tmp/elsewhere"; ln -s "$tmp/elsewhere" "$KD"; : >"$CALLS"
+run test-file-secrets >"$tmp/out" 2>&1 && bad "file secrets: a symbolic link was accepted"
+grep -q 'FAILED  ncs_file_secrets' "$tmp/out" && grep -q 'is not a directory: left alone' "$tmp/out" && [ -L "$KD" ] && ! grep -q chown "$CALLS" \
+  && ok "file secrets: a symbolic link in the directory's place is left alone and fails" || { cat "$tmp/out" "$CALLS"; bad "file secrets symlink"; }
+rm -f "$KD" "$here/profiles/test-file-secrets.sh"; touch "$STATE/active-containerd-ocisaas"
+grep -q 'ncs_volumes ncs_file_secrets oci_saas_runtime' "$here/profiles/nuit-container-service.sh" && ok "the nuit-container-service profile sets up file secrets before the runtime" || bad "profile lacks ncs_file_secrets"
 
 # the root fingerprint needs no xxd (a machine installed by hand may lack it): perl does it, and when nothing can, it says so instead of blaming the bundle
 mkdir -p "$tmp/noxxd"; for t in sh cat awk sha256sum perl tar find head mkdir rm mktemp basename dirname cmp install printf; do ln -sf "$(command -v $t)" "$tmp/noxxd/$t" 2>/dev/null || true; done

@@ -380,6 +380,69 @@ ocisaas_mismatch() { # ocisaas_mismatch <unpacked bundle dir>
   cmp -s "$1/artifacts.pub" "$(p "$OCISAAS_ETC/artifacts.pub")" || { echo artifacts.pub; return; }
   cmp -s "$1/policy.pub" "$(p "$OCISAAS_ETC/policy.pub")" || echo policy.pub
 }
+# File-mounted secrets (nuit-cloud/nuit-cloud#222): the runtime copies a pod volume into a tmpfs inside the microVM when a container's bind
+# names `<kubelet dir>/pods/<uid>/volumes/kubernetes.io~secret/<name>` (oci-saas docs/containerd.md, "Pod volumes"). There is no kubelet
+# here: container-management, logged in as the platform's user, writes a secret's files under this directory just before it creates the
+# container and removes them straight after. So the directory is the platform user's alone (0700; the shim runs as root and only reads it),
+# lives under /run (memory, gone at reboot, made again at boot by systemd-tmpfiles), and the runtime's containerd is told it is the kubelet
+# dir. The shim takes OCI_SAAS_KUBELET_DIR from containerd's environment when containerd starts it, so the setting is a drop-in on
+# containerd-ocisaas and needs containerd restarted. That restart stops only containerd (KillMode=process): running pods keep running and
+# containerd re-attaches their shims, but those shims keep the environment they started with, so file secrets work for pods started after it.
+# Written before the runtime is installed, the setting is in place when the runtime first starts and nothing is restarted.
+# The agent's runtime observation reports the same path (observe.FileSecretsDir); change both together.
+NCS_KUBELET_DIR=/run/nuit-cloud/kubelet
+NCS_KUBELET_DROPIN=/etc/systemd/system/containerd-ocisaas.service.d/20-nuit-kubelet-dir.conf
+NCS_KUBELET_TMPFILES=/etc/tmpfiles.d/nuit-cloud-kubelet.conf
+ncs_kubelet_dropin() { printf '[Service]\n# file-mounted secrets: container-management writes them here (nuit-cloud/nuit-cloud#222)\nEnvironment=OCI_SAAS_KUBELET_DIR=%s\n' "$NCS_KUBELET_DIR"; }
+ncs_kubelet_tmpfiles() { printf 'd %s 0755 root root -\nd %s 0700 %s - -\n' "$(dirname "$NCS_KUBELET_DIR")" "$NCS_KUBELET_DIR" "$NC_USER"; }
+owner_mode_of() { stat -c '%U %a' "$1" 2>/dev/null || stat -f '%Su %Lp' "$1" 2>/dev/null; }
+# Whether the running containerd-ocisaas has the setting: 0 it has, 1 it has not, 2 cannot tell (not running, or its environment unreadable).
+ncs_kubelet_live() {
+  systemctl is-active --quiet containerd-ocisaas || return 2
+  _pid="$(systemctl show -p MainPID --value containerd-ocisaas 2>/dev/null)" || _pid=
+  case "$_pid" in '' | 0 | *[!0-9]*) return 2 ;; esac
+  [ -r "$(p "/proc/$_pid/environ")" ] || return 2
+  tr '\0' '\n' <"$(p "/proc/$_pid/environ")" | grep -qx "OCI_SAAS_KUBELET_DIR=$NCS_KUBELET_DIR" && return 0
+  return 1
+}
+f_ncs_file_secrets_ok() {
+  _why=
+  [ ! -L "$(p "$NCS_KUBELET_DIR")" ] && [ -d "$(p "$NCS_KUBELET_DIR")" ] && [ "$(owner_mode_of "$(p "$NCS_KUBELET_DIR")")" = "$NC_USER 700" ] \
+    || _why="$NCS_KUBELET_DIR is not a directory of $NC_USER's with mode 0700"
+  [ "$(cat "$(p "$NCS_KUBELET_TMPFILES")" 2>/dev/null)" = "$(ncs_kubelet_tmpfiles)" ] || _why="${_why:+$_why; }$NCS_KUBELET_TMPFILES does not make it at boot"
+  [ "$(cat "$(p "$NCS_KUBELET_DROPIN")" 2>/dev/null)" = "$(ncs_kubelet_dropin)" ] || _why="${_why:+$_why; }the runtime is not told OCI_SAAS_KUBELET_DIR=$NCS_KUBELET_DIR ($NCS_KUBELET_DROPIN)"
+  if [ -z "$_why" ]; then
+    _lrc=0; ncs_kubelet_live || _lrc=$?
+    [ "$_lrc" != 1 ] || _why="the running containerd-ocisaas was started without OCI_SAAS_KUBELET_DIR=$NCS_KUBELET_DIR"
+  fi
+  [ -z "$_why" ] && return 0
+  echo "  file secrets: $_why" >&2
+  return 1
+}
+f_ncs_file_secrets_do() {
+  id "$NC_USER" >/dev/null 2>&1 || { echo "  $NC_USER does not exist yet (the user feature comes first)" >&2; return 3; }
+  _d="$(p "$NCS_KUBELET_DIR")"
+  if [ -L "$_d" ] || { [ -e "$_d" ] && [ ! -d "$_d" ]; }; then echo "  $NCS_KUBELET_DIR exists and is not a directory: left alone" >&2; return 1; fi
+  mkdir -p "$_d"
+  chown "$NC_USER" "$_d" 2>/dev/null || [ -n "$ROOT" ] || return 1
+  chmod 0700 "$_d"
+  mkdir -p "$(dirname "$(p "$NCS_KUBELET_TMPFILES")")" "$(dirname "$(p "$NCS_KUBELET_DROPIN")")"
+  [ "$(cat "$(p "$NCS_KUBELET_TMPFILES")" 2>/dev/null)" = "$(ncs_kubelet_tmpfiles)" ] || ncs_kubelet_tmpfiles >"$(p "$NCS_KUBELET_TMPFILES")"
+  _changed=
+  if [ "$(cat "$(p "$NCS_KUBELET_DROPIN")" 2>/dev/null)" != "$(ncs_kubelet_dropin)" ]; then
+    ncs_kubelet_dropin >"$(p "$NCS_KUBELET_DROPIN")"
+    _changed=1
+    systemctl daemon-reload
+  fi
+  # restart only when the running containerd lacks the setting: it says so, or the drop-in just changed and it cannot be read
+  _lrc=0; ncs_kubelet_live || _lrc=$?
+  if systemctl is-active --quiet containerd-ocisaas && { [ "$_lrc" = 1 ] || { [ -n "$_changed" ] && [ "$_lrc" = 2 ]; }; }; then
+    echo "  restarting containerd-ocisaas for OCI_SAAS_KUBELET_DIR=$NCS_KUBELET_DIR: only containerd restarts, running pods keep running, and file secrets work for pods started from now on" >&2
+    systemctl restart containerd-ocisaas || return 1
+  fi
+  return 0
+}
+
 f_oci_saas_record_ok() { ocisaas_running && ocisaas_recorded; }
 f_oci_saas_record_do() {
   if [ -z "${NCS_RUNTIME_BUNDLE:-}" ] || [ -z "${NCS_RUNTIME_ROOT_FINGERPRINT:-}" ] || [ -z "${NCS_RUNTIME_BUNDLE_SHA256:-}" ]; then
